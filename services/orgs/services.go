@@ -323,9 +323,8 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 
 	// If there is no frontend defined we are running as a client.
 	spec := services.ClientServicesSpec()
-	if org_config.Frontend != nil &&
-		org_config.Frontend.ServerServices != nil {
-		spec = org_config.Frontend.ServerServices
+	if org_config.Services != nil {
+		spec = org_config.Services
 	}
 
 	if spec.FrontendServer {
@@ -427,7 +426,8 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 			// Assume the built in artifacts are OK so we dont need to
 			// validate them at runtime.
 			err = repository.LoadBuiltInArtifacts(ctx, org_config,
-				repo_manager.(*repository.RepositoryManager), false /* validate */)
+				repo_manager.(*repository.RepositoryManager),
+				!services.ValidateArtifact)
 			if err != nil {
 				return err
 			}

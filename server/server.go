@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/crypto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	crypto_server "www.velocidex.com/golang/velociraptor/crypto/server"
@@ -139,24 +140,27 @@ func NewServer(ctx context.Context,
 // authenticated.
 func (self *Server) ProcessSingleUnauthenticatedMessage(
 	ctx context.Context,
-	message *crypto_proto.VeloMessage) {
+	message *crypto_proto.VeloMessage) error {
 
 	if message.CSR != nil {
 		org_manager, err := services.GetOrgManager()
 		if err != nil {
-			return
+			return err
 		}
 
 		config_obj, err := org_manager.GetOrgConfig(message.OrgId)
 		if err != nil {
-			return
+			return err
 		}
 
 		err = enroll(ctx, config_obj, self, message.CSR)
 		if err != nil {
 			self.logger.Error(fmt.Sprintf("Enrol Error: %s", err))
 		}
+		return err
 	}
+
+	return nil
 }
 
 func (self *Server) ProcessUnauthenticatedMessages(
@@ -217,10 +221,20 @@ func (self *Server) Process(
 		return nil, 0, err
 	}
 
-	runner := flows.NewFlowRunner(config_obj)
-	defer runner.Close(ctx)
+	// Older clients
+	if message_info.Version < constants.CLIENT_API_VERSION_0_6_8 {
+		runner := flows.NewLegacyFlowRunner(config_obj)
+		defer runner.Close(ctx)
 
-	err = runner.ProcessMessages(ctx, message_info)
+		err = runner.ProcessMessages(ctx, message_info)
+	} else {
+
+		// Newer clients maintain flow state on the client so need a
+		// much cheaper flow runner.
+		runner := flows.NewFlowRunner(config_obj)
+		err = runner.ProcessMessages(ctx, message_info)
+	}
+
 	if err != nil {
 		return nil, 0, err
 	}
@@ -271,10 +285,12 @@ func (self *Server) Process(
 		nonce = config_obj.Client.Nonce
 	}
 
-	// Messages sent to clients are typically small and we do not
-	// benefit from compression.
+	// Send the client any outstanding tasks.
 	response, err := self.manager.EncryptMessageList(
 		message_list,
+
+		// Messages sent to clients are typically small and do not
+		// benefit from compression.
 		crypto_proto.PackedMessageList_UNCOMPRESSED,
 		nonce,
 		message_info.Source)

@@ -31,6 +31,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/server"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
+	"www.velocidex.com/golang/velociraptor/vtesting"
 	"www.velocidex.com/golang/velociraptor/vtesting/assert"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/simple"
@@ -84,9 +85,9 @@ func (self MockAPIClientFactory) GetAPIClient(
 
 func (self *ServerTestSuite) SetupTest() {
 	self.ConfigObj = self.LoadConfig()
-	self.ConfigObj.Frontend.ServerServices.HuntDispatcher = true
-	self.ConfigObj.Frontend.ServerServices.ClientMonitoring = true
-	self.ConfigObj.Frontend.ServerServices.Interrogation = true
+	self.ConfigObj.Services.HuntDispatcher = true
+	self.ConfigObj.Services.ClientMonitoring = true
+	self.ConfigObj.Services.Interrogation = true
 
 	self.LoadArtifacts(mock_definitions)
 
@@ -283,7 +284,7 @@ func (self *ServerTestSuite) RequiredFilestoreContains(
 }
 
 // Receiving a response from the server to the monitoring flow will
-// write the rows into a csv file in the client's monitoring area.
+// write the rows into a jsonl file in the client's monitoring area.
 func (self *ServerTestSuite) TestMonitoring() {
 	runner := flows.NewFlowRunner(self.ConfigObj)
 	runner.ProcessSingleMessage(
@@ -294,9 +295,9 @@ func (self *ServerTestSuite) TestMonitoring() {
 			VQLResponse: &actions_proto.VQLResponse{
 				Columns: []string{
 					"ClientId", "Timestamp", "Fqdn", "HuntId"},
-				Response: fmt.Sprintf(
-					`[{"ClientId": "%s", "HuntId": "H.123"}]`,
-					self.client_id),
+				JSONLResponse: fmt.Sprintf(
+					`{"ClientId": "%s", "HuntId": "H.123"}\n`, self.client_id),
+				TotalRows: 1,
 				Query: &actions_proto.VQLRequest{
 					Name: "Generic.Client.Stats",
 				},
@@ -323,7 +324,8 @@ func (self *ServerTestSuite) TestMonitoringWithUpload() {
 			RequestId: constants.TransferWellKnownFlowId,
 			FileBuffer: &actions_proto.FileBuffer{
 				Pathspec: &actions_proto.PathSpec{
-					Path: "/etc/passwd",
+					Path:       "/etc/passwd",
+					Components: []string{"etc", "passwd"},
 				},
 				Data: []byte("Hello"),
 				Size: 10000,
@@ -353,7 +355,7 @@ func (self *ServerTestSuite) TestLog() {
 			Source:    self.client_id,
 			SessionId: flow_id,
 			LogMessage: &crypto_proto.LogMessage{
-				Message: "Foobar",
+				Jsonl: "{\"message\":\"Foobar\"}\n",
 			},
 		})
 	runner.Close(context.Background())
@@ -364,7 +366,7 @@ func (self *ServerTestSuite) TestLog() {
 			Source:    self.client_id,
 			SessionId: flow_id,
 			LogMessage: &crypto_proto.LogMessage{
-				Message: "ZooBar",
+				Jsonl: "{\"message\":\"ZooBar\"}\n",
 			},
 		})
 	runner.Close(context.Background())
@@ -372,65 +374,6 @@ func (self *ServerTestSuite) TestLog() {
 	path_spec := paths.NewFlowPathManager(self.client_id, flow_id).Log()
 	self.RequiredFilestoreContains(path_spec, "Foobar")
 	self.RequiredFilestoreContains(path_spec, "ZooBar")
-}
-
-// Test that messages intended to unknown flows are handled
-// gracefully.
-func (self *ServerTestSuite) TestLogToUnknownFlow() {
-	// Emulate a log message from client to flow.
-	runner := flows.NewFlowRunner(self.ConfigObj)
-	runner.ProcessSingleMessage(
-		context.Background(),
-		&crypto_proto.VeloMessage{
-			Source:    self.client_id,
-			SessionId: "F.1234",
-			LogMessage: &crypto_proto.LogMessage{
-				Message: "Foobar",
-			},
-		})
-	runner.Close(context.Background())
-
-	t := self.T()
-
-	// Cancellation message should never be sent due to log.
-	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
-	assert.NoError(self.T(), err)
-
-	tasks, err := client_info_manager.PeekClientTasks(
-		context.Background(), self.client_id)
-	assert.NoError(t, err)
-	assert.Equal(t, len(tasks), 0)
-
-	runner = flows.NewFlowRunner(self.ConfigObj)
-	runner.ProcessSingleMessage(
-		context.Background(),
-		&crypto_proto.VeloMessage{
-			Source:    self.client_id,
-			SessionId: "F.1234",
-			Status:    &crypto_proto.VeloStatus{},
-		})
-	runner.Close(context.Background())
-
-	// Cancellation message should never be sent due to status.
-	tasks, err = client_info_manager.PeekClientTasks(context.Background(), self.client_id)
-	assert.NoError(t, err)
-	assert.Equal(t, len(tasks), 0)
-
-	runner = flows.NewFlowRunner(self.ConfigObj)
-	runner.ProcessSingleMessage(
-		context.Background(),
-		&crypto_proto.VeloMessage{
-			Source:      self.client_id,
-			SessionId:   "F.1234",
-			VQLResponse: &actions_proto.VQLResponse{},
-		})
-	runner.Close(context.Background())
-
-	// Cancellation message should be sent due to response
-	// messages.
-	tasks, err = client_info_manager.PeekClientTasks(context.Background(), self.client_id)
-	assert.NoError(t, err)
-	assert.Equal(t, len(tasks), 1)
 }
 
 func (self *ServerTestSuite) TestScheduleCollection() {
@@ -465,7 +408,10 @@ func (self *ServerTestSuite) TestScheduleCollection() {
 
 	tasks, err := client_info_manager.PeekClientTasks(context.Background(), self.client_id)
 	assert.NoError(t, err)
-	assert.Equal(t, len(tasks), 2)
+	assert.Equal(t, len(tasks), 1)
+
+	// The request sends a single FlowRequest task with two queries
+	assert.Equal(t, len(tasks[0].FlowRequest.VQLClientActions), 2)
 
 	collection_context := &flows_proto.ArtifactCollectorContext{}
 	path_manager := paths.NewFlowPathManager(self.client_id, flow_id)
@@ -555,9 +501,8 @@ func (self *ServerTestSuite) TestVQLResponse() {
 			RequestId: constants.ProcessVQLResponses,
 			VQLResponse: &actions_proto.VQLResponse{
 				Columns: []string{"ClientId", "Column1"},
-				Response: fmt.Sprintf(
-					`[{"ClientId": "%s", "Column1": "Foo"}]`,
-					self.client_id),
+				JSONLResponse: fmt.Sprintf(
+					`{"ClientId": "%s", "Column1": "Foo"}\n`, self.client_id),
 				Query: &actions_proto.VQLRequest{
 					Name: "Generic.Client.Info",
 				},
@@ -588,31 +533,30 @@ func (self *ServerTestSuite) TestErrorMessage() {
 			Source:    self.client_id,
 			SessionId: flow_id,
 			RequestId: constants.ProcessVQLResponses,
-			Status: &crypto_proto.VeloStatus{
-				Status:       crypto_proto.VeloStatus_GENERIC_ERROR,
-				ErrorMessage: "Error generated.",
-				Backtrace:    "I am a backtrace",
+			FlowStats: &crypto_proto.FlowStats{
+				QueryStatus: []*crypto_proto.VeloStatus{
+					{
+						Status:       crypto_proto.VeloStatus_GENERIC_ERROR,
+						ErrorMessage: "Error generated.",
+						Backtrace:    "I am a backtrace",
+					},
+				},
 			},
 		})
 	runner.Close(context.Background())
 
-	db, _ := datastore.GetDB(self.ConfigObj)
+	launcher, err := services.GetLauncher(self.ConfigObj)
+	assert.NoError(self.T(), err)
 
-	// A log is generated
-	path_manager := paths.NewFlowPathManager(self.client_id, flow_id)
-	self.RequiredFilestoreContains(path_manager.Log(), "Error generated")
-
-	// The collection_context is marked as errored.
-	collection_context := &flows_proto.ArtifactCollectorContext{}
-	err = db.GetSubject(self.ConfigObj, path_manager.Path(),
-		collection_context)
+	details, err := launcher.GetFlowDetails(
+		self.ConfigObj, self.client_id, flow_id)
 	require.NoError(t, err)
 
 	require.Regexp(self.T(), regexp.MustCompile("Error generated"),
-		collection_context.Status)
+		details.Context.Status)
 
 	require.Equal(self.T(), flows_proto.ArtifactCollectorContext_ERROR,
-		collection_context.State)
+		details.Context.State)
 }
 
 // Successful status should terminate the flow.
@@ -623,55 +567,63 @@ func (self *ServerTestSuite) TestCompletions() {
 	flow_id, err := self.createArtifactCollection()
 	require.NoError(t, err)
 
+	launcher, err := services.GetLauncher(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
 	// Emulate a response from this flow.
 	runner := flows.NewFlowRunner(self.ConfigObj)
 
-	// Generic.Client.Info sends two requests, lets complete them both.
+	// Generic.Client.Info sends two requests, send status for one
+	// message is complete but the other is still running.
 	runner.ProcessSingleMessage(
 		context.Background(),
 		&crypto_proto.VeloMessage{
 			Source:    self.client_id,
 			SessionId: flow_id,
 			RequestId: constants.ProcessVQLResponses,
-			Status: &crypto_proto.VeloStatus{
-				Status:  crypto_proto.VeloStatus_OK,
-				QueryId: 0,
+			FlowStats: &crypto_proto.FlowStats{
+				QueryStatus: []*crypto_proto.VeloStatus{
+					{Status: crypto_proto.VeloStatus_OK, QueryId: 1},
+					{Status: crypto_proto.VeloStatus_PROGRESS, QueryId: 2},
+				},
 			},
 		})
-	runner.Close(context.Background())
+	defer runner.Close(context.Background())
 
-	db, _ := datastore.GetDB(self.ConfigObj)
+	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
+		details, err := launcher.GetFlowDetails(
+			self.ConfigObj, self.client_id, flow_id)
+		require.NoError(t, err)
+		// Flow not complete yet - still an outstanding request.
+		return flows_proto.ArtifactCollectorContext_RUNNING ==
+			details.Context.State
+	})
 
-	// The collection_context is marked as errored.
-	collection_context := &flows_proto.ArtifactCollectorContext{}
-	path_manager := paths.NewFlowPathManager(self.client_id, flow_id)
-	err = db.GetSubject(self.ConfigObj, path_manager.Path(), collection_context)
-	require.NoError(t, err)
-
-	// Flow not complete yet - still an outstanding request.
-	require.Equal(self.T(), flows_proto.ArtifactCollectorContext_RUNNING,
-		collection_context.State)
-
+	// Now complete both queries
 	runner.ProcessSingleMessage(
 		context.Background(),
 		&crypto_proto.VeloMessage{
 			Source:    self.client_id,
 			SessionId: flow_id,
 			RequestId: constants.ProcessVQLResponses,
-			Status: &crypto_proto.VeloStatus{
-				Status:  crypto_proto.VeloStatus_OK,
-				QueryId: 1,
+			FlowStats: &crypto_proto.FlowStats{
+				QueryStatus: []*crypto_proto.VeloStatus{
+					{Status: crypto_proto.VeloStatus_OK, QueryId: 1},
+					{Status: crypto_proto.VeloStatus_OK, QueryId: 2},
+				},
 			},
 		})
-	runner.Close(context.Background())
+	defer runner.Close(context.Background())
 
-	// Flow should be complete now that second response arrived.
-	err = db.GetSubject(self.ConfigObj, path_manager.Path(), collection_context)
-	require.NoError(t, err)
+	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
+		// Flow should be complete now that second response arrived.
+		details, err := launcher.GetFlowDetails(
+			self.ConfigObj, self.client_id, flow_id)
+		require.NoError(t, err)
 
-	require.Equal(self.T(), flows_proto.ArtifactCollectorContext_FINISHED,
-		collection_context.State)
-
+		return flows_proto.ArtifactCollectorContext_FINISHED ==
+			details.Context.State
+	})
 }
 
 // Test flow cancellation
@@ -696,7 +648,8 @@ func (self *ServerTestSuite) TestCancellation() {
 	assert.NoError(t, err)
 
 	// Generic.Client.Info has two source preconditions in parallel
-	assert.Equal(t, len(tasks), 2)
+	assert.Equal(t, len(tasks), 1)
+	assert.Equal(t, len(tasks[0].FlowRequest.VQLClientActions), 2)
 
 	// Cancelling the flow will notify the client immediately.
 	launcher, err := services.GetLauncher(self.ConfigObj)
@@ -748,29 +701,28 @@ func (self *ServerTestSuite) TestUnknownFlow() {
 	runner.ProcessSingleMessage(
 		context.Background(),
 		&crypto_proto.VeloMessage{
-			Source:      self.client_id,
-			SessionId:   flow_id,
-			VQLResponse: &actions_proto.VQLResponse{},
+			Source:    self.client_id,
+			SessionId: flow_id,
+			FlowStats: &crypto_proto.FlowStats{
+				QueryStatus: []*crypto_proto.VeloStatus{
+					{Status: crypto_proto.VeloStatus_OK, QueryId: 1},
+				},
+			},
 		})
 
-	// This should send a cancellation message to the client.
-	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
-	assert.NoError(t, err)
-
-	tasks, err := client_info_manager.PeekClientTasks(context.Background(), self.client_id)
-	assert.NoError(t, err)
-	assert.Equal(t, len(tasks), 1)
-
-	// Client will cancel all in flight queries from this session
-	// id.
-	require.Equal(t, tasks[0].SessionId, flow_id)
-	require.NotNil(t, tasks[0].Cancel)
+	// We used to send cancellation message to the client, but this
+	// too expensive for the server to keep track of. Now we just
+	// write data in the flow as if it exists anyway.
 
 	// The flow does not exist - make sure it still does not.
 	collection_context := &flows_proto.ArtifactCollectorContext{}
 	path_manager := paths.NewFlowPathManager(self.client_id, flow_id)
 	err = db.GetSubject(self.ConfigObj, path_manager.Path(), collection_context)
 	require.Error(t, err, os.ErrNotExist)
+
+	// The flow stats are written as normal.
+	err = db.GetSubject(self.ConfigObj, path_manager.Stats(), collection_context)
+	assert.NoError(t, err)
 }
 
 func TestServerTestSuite(t *testing.T) {

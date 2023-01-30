@@ -25,7 +25,6 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
-	"strings"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
@@ -45,7 +44,7 @@ import (
 
 type LogWriter struct {
 	config_obj *config_proto.Config
-	responder  *responder.Responder
+	responder  responder.Responder
 	ctx        context.Context
 }
 
@@ -63,7 +62,7 @@ type VQLClientAction struct{}
 func (self VQLClientAction) StartQuery(
 	config_obj *config_proto.Config,
 	ctx context.Context,
-	responder *responder.Responder,
+	responder responder.Responder,
 	arg *actions_proto.VQLCollectorArgs) {
 
 	// Just ignore requests that are too old.
@@ -111,6 +110,8 @@ func (self VQLClientAction) StartQuery(
 		responder.RaiseError(ctx, "Query should be specified.")
 		return
 	}
+
+	name := GetQueryName(arg.Query)
 
 	// Clients do not have a copy of artifacts so they need to be
 	// sent all artifacts from the server.
@@ -164,7 +165,7 @@ func (self VQLClientAction) StartQuery(
 			"incorrect or missed results or even crashes.")
 	}
 
-	scope.Log("INFO:Starting query execution.")
+	scope.Log("INFO:Starting query execution for %v.", name)
 
 	throttler := NewThrottler(ctx, scope, float64(rate),
 		float64(cpu_limit), float64(iops_limit))
@@ -189,18 +190,19 @@ func (self VQLClientAction) StartQuery(
 			responder.RaiseError(ctx, msg)
 		}
 
-		scope.Log("INFO:Collection is done after %v", time.Since(start))
+		scope.Log("INFO:Collection %v is done after %v", name, time.Since(start))
 	}()
 
 	ok, err := CheckPreconditions(ctx, scope, arg)
 	if err != nil {
-		scope.Log("While evaluating preconditions: %v", err)
-		responder.RaiseError(ctx, fmt.Sprintf("While evaluating preconditions: %v", err))
+		scope.Log("%v: While evaluating preconditions: %v", name, err)
+		responder.RaiseError(ctx,
+			fmt.Sprintf("While evaluating preconditions: %v", err))
 		return
 	}
 
 	if !ok {
-		scope.Log("Skipping query due to preconditions")
+		scope.Log("INFO:%v: Skipping query due to preconditions", name)
 		responder.Return(ctx)
 		return
 	}
@@ -248,7 +250,7 @@ func (self VQLClientAction) StartQuery(
 
 			case <-time.After(time.Second * time.Duration(heartbeat)):
 				responder.Log(ctx, logging.DEFAULT,
-					fmt.Sprintf("Time %v: %s: Waiting for rows.",
+					fmt.Sprintf("%v: Time %v: %s: Waiting for rows.", name,
 						(uint64(time.Now().UTC().UnixNano()/1000)-
 							query_start)/1000000, query.Name))
 
@@ -257,10 +259,7 @@ func (self VQLClientAction) StartQuery(
 					query_log.Close()
 					break run_query
 				}
-				// Skip let queries since they never produce results.
-				if strings.HasPrefix(strings.ToLower(query.VQL), "let") {
-					continue
-				}
+
 				response := &actions_proto.VQLResponse{
 					Query:         query,
 					QueryId:       uint64(query_idx),
@@ -271,6 +270,11 @@ func (self VQLClientAction) StartQuery(
 					Timestamp:     uint64(time.Now().UTC().UnixNano() / 1000),
 				}
 
+				// Do not send empty responses
+				if result.TotalRows == 0 {
+					continue
+				}
+
 				row_tracker.AddRows(query, uint64(result.TotalRows))
 
 				// Don't log empty VQL statements.
@@ -278,7 +282,8 @@ func (self VQLClientAction) StartQuery(
 					responder.Log(ctx,
 						logging.DEFAULT,
 						fmt.Sprintf(
-							"Time %v: %s: Sending response part %d %s (%d rows).",
+							"%v: Time %v: %s: Sending response part %d %s (%d rows).",
+							name,
 							(response.Timestamp-query_start)/1000000,
 							query.Name,
 							result.Part,
@@ -287,7 +292,7 @@ func (self VQLClientAction) StartQuery(
 						))
 				}
 				response.Columns = result.Columns
-				responder.AddResponse(ctx, &crypto_proto.VeloMessage{
+				responder.AddResponse(&crypto_proto.VeloMessage{
 					VQLResponse: response})
 			}
 		}
@@ -295,7 +300,7 @@ func (self VQLClientAction) StartQuery(
 
 	if uploader.Count > 0 {
 		responder.Log(ctx, logging.DEFAULT,
-			fmt.Sprintf("Uploaded %v files.", uploader.Count))
+			fmt.Sprintf("%v: Uploaded %v files.", name, uploader.Count))
 	}
 
 	responder.Return(ctx)

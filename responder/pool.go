@@ -1,3 +1,5 @@
+// +build XXXX
+
 package responder
 
 import (
@@ -28,7 +30,6 @@ import (
 // pool client immediately.
 
 var (
-	mu                       sync.Mutex
 	GlobalPoolEventResponder *PoolEventResponder
 )
 
@@ -67,6 +68,7 @@ func (self *PoolEventResponder) RegisterPoolClientResponder(
 
 // Gets a new responder which is feeding the GlobalPoolEventResponder
 func (self *PoolEventResponder) NewResponder(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	req *crypto_proto.VeloMessage) *Responder {
 	// The PoolEventResponder input
@@ -74,9 +76,9 @@ func (self *PoolEventResponder) NewResponder(
 
 	// Prepare a new responder that will feed us.
 	result := &Responder{
-		request: req,
-		output:  in,
-		logger:  logging.GetLogger(config_obj, &logging.ClientComponent),
+		ctx:    ctx,
+		output: in,
+		logger: logging.GetLogger(config_obj, &logging.ClientComponent),
 	}
 
 	go func() {

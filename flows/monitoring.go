@@ -1,3 +1,7 @@
+// NOTE: This file implements the old Client communication protocol. It is
+// here to provide backwards communication with older clients and will
+// eventually be removed.
+
 package flows
 
 import (
@@ -24,6 +28,11 @@ var (
 		Help: "Total number of event rows received from clients.",
 	})
 )
+
+type jsonBatch struct {
+	bytes.Buffer
+	row_count int
+}
 
 // Receive monitoring messages from the client.
 func MonitoringProcessMessage(
@@ -100,7 +109,7 @@ func flushContextLogsMonitoring(
 
 			// Write the logs asynchronously
 			rs_writer, err = result_sets.NewTimedResultSetWriter(
-				file_store_factory, log_path_manager, json.NoEncOpts,
+				file_store_factory, log_path_manager, json.DefaultEncOpts(),
 				utils.BackgroundWriter)
 			if err != nil {
 				return err
@@ -125,7 +134,7 @@ func (self *CollectionContext) batchRows(
 	artifact_name string, jsonl []byte) {
 	batch, pres := self.monitoring_batch[artifact_name]
 	if !pres {
-		batch = &bytes.Buffer{}
+		batch = &jsonBatch{}
 	}
 	batch.Write(jsonl)
 	self.monitoring_batch[artifact_name] = batch
@@ -144,7 +153,7 @@ func flushMonitoringLogs(
 	for query_name, jsonl_buff := range collection_context.monitoring_batch {
 		err := journal.PushJsonlToArtifact(
 			config_obj,
-			jsonl_buff.Bytes(),
+			jsonl_buff.Bytes(), jsonl_buff.row_count,
 			query_name,
 			collection_context.ClientId,
 			collection_context.SessionId)

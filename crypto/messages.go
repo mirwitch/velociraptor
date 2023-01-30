@@ -7,12 +7,16 @@ import (
 	"google.golang.org/protobuf/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
-	"www.velocidex.com/golang/velociraptor/responder"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 // Once a message is decoded the MessageInfo contains metadata about it.
 type MessageInfo struct {
+	// Communication version:
+	// 3 - All versions until 0.6.8
+	// 4 - Release 0.6.8
+	Version uint32
+
 	// The compressed MessageList protobufs sent in each POST.
 	RawCompressed [][]byte
 	Authenticated bool
@@ -26,7 +30,8 @@ type MessageInfo struct {
 // immediately use the decompressed buffer and not hold it around.
 func (self *MessageInfo) IterateJobs(
 	ctx context.Context, config_obj *config_proto.Config,
-	processor func(ctx context.Context, msg *crypto_proto.VeloMessage)) error {
+	processor func(ctx context.Context,
+		msg *crypto_proto.VeloMessage) error) (rerr error) {
 	for _, raw := range self.RawCompressed {
 		if self.Compression == crypto_proto.PackedMessageList_ZCOMPRESSION {
 			decompressed, err := utils.Uncompress(ctx, raw)
@@ -49,16 +54,9 @@ func (self *MessageInfo) IterateJobs(
 			job.Source = self.Source
 			job.OrgId = self.OrgId
 
-			// For backwards compatibility normalize old
-			// client messages to new format.
-			err = responder.NormalizeVeloMessageForBackwardCompatibility(job)
-			if err != nil {
-				return err
-			}
-
-			processor(ctx, job)
+			rerr = processor(ctx, job)
 		}
 	}
 
-	return nil
+	return rerr
 }

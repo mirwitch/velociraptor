@@ -1,3 +1,5 @@
+// +build XXXX
+
 /*
    The pool client pretends to be a large number of clients in order
    to exert a large load on the server.  In reality each client is
@@ -150,7 +152,7 @@ func (self *PoolClientExecutor) maybeUpdateEventTable(
 	fmt.Printf("Installing new event table for version %v\n", req.UpdateEventTable.Version)
 
 	g_responder := responder.GlobalPoolEventResponder
-	pool_responder := g_responder.NewResponder(self.config_obj, req)
+	pool_responder := g_responder.NewResponder(ctx, self.config_obj, req)
 	actions.UpdateEventTable{}.Run(
 		self.config_obj, ctx, pool_responder, req.UpdateEventTable)
 

@@ -1,4 +1,4 @@
-package api
+package api_test
 
 import (
 	"testing"
@@ -7,6 +7,7 @@ import (
 	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/protobuf/proto"
+	"www.velocidex.com/golang/velociraptor/api"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
@@ -30,7 +31,7 @@ func (self *DatastoreAPITest) SetupTest() {
 
 	self.TestSuite.SetupTest()
 
-	server_builder, err := NewServerBuilder(
+	server_builder, err := api.NewServerBuilder(
 		self.Sm.Ctx, self.ConfigObj, self.Sm.Wg)
 	assert.NoError(self.T(), err)
 
@@ -38,7 +39,7 @@ func (self *DatastoreAPITest) SetupTest() {
 	assert.NoError(self.T(), err)
 
 	// Now bring up an API server.
-	self.ConfigObj.Frontend.ServerServices = &config_proto.ServerServicesConfig{}
+	self.ConfigObj.Services = &config_proto.ServerServicesConfig{}
 
 	// Wait for the server to come up.
 	vtesting.WaitUntil(2*time.Second, self.T(), func() bool {

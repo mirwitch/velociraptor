@@ -138,6 +138,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 )
 
@@ -539,6 +540,10 @@ func (self *Launcher) ScheduleArtifactCollectionFromCollectorArgs(
 		return "", errors.New("Client id not provided.")
 	}
 
+	if !utils.ValidateClientId(client_id) {
+		return "", errors.New("Client id not valid.")
+	}
+
 	db, err := datastore.GetDB(config_obj)
 	if err != nil {
 		return "", err
@@ -551,21 +556,32 @@ func (self *Launcher) ScheduleArtifactCollectionFromCollectorArgs(
 
 	session_id := NewFlowId(client_id)
 
+	// How long to batch log messages for on the client.
+	batch_delay := uint64(2000)
+	if collector_request.LogBatchTime > 0 {
+		batch_delay = collector_request.LogBatchTime
+	} else if config_obj.Frontend != nil &&
+		config_obj.Frontend.Resources != nil &&
+		config_obj.Frontend.Resources.DefaultLogBatchTime > 0 {
+		batch_delay = config_obj.Frontend.Resources.DefaultLogBatchTime
+	}
+
 	// Compile all the requests into specific tasks to be sent to the
 	// client.
-	tasks := []*crypto_proto.VeloMessage{}
-	for id, arg := range vql_collector_args {
+	task := &crypto_proto.VeloMessage{
+		SessionId: session_id,
+		RequestId: constants.ProcessVQLResponses,
+		FlowRequest: &crypto_proto.FlowRequest{
+			LogBatchTime:   batch_delay,
+			MaxRows:        collector_request.MaxRows,
+			MaxUploadBytes: collector_request.MaxUploadBytes,
+		},
+	}
+
+	for _, arg := range vql_collector_args {
 		// If sending to the server record who actually launched this.
 		if client_id == "server" {
 			arg.Principal = collector_request.Creator
-		}
-
-		// The task we will schedule for the client.
-		task := &crypto_proto.VeloMessage{
-			QueryId:         uint64(id),
-			SessionId:       session_id,
-			RequestId:       constants.ProcessVQLResponses,
-			VQLClientAction: arg,
 		}
 
 		// Send an urgent request to the client.
@@ -573,7 +589,8 @@ func (self *Launcher) ScheduleArtifactCollectionFromCollectorArgs(
 			task.Urgent = true
 		}
 
-		tasks = append(tasks, task)
+		task.FlowRequest.VQLClientActions = append(
+			task.FlowRequest.VQLClientActions, arg)
 	}
 
 	// Save the collection context first.
@@ -582,12 +599,12 @@ func (self *Launcher) ScheduleArtifactCollectionFromCollectorArgs(
 	// Generate a new collection context for this flow.
 	collection_context := &flows_proto.ArtifactCollectorContext{
 		SessionId:           session_id,
-		CreateTime:          uint64(time.Now().UnixNano() / 1000),
+		CreateTime:          uint64(utils.GetTime().Now().UnixNano() / 1000),
 		State:               flows_proto.ArtifactCollectorContext_RUNNING,
 		Request:             collector_request,
 		ClientId:            client_id,
-		TotalRequests:       int64(len(tasks)),
-		OutstandingRequests: int64(len(tasks)),
+		TotalRequests:       int64(len(vql_collector_args)),
+		OutstandingRequests: int64(len(vql_collector_args)),
 	}
 
 	// Store the collection_context first, then queue all the tasks.
@@ -597,8 +614,9 @@ func (self *Launcher) ScheduleArtifactCollectionFromCollectorArgs(
 
 		func() {
 			// Queue and notify the client about the new tasks
-			client_manager.QueueMessagesForClient(
-				ctx, client_id, tasks, true /* notify */)
+			client_manager.QueueMessageForClient(
+				ctx, client_id, task,
+				services.NOTIFY_CLIENT, utils.BackgroundWriter)
 		})
 	if err != nil {
 		return "", err
@@ -607,7 +625,9 @@ func (self *Launcher) ScheduleArtifactCollectionFromCollectorArgs(
 	// Record the tasks for provenance of what we actually did.
 	err = db.SetSubjectWithCompletion(config_obj,
 		flow_path_manager.Task(),
-		&api_proto.ApiFlowRequestDetails{Items: tasks}, nil)
+		&api_proto.ApiFlowRequestDetails{
+			Items: []*crypto_proto.VeloMessage{task},
+		}, nil)
 	if err != nil {
 		return "", err
 	}

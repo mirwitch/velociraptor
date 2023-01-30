@@ -29,10 +29,10 @@ import (
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
-	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 // Filter will be applied on flows to remove those we dont care about.
@@ -56,11 +56,28 @@ func (self *Launcher) GetFlows(
 		return nil, err
 	}
 
+	seen := make(map[string]api.DSPathSpec)
+
 	// We only care about the flow contexts
 	for _, urn := range all_flow_urns {
-		if !urn.IsDir() {
-			flow_urns = append(flow_urns, urn)
+		// We really prefer the more modern JSON datastore objects but
+		// we do support older protobuf based objects if they are
+		// there.
+		if urn.Type() == api.PATH_TYPE_DATASTORE_JSON {
+			seen[urn.Base()] = urn
+			continue
 		}
+
+		if urn.Type() == api.PATH_TYPE_DATASTORE_PROTO {
+			_, pres := seen[urn.Base()]
+			if !pres {
+				seen[urn.Base()] = urn
+			}
+		}
+	}
+
+	for _, v := range seen {
+		flow_urns = append(flow_urns, v)
 	}
 
 	// No flows were returned.
@@ -91,18 +108,9 @@ func (self *Launcher) GetFlows(
 			continue
 		}
 
-		collection_context := &flows_proto.ArtifactCollectorContext{}
-		err := db.GetSubject(config_obj, urn, collection_context)
-		if err != nil || collection_context.SessionId == "" {
-			logging.GetLogger(
-				config_obj, &logging.FrontendComponent).
-				Error("Unable to open collection: %v", err)
-			continue
-		}
-
-		if !include_archived &&
-			collection_context.State ==
-				flows_proto.ArtifactCollectorContext_ARCHIVED {
+		collection_context, err := LoadCollectionContext(
+			config_obj, client_id, urn.Base())
+		if err != nil {
 			continue
 		}
 
@@ -129,18 +137,6 @@ func (self *Launcher) GetFlowDetails(
 	collection_context, err := LoadCollectionContext(config_obj, client_id, flow_id)
 	if err != nil {
 		return nil, err
-	}
-
-	ping := &flows_proto.PingContext{}
-	db, err := datastore.GetDB(config_obj)
-	if err != nil {
-		return nil, err
-	}
-
-	flow_path_manager := paths.NewFlowPathManager(client_id, flow_id)
-	err = db.GetSubject(config_obj, flow_path_manager.Ping(), ping)
-	if err == nil && ping.ActiveTime > collection_context.ActiveTime {
-		collection_context.ActiveTime = ping.ActiveTime
 	}
 
 	availableDownloads, _ := availableDownloadFiles(config_obj, client_id, flow_id)
@@ -182,6 +178,50 @@ func LoadCollectionContext(
 	if collection_context.SessionId == "" {
 		return nil, errors.New("Unknown flow " + client_id + " " + flow_id)
 	}
+
+	// Try to open the stats context
+	stats_context := &flows_proto.ArtifactCollectorContext{}
+	err = db.GetSubject(
+		config_obj, flow_path_manager.Stats(), stats_context)
+	if err != nil {
+		UpdateFlowStats(collection_context)
+		return collection_context, nil
+	}
+
+	// Copy relevant fields into the main context
+	if stats_context.TotalUploadedFiles > 0 {
+		collection_context.TotalUploadedFiles = stats_context.TotalUploadedFiles
+	}
+
+	if stats_context.TotalExpectedUploadedBytes > 0 {
+		collection_context.TotalExpectedUploadedBytes = stats_context.TotalExpectedUploadedBytes
+	}
+
+	if stats_context.TotalUploadedBytes > 0 {
+		collection_context.TotalUploadedBytes = stats_context.TotalUploadedBytes
+	}
+
+	if stats_context.TotalCollectedRows > 0 {
+		collection_context.TotalCollectedRows = stats_context.TotalCollectedRows
+	}
+
+	if stats_context.TotalLogs > 0 {
+		collection_context.TotalLogs = stats_context.TotalLogs
+	}
+
+	if stats_context.ActiveTime > 0 {
+		collection_context.ActiveTime = stats_context.ActiveTime
+	}
+
+	if len(stats_context.ArtifactsWithResults) > 0 {
+		collection_context.ArtifactsWithResults = stats_context.ArtifactsWithResults
+	}
+
+	if len(stats_context.QueryStats) > 0 {
+		collection_context.QueryStats = stats_context.QueryStats
+	}
+
+	UpdateFlowStats(collection_context)
 
 	return collection_context, nil
 }
@@ -247,7 +287,7 @@ func (self *Launcher) CancelFlow(
 		&crypto_proto.VeloMessage{
 			Cancel:    &crypto_proto.Cancel{},
 			SessionId: flow_id,
-		}, true /* notify */, nil)
+		}, services.NOTIFY_CLIENT, utils.BackgroundWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -291,4 +331,101 @@ func (self *Launcher) GetFlowRequests(
 
 	result.Items = flow_details.Items[offset:end]
 	return result, nil
+}
+
+// The collection_context contains high level stats that summarise the
+// colletion. We derive this information from the specific results of
+// each query.
+func UpdateFlowStats(collection_context *flows_proto.ArtifactCollectorContext) {
+	// Support older colletions which do not have this info
+	if len(collection_context.QueryStats) == 0 {
+		return
+	}
+
+	// Now update the overall collection statuses based on all the
+	// individual query status. The collection status is a high level
+	// overview of the entire collection.
+	if collection_context.State == flows_proto.ArtifactCollectorContext_UNSET {
+		collection_context.State = flows_proto.ArtifactCollectorContext_RUNNING
+	}
+
+	// Total execution duration is the sum of all the query durations
+	// (this can be faster than wall time if queries run in parallel)
+	collection_context.ExecutionDuration = 0
+	collection_context.TotalUploadedBytes = 0
+	collection_context.TotalExpectedUploadedBytes = 0
+	collection_context.TotalUploadedFiles = 0
+	collection_context.TotalCollectedRows = 0
+	collection_context.ActiveTime = 0
+	collection_context.StartTime = 0
+
+	// Number of queries completed.
+	completed_count := 0
+
+	for _, s := range collection_context.QueryStats {
+		collection_context.ExecutionDuration += s.Duration
+		collection_context.TotalUploadedBytes += uint64(s.UploadedBytes)
+		collection_context.TotalExpectedUploadedBytes += uint64(s.ExpectedUploadedBytes)
+		collection_context.TotalUploadedFiles += uint64(s.UploadedFiles)
+		collection_context.TotalCollectedRows += uint64(s.ResultRows)
+
+		if s.LastActive > collection_context.ActiveTime {
+			collection_context.ActiveTime = s.LastActive
+		}
+
+		if collection_context.StartTime == 0 ||
+			collection_context.StartTime > s.FirstActive {
+			collection_context.StartTime = s.FirstActive
+		}
+
+		// Get the first errored query and mark the entire collection_context with it.
+		if collection_context.State == flows_proto.ArtifactCollectorContext_RUNNING &&
+			s.Status == crypto_proto.VeloStatus_GENERIC_ERROR {
+			collection_context.State = flows_proto.ArtifactCollectorContext_ERROR
+			collection_context.Status = s.ErrorMessage
+			collection_context.Backtrace = s.Backtrace
+		}
+
+		// Query is considered complete if it is in the ERROR or OK state
+		if s.Status == crypto_proto.VeloStatus_OK ||
+			s.Status == crypto_proto.VeloStatus_GENERIC_ERROR {
+			completed_count++
+		}
+
+		// Merge the NamesWithResponse for all the queries.
+		for _, a := range s.NamesWithResponse {
+			if a != "" &&
+				!utils.InString(collection_context.ArtifactsWithResults, a) {
+				collection_context.ArtifactsWithResults = append(
+					collection_context.ArtifactsWithResults, a)
+			}
+		}
+	}
+
+	// How many queries are outstanding still?
+	collection_context.TotalRequests = int64(len(collection_context.QueryStats))
+	collection_context.OutstandingRequests = collection_context.TotalRequests -
+		int64(completed_count)
+
+	// All queries are accounted for.
+	if collection_context.OutstandingRequests <= 0 &&
+		collection_context.State == flows_proto.ArtifactCollectorContext_RUNNING {
+		collection_context.State = flows_proto.ArtifactCollectorContext_FINISHED
+	}
+}
+
+func (self *Launcher) WriteFlow(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	flow *flows_proto.ArtifactCollectorContext) error {
+
+	db, err := datastore.GetDB(config_obj)
+	if err != nil {
+		return err
+	}
+
+	flow_path_manager := paths.NewFlowPathManager(flow.ClientId, flow.SessionId)
+	return db.SetSubjectWithCompletion(
+		config_obj, flow_path_manager.Path(),
+		flow, utils.BackgroundWriter)
 }

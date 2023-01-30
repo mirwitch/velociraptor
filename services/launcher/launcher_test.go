@@ -19,6 +19,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
+	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/json"
@@ -26,6 +27,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/responder"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vtesting"
 	"www.velocidex.com/golang/vfilter"
 
 	// Load plugins (timestamp, parse_csv)
@@ -558,9 +560,11 @@ func (self *LauncherTestSuite) TestCompilingObfuscation() {
 
 	compiled, err := launcher.CompileCollectorArgs(
 		ctx, self.ConfigObj, acl_manager, repository,
-		services.CompilerOptions{}, request)
+		services.CompilerOptions{
+			ObfuscateNames: false,
+		}, request)
 	assert.NoError(self.T(), err)
-	assert.Equal(self.T(), compiled[0].Query[1].Description, "")
+	assert.Equal(self.T(), compiled[0].Query[1].Name, "Test.Artifact")
 }
 
 func (self *LauncherTestSuite) TestCompilingPermissions() {
@@ -655,14 +659,21 @@ func (self *LauncherTestSuite) TestParameterTypes() {
 	assert.NoError(self.T(), err)
 
 	// Now run the VQL and receive the rows back
-	test_responder := responder.TestResponder()
+	test_responder := responder.TestResponderWithFlowId(
+		self.ConfigObj, "F.TestParameterTypes")
 	for _, vql_request := range compiled {
 		actions.VQLClientAction{}.StartQuery(
 			self.ConfigObj, ctx, test_responder, vql_request)
 	}
 
-	results := getResponses(test_responder)
-	goldie.Assert(self.T(), "TestParameterTypes", json.MustMarshalIndent(results))
+	var messages []*crypto_proto.VeloMessage
+	vtesting.WaitUntil(time.Second, self.T(), func() bool {
+		messages = test_responder.Drain.Messages()
+		return len(messages) > 0
+	})
+
+	goldie.Assert(self.T(), "TestParameterTypes",
+		json.MustMarshalIndent(getResponses(messages)))
 }
 
 var (
@@ -796,14 +807,21 @@ func (self *LauncherTestSuite) TestParameterTypesDeps() {
 	assert.NoError(self.T(), err)
 
 	// Now run the VQL and receive the rows back
-	test_responder := responder.TestResponder()
+	test_responder := responder.TestResponderWithFlowId(
+		self.ConfigObj, "F.TestParameterTypesDeps")
 	for _, vql_request := range compiled {
 		actions.VQLClientAction{}.StartQuery(
 			self.ConfigObj, ctx, test_responder, vql_request)
 	}
 
-	results := getResponses(test_responder)
-	goldie.Assert(self.T(), "TestParameterTypesDeps", json.MustMarshalIndent(results))
+	var messages []*ordereddict.Dict
+	vtesting.WaitUntil(time.Second, self.T(), func() bool {
+		messages = getResponses(test_responder.Drain.Messages())
+		return len(messages) > 0
+	})
+
+	goldie.Assert(self.T(), "TestParameterTypesDeps",
+		json.MustMarshalIndent(messages))
 }
 
 func (self *LauncherTestSuite) TestParameterTypesDepsQuery() {
@@ -1050,7 +1068,8 @@ sources:
 	repository := manager.NewRepository()
 
 	for _, definition := range artifact_definitions {
-		_, err := repository.LoadYaml(definition, true /* validate */, true)
+		_, err := repository.LoadYaml(definition,
+			services.ValidateArtifact, services.ArtifactIsBuiltIn)
 		assert.Error(self.T(), err, "Failed to reject "+definition)
 	}
 
@@ -1078,7 +1097,7 @@ sources:
 	repository := manager.NewRepository()
 
 	for _, definition := range artifact_definitions {
-		_, err := repository.LoadYaml(definition, true /* validate */, true)
+		_, err := repository.LoadYaml(definition, services.ValidateArtifact, services.ArtifactIsBuiltIn)
 		assert.NoError(self.T(), err)
 	}
 

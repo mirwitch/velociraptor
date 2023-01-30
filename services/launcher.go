@@ -78,6 +78,8 @@ type CompilerOptions struct {
 
 	// Ignore Missing Artifacts without raising an error.
 	IgnoreMissingArtifacts bool
+
+	LogBatchTime uint64
 }
 
 type Launcher interface {
@@ -166,6 +168,11 @@ type Launcher interface {
 		config_obj *config_proto.Config,
 		client_id string, flow_id string,
 		offset uint64, count uint64) (*api_proto.ApiFlowRequestDetails, error)
+
+	WriteFlow(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		flow *flows_proto.ArtifactCollectorContext) error
 
 	DeleteFlow(
 		ctx context.Context,

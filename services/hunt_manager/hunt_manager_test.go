@@ -36,9 +36,9 @@ type HuntTestSuite struct {
 
 func (self *HuntTestSuite) SetupTest() {
 	self.ConfigObj = self.TestSuite.LoadConfig()
-	self.ConfigObj.Frontend.ServerServices.FrontendServer = true
-	self.ConfigObj.Frontend.ServerServices.HuntDispatcher = true
-	self.ConfigObj.Frontend.ServerServices.HuntManager = true
+	self.ConfigObj.Services.FrontendServer = true
+	self.ConfigObj.Services.HuntDispatcher = true
+	self.ConfigObj.Services.HuntManager = true
 
 	self.TestSuite.SetupTest()
 
@@ -697,6 +697,7 @@ func (self *HuntTestSuite) TestHuntManagerMutations() {
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("Timestamp", time.Now().UTC().Unix()).
 			Set("Flow", flow_obj).
+			Set("FlowId", flow_obj.SessionId).
 			Set("ClientId", self.client_id),
 		}, "System.Flow.Completion", self.client_id, ""))
 
@@ -775,6 +776,7 @@ func (self *HuntTestSuite) TestHuntManagerErrors() {
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("Timestamp", time.Now().UTC().Unix()).
 			Set("Flow", flow_obj).
+			Set("FlowId", flow_obj.SessionId).
 			Set("ClientId", self.client_id),
 		}, "System.Flow.Completion", self.client_id, ""))
 

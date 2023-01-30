@@ -1,0 +1,147 @@
+{
+ "responses": [
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_0",
+     "accessor": "data"
+    },
+    "size": 11,
+    "stored_size": 11,
+    "data": "SGVsbG8gd29ybGQ="
+   }
+  },
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_0",
+     "accessor": "data"
+    },
+    "offset": 11,
+    "size": 11,
+    "stored_size": 11,
+    "eof": true
+   }
+  },
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_1",
+     "accessor": "data"
+    },
+    "size": 11,
+    "stored_size": 11,
+    "data": "SGVsbG8gd29ybGQ=",
+    "upload_number": 1
+   }
+  },
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_1",
+     "accessor": "data"
+    },
+    "offset": 11,
+    "size": 11,
+    "stored_size": 11,
+    "eof": true,
+    "upload_number": 1
+   }
+  },
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_2",
+     "accessor": "data"
+    },
+    "size": 11,
+    "stored_size": 11,
+    "data": "SGVsbG8gd29ybGQ=",
+    "upload_number": 2
+   }
+  },
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_2",
+     "accessor": "data"
+    },
+    "offset": 11,
+    "size": 11,
+    "stored_size": 11,
+    "eof": true,
+    "upload_number": 2
+   }
+  },
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_3",
+     "accessor": "data"
+    },
+    "size": 11,
+    "stored_size": 11,
+    "data": "SGVsbG8gd29ybGQ=",
+    "upload_number": 3
+   }
+  },
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_3",
+     "accessor": "data"
+    },
+    "offset": 11,
+    "size": 11,
+    "stored_size": 11,
+    "eof": true,
+    "upload_number": 3
+   }
+  },
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_4",
+     "accessor": "data"
+    },
+    "size": 11,
+    "stored_size": 11,
+    "data": "SGVsbG8gd29ybGQ=",
+    "upload_number": 4
+   }
+  },
+  {
+   "session_id": "Test22",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "file_4",
+     "accessor": "data"
+    },
+    "offset": 11,
+    "size": 11,
+    "stored_size": 11,
+    "eof": true,
+    "upload_number": 4
+   }
+  }
+ ]
+}

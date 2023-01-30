@@ -235,6 +235,10 @@ message ClientConfig {
     CryptoConfig Crypto = 33;
 
     bool disable_compression = 37;
+
+    // How often clients inform the server about flow progress
+    // (default 5 seconds).
+    uint64 default_server_flow_stats_update = 39;
 }
 
 message APIConfig {
@@ -556,6 +560,15 @@ message FrontendResourceControl {
     // size of the file - when it is exceeded, the file will be
     // truncated and events will be lost. Default is 1gb
     int64 max_journal_buffer_size = 28;
+
+    // The maximum time in seconds the client will batch log messages
+    // before forwarding them to the server (default 1 second).
+    uint64 default_log_batch_time = 31;
+
+    // The maximum time in seconds the client will batch minitoring
+    // log messages before forwarding them to the server (default 600
+    // second).
+    uint64 default_monitoring_log_batch_time = 32;
 }
 
 
@@ -651,10 +664,6 @@ message FrontendConfig {
 
     int64 GRPC_pool_max_size = 17;
     int64 GRPC_pool_max_wait = 18;
-
-    // The services that will run on this frontend. If not set, all
-    // services will run on the primary frontend.
-    ServerServicesConfig server_services = 20;
 
     FrontendResourceControl resources = 27;
 
@@ -1046,4 +1055,10 @@ message Config {
     // does not know or use its own org id.
     string org_id = 36;
     string org_name = 37;
+
+
+    // The services that will run at initialization. Note this is not
+    // set in the config file by the user but is propagated from the
+    // startup code.
+    ServerServicesConfig services = 38;
 }

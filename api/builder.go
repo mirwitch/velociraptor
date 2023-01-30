@@ -117,7 +117,7 @@ func (self *Builder) withAutoCertFrontendSelfSignedGUI(
 	logger := logging.GetLogger(config_obj, &logging.GUIComponent)
 	logger.Info("Autocert is enabled but GUI port is not 443, starting Frontend with autocert and GUI with self signed.")
 
-	if config_obj.Frontend.ServerServices.GuiServer && config_obj.GUI != nil {
+	if config_obj.Services.GuiServer && config_obj.GUI != nil {
 		mux := http.NewServeMux()
 
 		router, err := PrepareGUIMux(ctx, config_obj, mux)
@@ -136,7 +136,7 @@ func (self *Builder) withAutoCertFrontendSelfSignedGUI(
 		}
 	}
 
-	if !config_obj.Frontend.ServerServices.FrontendServer {
+	if !config_obj.Services.FrontendServer {
 		return nil
 	}
 
@@ -166,7 +166,7 @@ func (self *Builder) WithAutocertGUI(
 
 	mux := http.NewServeMux()
 
-	if self.config_obj.Frontend.ServerServices.FrontendServer {
+	if self.config_obj.Services.FrontendServer {
 		err := server.PrepareFrontendMux(self.config_obj, self.server_obj, mux)
 		if err != nil {
 			return err
@@ -196,7 +196,7 @@ func startSharedSelfSignedFrontend(
 		return errors.New("Frontend not configured")
 	}
 
-	if config_obj.Frontend.ServerServices.FrontendServer {
+	if config_obj.Services.FrontendServer {
 		err := server.PrepareFrontendMux(config_obj, server_obj, mux)
 		if err != nil {
 			return err
@@ -226,13 +226,12 @@ func startSelfSignedFrontend(
 	config_obj *config_proto.Config,
 	server_obj *server.Server) error {
 
-	if config_obj.Frontend == nil ||
-		config_obj.Frontend.ServerServices == nil {
+	if config_obj.Services == nil {
 		return errors.New("Frontend not configured")
 	}
 
 	// Launch a new server for the GUI.
-	if config_obj.Frontend.ServerServices.GuiServer {
+	if config_obj.Services.GuiServer {
 		mux := http.NewServeMux()
 
 		router, err := PrepareGUIMux(ctx, config_obj, mux)
@@ -251,7 +250,7 @@ func startSelfSignedFrontend(
 		}
 	}
 
-	if !config_obj.Frontend.ServerServices.FrontendServer {
+	if !config_obj.Services.FrontendServer {
 		return nil
 	}
 
@@ -305,7 +304,8 @@ func StartFrontendHttps(
 		return errors.New("Frontend server not configured")
 	}
 
-	certs, err := getCertificates(config_obj)
+	tls_config := &tls.Config{}
+	err := getTLSConfig(config_obj, tls_config)
 	if err != nil {
 		return err
 	}
@@ -314,13 +314,6 @@ func StartFrontendHttps(
 		"%s:%d",
 		config_obj.Frontend.BindAddress,
 		config_obj.Frontend.BindPort)
-
-	expected_clients := int64(10000)
-	if config_obj.Frontend != nil &&
-		config_obj.Frontend.Resources != nil &&
-		config_obj.Frontend.Resources.ExpectedClients > 0 {
-		expected_clients = config_obj.Frontend.Resources.ExpectedClients
-	}
 
 	server := &http.Server{
 		Addr:     listenAddr,
@@ -331,23 +324,7 @@ func StartFrontendHttps(
 		ReadTimeout:  500 * time.Second,
 		WriteTimeout: 900 * time.Second,
 		IdleTimeout:  150 * time.Second,
-		TLSConfig: &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			ClientSessionCache: tls.NewLRUClientSessionCache(int(expected_clients)),
-			Certificates:       certs,
-			CurvePreferences: []tls.CurveID{tls.CurveP521,
-				tls.CurveP384, tls.CurveP256},
-
-			PreferServerCipherSuites: true,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-			},
-		},
+		TLSConfig:    tls_config,
 	}
 
 	wg.Add(1)
@@ -487,6 +464,19 @@ func StartFrontendWithAutocert(
 		Cache:      autocert.DirCache(cache_dir),
 	}
 
+	tls_config := &tls.Config{}
+	err := getTLSConfig(config_obj, tls_config)
+	if err != nil {
+		return err
+	}
+
+	// Autocert selects its own certificates by itself
+	// https://cs.opensource.google/go/x/crypto/+/refs/tags/v0.5.0:acme/autocert/autocert.go;l=227
+	cert_manager_config := certManager.TLSConfig()
+	tls_config.GetCertificate = cert_manager_config.GetCertificate
+	tls_config.NextProtos = cert_manager_config.NextProtos
+	tls_config.Certificates = nil
+
 	server := &http.Server{
 		// ACME protocol requires TLS be served over port 443.
 		Addr:     ":https",
@@ -497,7 +487,7 @@ func StartFrontendWithAutocert(
 		ReadTimeout:  500 * time.Second,
 		WriteTimeout: 900 * time.Second,
 		IdleTimeout:  300 * time.Second,
-		TLSConfig:    certManager.TLSConfig(),
+		TLSConfig:    tls_config,
 	}
 
 	// We must have port 80 open to serve the HTTP 01 challenge.
@@ -627,7 +617,8 @@ func StartSelfSignedGUI(
 		return errors.New("GUI server not configured")
 	}
 
-	certs, err := getCertificates(config_obj)
+	tls_config := &tls.Config{}
+	err := getTLSConfig(config_obj, tls_config)
 	if err != nil {
 		return err
 	}
@@ -645,21 +636,7 @@ func StartSelfSignedGUI(
 		ReadTimeout:  500 * time.Second,
 		WriteTimeout: 900 * time.Second,
 		IdleTimeout:  15 * time.Second,
-		TLSConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			CurvePreferences: []tls.CurveID{tls.CurveP521,
-				tls.CurveP384, tls.CurveP256},
-			Certificates:             certs,
-			PreferServerCipherSuites: true,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-			},
-		},
+		TLSConfig:    tls_config,
 	}
 
 	logger.Info("GUI is ready to handle TLS requests on <green>https://%s:%d/",
@@ -701,4 +678,35 @@ func get_hostname(fe_hostname, bind_addr string) string {
 		return fe_hostname
 	}
 	return bind_addr
+}
+
+// Prepare a TLS config with correct cipher choices.
+func getTLSConfig(config_obj *config_proto.Config, in *tls.Config) error {
+	certs, err := getCertificates(config_obj)
+	if err != nil {
+		return err
+	}
+
+	expected_clients := int64(10000)
+	if config_obj.Frontend != nil &&
+		config_obj.Frontend.Resources != nil &&
+		config_obj.Frontend.Resources.ExpectedClients > 0 {
+		expected_clients = config_obj.Frontend.Resources.ExpectedClients
+	}
+
+	in.MinVersion = tls.VersionTLS13
+	in.CurvePreferences = []tls.CurveID{
+		tls.CurveP521, tls.CurveP384, tls.CurveP256}
+	in.ClientSessionCache = tls.NewLRUClientSessionCache(int(expected_clients))
+	in.PreferServerCipherSuites = true
+	in.Certificates = certs
+	in.CipherSuites = []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+	}
+	return nil
 }
