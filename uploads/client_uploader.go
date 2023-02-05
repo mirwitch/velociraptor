@@ -18,7 +18,8 @@ import (
 )
 
 var (
-	BUFF_SIZE = int64(1024 * 1024)
+	BUFF_SIZE  = int64(1024 * 1024)
+	UPLOAD_CTX = "__uploads"
 )
 
 // An uploader delivering files from client to server.
@@ -41,6 +42,15 @@ func (self *VelociraptorUploader) Upload(
 	reader io.Reader) (
 	*UploadResponse, error) {
 
+	if store_as_name == nil {
+		store_as_name = filename
+	}
+
+	cached, pres := DeduplicateUploads(scope, store_as_name)
+	if pres {
+		return cached, nil
+	}
+
 	upload_id := self.Responder.NextUploadId()
 
 	// Try to collect sparse files if possible
@@ -48,16 +58,15 @@ func (self *VelociraptorUploader) Upload(
 		ctx, scope, filename, accessor, store_as_name,
 		expected_size, mtime, upload_id, reader)
 	if err == nil {
+		CacheUploadResult(scope, store_as_name, result)
 		return result, nil
-	}
-
-	if store_as_name == nil {
-		store_as_name = filename
 	}
 
 	result = &UploadResponse{
 		Path:       filename.String(),
 		StoredName: store_as_name.String(),
+		Accessor:   accessor,
+		Components: store_as_name.Components,
 	}
 
 	offset := uint64(0)
@@ -129,6 +138,8 @@ func (self *VelociraptorUploader) Upload(
 			result.StoredSize = offset
 			result.Sha256 = hex.EncodeToString(sha_sum.Sum(nil))
 			result.Md5 = hex.EncodeToString(md5_sum.Sum(nil))
+
+			CacheUploadResult(scope, store_as_name, result)
 			return result, nil
 		}
 	}
@@ -154,14 +165,17 @@ func (self *VelociraptorUploader) maybeUploadSparse(
 
 	index := &actions_proto.Index{}
 
+	if store_as_name == nil {
+		store_as_name = filename
+	}
+
 	// This is the response that will be passed into the VQL
 	// engine.
 	result := &UploadResponse{
-		Path: filename.String(),
-	}
-
-	if store_as_name == nil {
-		store_as_name = filename
+		Path:       filename.String(),
+		StoredName: store_as_name.String(),
+		Components: store_as_name.Components,
+		Accessor:   accessor,
 	}
 
 	self.Count += 1

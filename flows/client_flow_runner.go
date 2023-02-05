@@ -3,6 +3,7 @@ package flows
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
@@ -70,7 +71,7 @@ func (self *ClientFlowRunner) ProcessMonitoringMessage(
 		if err != nil {
 			return fmt.Errorf("MonitoringVQLResponse: %w", err)
 		}
-		return nil
+		return self.maybeProcessClientInfo(ctx, client_id, msg.VQLResponse)
 	}
 
 	if msg.LogMessage != nil {
@@ -98,8 +99,13 @@ func (self *ClientFlowRunner) MonitoringLogMessage(
 
 	artifact_name := artifacts.DeobfuscateString(
 		self.config_obj, response.Artifact)
-	if artifact_name == "" {
-		artifact_name = "Unknown"
+
+	// If we are not able to deobfuscate the artifact name properly
+	// (e.g. due to server keys changing) we really can not store the
+	// data anywhere so drop it.
+	if artifact_name == "" ||
+		strings.HasPrefix(artifact_name, "$") {
+		return nil
 	}
 
 	log_path_manager, err := artifact_paths.NewArtifactLogPathManager(
@@ -139,7 +145,13 @@ func (self *ClientFlowRunner) MonitoringVQLResponse(
 	// Deobfuscate the response if needed.
 	_ = artifacts.Deobfuscate(self.config_obj, response)
 
+	// If we are not able to deobfuscate the artifact name properly
+	// (e.g. due to server keys changing) we really can not store the
+	// data anywhere so drop it.
 	query_name := response.Query.Name
+	if query_name == "" || strings.HasPrefix(query_name, "$") {
+		return nil
+	}
 
 	journal, err := services.GetJournal(self.config_obj)
 	if err != nil {
@@ -400,6 +412,11 @@ func (self *ClientFlowRunner) VQLResponse(
 	err := artifacts.Deobfuscate(self.config_obj, response)
 	if err != nil {
 		return err
+	}
+
+	if response.Query.Name == "" ||
+		strings.HasPrefix(response.Query.Name, "$") {
+		return nil
 	}
 
 	path_manager, err := artifact_paths.NewArtifactPathManager(

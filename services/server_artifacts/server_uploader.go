@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	"github.com/go-errors/errors"
 	"www.velocidex.com/golang/velociraptor/accessors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
@@ -20,10 +21,11 @@ import (
 
 type ServerUploader struct {
 	*uploader.FileStoreUploader
-	path_manager  *paths.FlowPathManager
-	query_context QueryContext
-	config_obj    *config_proto.Config
-	session_id    string
+	path_manager       *paths.FlowPathManager
+	query_context      QueryContext
+	collection_context CollectionContextManager
+	config_obj         *config_proto.Config
+	session_id         string
 }
 
 func (self *ServerUploader) Upload(
@@ -38,6 +40,19 @@ func (self *ServerUploader) Upload(
 	ctime time.Time,
 	btime time.Time,
 	reader io.Reader) (*uploads.UploadResponse, error) {
+
+	if filename == nil {
+		return nil, errors.New("Not found")
+	}
+
+	if store_as_name == nil {
+		store_as_name = filename
+	}
+
+	cached, pres := uploads.DeduplicateUploads(scope, store_as_name)
+	if pres {
+		return cached, nil
+	}
 
 	result, err := self.FileStoreUploader.Upload(ctx, scope, filename,
 		accessor, store_as_name, expected_size,
@@ -73,6 +88,8 @@ func (self *ServerUploader) Upload(
 		s.ExpectedUploadedBytes += int64(result.Size)
 	})
 
+	self.collection_context.ChargeBytes(int64(result.Size))
+
 	row := ordereddict.NewDict().
 		Set("Timestamp", timestamp).
 		Set("ClientId", "server").
@@ -87,6 +104,8 @@ func (self *ServerUploader) Upload(
 		"System.Upload.Completion",
 		"server", self.session_id,
 	)
+
+	uploads.CacheUploadResult(scope, store_as_name, result)
 	return result, err
 }
 
@@ -94,14 +113,16 @@ func NewServerUploader(
 	config_obj *config_proto.Config,
 	session_id string,
 	path_manager *paths.FlowPathManager,
+	collection_context CollectionContextManager,
 	query_context QueryContext) uploads.Uploader {
 	return &ServerUploader{
 		FileStoreUploader: uploader.NewFileStoreUploader(config_obj,
 			file_store.GetFileStore(config_obj),
 			path_manager.UploadContainer()),
-		path_manager:  path_manager,
-		query_context: query_context,
-		config_obj:    config_obj,
-		session_id:    session_id,
+		path_manager:       path_manager,
+		query_context:      query_context,
+		collection_context: collection_context,
+		config_obj:         config_obj,
+		session_id:         session_id,
 	}
 }

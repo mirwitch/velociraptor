@@ -3,6 +3,7 @@ package server_artifacts_test
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,7 +58,7 @@ func (self *ServerArtifactsTestSuite) LoadArtifacts(definition string) services.
 }
 
 func (self *ServerArtifactsTestSuite) ScheduleAndWait(
-	name, user string) *api_proto.FlowDetails {
+	name, user, flow_id string) *api_proto.FlowDetails {
 
 	manager, _ := services.GetRepositoryManager(self.ConfigObj)
 	repository, _ := manager.GetGlobalRepository(self.ConfigObj)
@@ -85,10 +86,10 @@ func (self *ServerArtifactsTestSuite) ScheduleAndWait(
 
 	acl_manager := acl_managers.NewServerACLManager(self.ConfigObj, user)
 
-	launcher.SetFlowIdForTests("F.1234")
+	launcher.SetFlowIdForTests(flow_id)
 
 	// Schedule a job for the server runner.
-	flow_id, err := launcher.ScheduleArtifactCollection(
+	flow_id, err = launcher.ScheduleArtifactCollection(
 		self.Sm.Ctx, self.ConfigObj, acl_manager,
 		repository, &flows_proto.ArtifactCollectorArgs{
 			Creator:   user,
@@ -129,10 +130,76 @@ type: SERVER
 sources:
 - query: SELECT "Foo" FROM scope()
 `)
-	details := self.ScheduleAndWait("Test1", "admin")
+	details := self.ScheduleAndWait("Test1", "admin", "F.1234")
 
 	// One row is collected
 	assert.Equal(self.T(), uint64(1), details.Context.TotalCollectedRows)
+
+	// How long we took to run - should be immediate
+	run_time := (details.Context.ActiveTime - details.Context.StartTime) / 1000000
+	assert.True(self.T(), run_time < 2)
+}
+
+func (self *ServerArtifactsTestSuite) TestServerArtifactsCancellation() {
+	launcher, err := services.GetLauncher(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	self.LoadArtifacts(`
+name: Test1
+type: SERVER
+sources:
+- query: SELECT sleep(time=10000) FROM scope()
+`)
+
+	mu := &sync.Mutex{}
+	var details *api_proto.FlowDetails
+
+	go func() {
+		flow_details := self.ScheduleAndWait("Test1", "admin", "F.1234")
+		mu.Lock()
+		details = flow_details
+		mu.Unlock()
+	}()
+
+	// Wait for the flow to be created
+	vtesting.WaitUntil(time.Second*5, self.T(), func() bool {
+		_, err := launcher.GetFlowDetails(self.ConfigObj, "server", "F.1234")
+		return err == nil
+	})
+
+	// cancel the flow
+	resp, err := launcher.CancelFlow(
+		self.Ctx, self.ConfigObj, "server", "F.1234", "admin")
+	assert.NoError(self.T(), err)
+	assert.Equal(self.T(), resp.FlowId, "F.1234")
+
+	vtesting.WaitUntil(time.Second*5, self.T(), func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return details != nil
+	})
+	assert.Equal(self.T(), "Cancelled by admin", details.Context.Status)
+	assert.Equal(self.T(), flows_proto.ArtifactCollectorContext_ERROR,
+		details.Context.State)
+}
+
+func (self *ServerArtifactsTestSuite) TestServerArtifactsRowLimit() {
+	self.LoadArtifacts(`
+name: Test1
+type: SERVER
+sources:
+- query: SELECT _value FROM range(end=100)
+resources:
+  max_rows: 10
+`)
+	details := self.ScheduleAndWait("Test1", "admin", "F.1234")
+
+	assert.Equal(self.T(), flows_proto.ArtifactCollectorContext_ERROR,
+		details.Context.State)
+	assert.Equal(self.T(), "Row limit exceeded", details.Context.Status)
+	assert.True(self.T(), details.Context.TotalCollectedRows < 20)
+	assert.True(self.T(), details.Context.TotalCollectedRows >= 10)
 
 	// How long we took to run - should be immediate
 	run_time := (details.Context.ActiveTime - details.Context.StartTime) / 1000000
@@ -150,7 +217,7 @@ sources:
                    name="test.txt")
      FROM scope()
 `)
-	details := self.ScheduleAndWait("TestUpload", "admin")
+	details := self.ScheduleAndWait("TestUpload", "admin", "F.1234")
 
 	// One row is collected
 	assert.Equal(self.T(), uint64(1), details.Context.TotalCollectedRows)
@@ -182,6 +249,47 @@ sources:
 	assert.Equal(self.T(), "Hello world", string(data))
 }
 
+func (self *ServerArtifactsTestSuite) TestServerArtifactWithUploadDeduplication() {
+	self.LoadArtifacts(`
+name: TestUploadMany
+type: SERVER
+sources:
+- query: |
+     SELECT upload(accessor="data",
+                   file="Hello world",
+                   name="test_many.txt")
+     FROM range(end=10)
+`)
+	details := self.ScheduleAndWait("TestUploadMany", "admin", "F.1234")
+
+	// 10 rows are collected
+	assert.Equal(self.T(), uint64(10), details.Context.TotalCollectedRows)
+
+	// But only one upload is actually made
+	assert.Equal(self.T(), uint64(1), details.Context.TotalUploadedFiles)
+	assert.Equal(self.T(), flows_proto.ArtifactCollectorContext_FINISHED, details.Context.State)
+
+	// Make sure the upload data is stored in the upload file.
+	flow_path_manager := paths.NewFlowPathManager(
+		"server", details.Context.SessionId)
+	uploads_data := test_utils.FileReadAll(self.T(), self.ConfigObj,
+		flow_path_manager.UploadMetadata())
+
+	assert.Contains(self.T(), uploads_data,
+		`"_Components":["clients","server","collections","F.1234","uploads","test_many.txt"]`)
+
+	// There is only one uploaded file in the uploads file
+	assert.Equal(self.T(), 1, len(strings.Split("\n", uploads_data)))
+
+	// Now read the uploaded file.
+	data := test_utils.FileReadAll(self.T(), self.ConfigObj,
+		path_specs.NewUnsafeFilestorePath(
+			"clients", "server", "collections", "F.1234",
+			"uploads", "test_many.txt").
+			SetType(api.PATH_TYPE_FILESTORE_ANY))
+	assert.Equal(self.T(), "Hello world", string(data))
+}
+
 // An artifact with two sources - one will produce an error. The
 // entire collection should fail but will have 2 rows returned.
 func (self *ServerArtifactsTestSuite) TestServerArtifactsMultiSource() {
@@ -202,7 +310,7 @@ sources:
   precondition: SELECT 1 FROM scope()
   query: SELECT "Foo" FROM scope()
 `)
-	details := self.ScheduleAndWait("TestMultiSource", "admin")
+	details := self.ScheduleAndWait("TestMultiSource", "admin", "F.1234")
 
 	// Two rows are collected
 	assert.Equal(self.T(), uint64(2), details.Context.TotalCollectedRows)
@@ -217,9 +325,10 @@ sources:
 
 	// Sort those for golden comparison
 	sort.Slice(details.Context.QueryStats, func(i, j int) bool {
-		return details.Context.QueryStats[i].Artifact <
-			details.Context.QueryStats[j].Artifact
+		return details.Context.QueryStats[i].ErrorMessage <
+			details.Context.QueryStats[j].ErrorMessage
 	})
+	sort.Strings(details.Context.ArtifactsWithResults)
 
 	goldie.Assert(self.T(), "TestMultiSource",
 		json.MustMarshalIndent(details.Context))
@@ -242,7 +351,7 @@ sources:
 - name: Source2
   query: SELECT "Foo" FROM scope()
 `)
-	details := self.ScheduleAndWait("TestMultiSourceSerial", "admin")
+	details := self.ScheduleAndWait("TestMultiSourceSerial", "admin", "F.1234")
 
 	// Two rows are collected
 	assert.Equal(self.T(), uint64(2), details.Context.TotalCollectedRows)
@@ -259,6 +368,33 @@ sources:
 		json.MustMarshalIndent(details.Context))
 }
 
+func (self *ServerArtifactsTestSuite) TestServerArtifactsBytesLimit() {
+	self.LoadArtifacts(`
+name: Test1
+type: SERVER
+sources:
+- query: |
+    -- Need to store to different files or the upload will be deduplicated.
+    SELECT upload(accessor="data",
+                  file="Hello world",
+                  name=format(format="test%d.txt", args=_value)) AS Upload
+    FROM range(end=100)
+resources:
+  max_upload_bytes: 20
+`)
+	details := self.ScheduleAndWait("Test1", "admin", "F.1234")
+
+	assert.Equal(self.T(), flows_proto.ArtifactCollectorContext_ERROR,
+		details.Context.State)
+	assert.Equal(self.T(), "Byte limit exceeded", details.Context.Status)
+	assert.True(self.T(), details.Context.TotalUploadedBytes < 30)
+	assert.True(self.T(), details.Context.TotalUploadedBytes >= 10)
+
+	// How long we took to run - should be immediate
+	run_time := (details.Context.ActiveTime - details.Context.StartTime) / 1000000
+	assert.True(self.T(), run_time < 2)
+}
+
 // Collect a long lived artifact with specified timeout.
 func (self *ServerArtifactsTestSuite) TestServerArtifactsTimeout() {
 	self.LoadArtifacts(`
@@ -270,7 +406,7 @@ sources:
 - query: SELECT sleep(time=200) FROM scope()
 `)
 
-	details := self.ScheduleAndWait("Test2", "admin")
+	details := self.ScheduleAndWait("Test2", "admin", "F.1234")
 
 	// No rows are collected because the query timed out.
 	assert.Equal(self.T(), uint64(0), details.Context.TotalCollectedRows)
@@ -301,7 +437,7 @@ sources:
 - query: SELECT * FROM info()
 `)
 
-	details := self.ScheduleAndWait("Test", "admin")
+	details := self.ScheduleAndWait("Test", "admin", "F.1234")
 
 	// Admin user should be able to collect since it has EXECVE
 	assert.Equal(self.T(), uint64(1), details.Context.TotalCollectedRows)
@@ -311,7 +447,7 @@ sources:
 	err := services.GrantRoles(self.ConfigObj, "gumby", []string{"reader"})
 	assert.NoError(self.T(), err)
 
-	details = self.ScheduleAndWait("Test", "gumby")
+	details = self.ScheduleAndWait("Test", "gumby", "F.1234")
 
 	// Gumby user has no permissions to run the artifact.
 	assert.Equal(self.T(), uint64(0), details.Context.TotalCollectedRows)
