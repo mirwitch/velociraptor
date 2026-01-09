@@ -1,3 +1,4 @@
+//go:build windows && amd64 && cgo
 // +build windows,amd64,cgo
 
 // An accessor for process address space.
@@ -16,6 +17,7 @@
 package process
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strconv"
@@ -24,12 +26,32 @@ import (
 	"time"
 
 	"github.com/Velocidex/ttlcache/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/uploads"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/windows"
 	"www.velocidex.com/golang/velociraptor/vql/windows/process"
 	"www.velocidex.com/golang/vfilter"
+)
+
+var (
+	processAccessorCurrentOpened = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "accessor_process_current_open",
+		Help: "Number of currently opened processes",
+	})
+
+	processAccessorTotalOpened = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "accessor_process_total_open",
+		Help: "Total Number of opened processes",
+	})
+
+	processAccessorTotalReadProcessMemory = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "accessor_process_total_read_process_memory",
+		Help: "Total Number of opened buffers read from process memory",
+	})
 )
 
 const PAGE_SIZE = 0x1000
@@ -212,8 +234,9 @@ func (self ProcessReader) Stat() (os.FileInfo, error) {
 }
 
 type ProcessAccessor struct {
-	mu  sync.Mutex
-	lru *ttlcache.Cache
+	mu    sync.Mutex
+	lru   *ttlcache.Cache
+	scope vfilter.Scope
 }
 
 const _ProcessAccessorTag = "_ProcessAccessor"
@@ -227,9 +250,11 @@ func (self ProcessAccessor) New(scope vfilter.Scope) (
 	if result_any == nil {
 		// Create a new cache in the scope.
 		result := &ProcessAccessor{
-			lru: ttlcache.NewCache(),
+			lru:   ttlcache.NewCache(),
+			scope: scope,
 		}
 		result.lru.SetTTL(time.Second)
+		result.lru.SkipTTLExtensionOnHit(true)
 		result.lru.SetCheckExpirationCallback(func(key string, value interface{}) bool {
 			info, ok := value.(*ProcessReader)
 			if ok {
@@ -264,11 +289,20 @@ func (self ProcessAccessor) New(scope vfilter.Scope) (
 					reader.mu.Unlock()
 				}
 			}
+			result.lru.Close()
 		})
 		return result, nil
 	}
 
 	return result_any.(*ProcessAccessor), nil
+}
+
+func (self ProcessAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name:        "process",
+		Description: `Access process memory like a file. The Path is taken in the form "/<pid>", i.e. the pid appears as the top level file.`,
+		Permissions: []acls.ACL_PERMISSION{acls.MACHINE_STATE},
+	}
 }
 
 func (self ProcessAccessor) ParsePath(path string) (
@@ -346,7 +380,8 @@ func (self *ProcessAccessor) OpenWithOSPath(
 	}
 
 	// Open the process and enumerate its ranges
-	ranges, proc_handle, err := process.GetVads(uint32(pid))
+	ranges, proc_handle, err := process.GetVads(
+		context.Background(), self.scope, uint32(pid))
 	if err != nil {
 		return nil, err
 	}
@@ -371,6 +406,5 @@ func (self *ProcessAccessor) OpenWithOSPath(
 }
 
 func init() {
-	accessors.Register("process", &ProcessAccessor{},
-		`Access process memory like a file. The Path is taken in the form "/<pid>", i.e. the pid appears as the top level file.`)
+	accessors.Register(&ProcessAccessor{})
 }

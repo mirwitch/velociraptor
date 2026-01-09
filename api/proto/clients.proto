@@ -53,6 +53,8 @@ message ApiClient {
 
     // Last time the labels on this client were updated.
     uint64 last_label_timestamp = 24;
+
+    map<string, int64> in_flight_flows = 25;
 }
 
 message SearchClientsRequest {
@@ -87,6 +89,8 @@ message SearchClientsResponse {
             description: "If name_only is specified in the request we only "
             "return the names here.",
         }];
+    uint64 total = 3;
+    SearchClientsRequest search_term = 4;
 }
 
 message GetClientRequest {
@@ -123,6 +127,14 @@ message ClientMetadataItem {
 message ClientMetadata {
     repeated ClientMetadataItem items = 1;
     string client_id = 2;
+}
+
+message SetClientMetadataRequest {
+    repeated ClientMetadataItem add = 1;
+
+    // A list of keys to remove
+    repeated string remove = 2;
+    string client_id = 3;
 }
 
 

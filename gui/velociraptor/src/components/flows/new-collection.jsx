@@ -7,8 +7,6 @@ import T from '../i8n/i8n.jsx';
 import Alert from 'react-bootstrap/Alert';
 import Button from 'react-bootstrap/Button';
 import Modal from 'react-bootstrap/Modal';
-import filterFactory, { textFilter } from 'react-bootstrap-table2-filter';
-import BootstrapTable from 'react-bootstrap-table-next';
 import Pagination from 'react-bootstrap/Pagination';
 import Form from 'react-bootstrap/Form';
 import Row from 'react-bootstrap/Row';
@@ -16,9 +14,10 @@ import VeloReportViewer from "../artifacts/reporting.jsx";
 import ButtonGroup from 'react-bootstrap/ButtonGroup';
 import Select from 'react-select';
 import NewCollectionConfigParameters from './new-collections-parameters.jsx';
-
+import Dropdown from 'react-bootstrap/Dropdown';
 import Spinner from '../utils/spinner.jsx';
 import Col from 'react-bootstrap/Col';
+import Table  from 'react-bootstrap/Table';
 
 import StepWizard from 'react-step-wizard';
 
@@ -30,11 +29,11 @@ import { HotKeys, ObserveKeys } from "react-hotkeys";
 import { requestToParameters, runArtifact } from "./utils.jsx";
 
 import api from '../core/api-service.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 
 class PaginationBuilder {
-    PaginationSteps = ["Select Artifacts", "Configure Parameters",
-                       "Specify Resources", "Review", "Launch"];
+    PaginationSteps = [T("Select Artifacts"), T("Configure Parameters"),
+                       T("Specify Resources"), T("Review"), T("Launch")];
 
     constructor(name, title, shouldFocused) {
         this.title = title;
@@ -44,6 +43,7 @@ class PaginationBuilder {
         }
     }
 
+    active = false
     title = ""
     name = ""
     shouldFocused = (isFocused, step) => isFocused;
@@ -56,6 +56,7 @@ class PaginationBuilder {
     // navigators are disabled.
     makePaginator = (spec) => {
         let {props, onBlur, isFocused} = spec;
+        this.active = this.name === this.PaginationSteps[props.currentStep-1];
         return <Col md="12">
                  <Pagination>
                    { _.map(this.PaginationSteps, (step, i) => {
@@ -98,6 +99,8 @@ const remove_artifact = (artifacts, name) => {
 
 
 class NewCollectionSelectArtifacts extends React.Component {
+    inputRef = React.createRef(null);
+
     static propTypes = {
         // A list of artifact descriptors that are selected.
         artifacts: PropTypes.array,
@@ -126,15 +129,58 @@ class NewCollectionSelectArtifacts extends React.Component {
         showFavoriteSelector: false,
 
         current_favorite: null,
+
+        active: false,
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
+        this.focusSearch();
+
+        // Prepare the debounced function in advance.
+        this._doSearch = _.debounce((value)=>{
+            api.post("v1/GetArtifacts", {
+                type: this.props.artifactType,
+                fields: {
+                    name: true,
+                },
+                search_term: this.state.filter,
+            }, this.source.token).then((response) => {
+                    let items = response.data.items || [];
+                    this.setState({matchingDescriptors: items, loading: false});
+                });
+        }, 400);
         this.doSearch("...");
     }
 
     componentWillUnmount() {
         this.source.cancel();
+    }
+
+    // Trigger a selection of the first artifacts when the list is
+    // added. This will render the artifact description view.
+    componentDidUpdate = (prevProps, prevState, rootNode) => {
+        if(_.isEmpty(prevProps.artifacts) && !_.isEmpty(this.props.artifacts)) {
+            this.onSelect(this.props.artifacts[0], true);
+        }
+
+        if(this.props.paginator.active && !this.state.active) {
+            this.focusSearch();
+            this.setState({active: true});
+        }
+
+        if(!this.props.paginator.active && this.state.active) {
+            this.setState({active: false});
+        }
+    }
+
+    focusSearch() {
+        const input = this.inputRef.current;
+
+        // Focus the input box once all the form is rendered.
+        setTimeout(function() {
+            input.select();
+        }, 400);
     }
 
     onSelect = (row, isSelect) => {
@@ -164,27 +210,13 @@ class NewCollectionSelectArtifacts extends React.Component {
         _.each(rows, (row) => this.onSelect(row, isSelect));
     }
 
-    updateSearch = (type, filters) => {
-        let value = filters && filters.filters && filters.filters.name &&
-            filters.filters.name.filterVal;
-        if (!value) {
-            this.doSearch("...");
-            return;
-        }
-        this.doSearch(value);
-    }
 
     doSearch = (value) => {
-        this.setState({loading: true});
-        api.post("v1/GetArtifacts", {
-            type: this.props.artifactType,
-            fields: {
-                name: true,
-            },
-            search_term: value}, this.source.token).then((response) => {
-                let items = response.data.items || [];
-                this.setState({matchingDescriptors: items, loading: false});
-            });
+        this.setState({
+            filter: value,
+        });
+
+        this._doSearch(value);
     }
 
     toggleSelection = (row, e) => {
@@ -230,6 +262,10 @@ class NewCollectionSelectArtifacts extends React.Component {
         let artifacts = [];
         _.each(spec, x=>artifacts.push(x.artifact));
 
+        if(_.isEmpty(artifacts)) {
+            return;
+        }
+
         api.post("v1/GetArtifacts", {
             type: this.props.artifactType,
             names: artifacts}, this.source.token).then((response) => {
@@ -258,25 +294,6 @@ class NewCollectionSelectArtifacts extends React.Component {
     }
 
     render() {
-        let columns = [{dataField: "name", text: "",
-                        formatter: (cell, row) => {
-                            return <Button tabIndex={0} variant="link"
-                                           onClick={(e)=>this.toggleSelection(row, e)}
-                                   >{cell}</Button>;
-                        },
-                        filter: textFilter({
-                            id: "search-for-artifact-input",
-                            placeholder: T("Search for artifacts..."),
-                        })}];
-
-        let selectRow = {mode: "checkbox",
-                         clickToSelect: true,
-                         classes: "row-selected",
-                         selected: _.map(this.props.artifacts, x=>x.name),
-                         onSelect: this.onSelect,
-                         hideSelectColumn: true,
-                         onSelectAll: this.onSelectAll,
-                        };
         return (
             <>
               <Modal.Header closeButton>
@@ -326,19 +343,43 @@ class NewCollectionSelectArtifacts extends React.Component {
                 <div className="row new-artifact-page">
                   <div className="col-4 new-artifact-search-table selectable">
                     { this.state.loading && <Spinner loading={this.state.loading}/> }
-                    <BootstrapTable
-                      hover
-                      condensed
-                      bootstrap4
-                      remote={ { filter: true } }
-                      filter={ filterFactory() }
-                      keyField="name"
-                      data={this.state.matchingDescriptors}
-                      columns={columns}
-                      selectRow={ selectRow }
-                      onTableChange={ this.updateSearch }
-                    />
-
+                    <Table>
+                      <thead>
+                        <tr>
+                          <th>
+                            <Form onSubmit={e=>{
+                                e.preventDefault();
+                                return false;
+                            }}>
+                              <Form.Control
+                                type="text"
+                                ref={this.inputRef}
+                                onChange={e=>this.doSearch(e.target.value)}
+                                placeholder={T("Search for artifacts...")}
+                              />
+                            </Form>
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {_.map(this.state.matchingDescriptors, (row, i)=>{
+                            let classname = "";
+                            _.each(this.props.artifacts, x=>{
+                                if(x.name===row.name) {
+                                    classname = "row-selected";
+                                }
+                            });
+                            return <tr key={i} className={classname}>
+                                     <td>
+                                       <Button
+                                         variant="link"
+                                         onClick={(e)=>this.toggleSelection(row, e)} >
+                                         {row.name}
+                                       </Button>
+                                     </td></tr>;
+                        })}
+                      </tbody>
+                    </Table>
                   </div>
                   <div name="ArtifactInfo" className="col-8 new-artifact-description">
                     { this.state.selectedDescriptor &&
@@ -416,7 +457,6 @@ class NewCollectionResources extends React.Component {
         }
         return max_mbytes.toFixed(2) + " Mb";
     }
-
 
     getMaxRows = (artifacts) => {
         let max_rows = 0;
@@ -507,7 +547,7 @@ class NewCollectionResources extends React.Component {
                     <Col sm="8">
                       <ValidatedInteger
                         placeholder={this.getCpuLimit(this.props.artifacts)}
-                        value={resources.cpu_limit}
+                        value={resources.cpu_limit || undefined}
                         valid_func={value=>value >= 0 && value <=100}
                         setInvalid={value => this.setState({
                             invalid_1: value})}
@@ -521,7 +561,7 @@ class NewCollectionResources extends React.Component {
                     <Col sm="8">
                       <ValidatedInteger
                         placeholder={this.getIopsLimit(this.props.artifacts)}
-                        value={resources.iops_limit}
+                        value={resources.iops_limit || undefined}
                         setInvalid={value => this.setState({invalid_1: value})}
                         setValue={value => this.props.setResources({
                             iops_limit: value
@@ -534,7 +574,7 @@ class NewCollectionResources extends React.Component {
                     <Col sm="8">
                       <ValidatedInteger
                         placeholder={this.getTimeout(this.props.artifacts)}
-                        value={resources.timeout}
+                        value={resources.timeout || undefined}
                         setInvalid={value => this.setState({invalid_2: value})}
                         setValue={value => this.props.setResources({timeout: value})} />
                     </Col>
@@ -545,7 +585,7 @@ class NewCollectionResources extends React.Component {
                     <Col sm="8">
                       <ValidatedInteger
                         placeholder={T("If set collection will be terminated after this many seconds with no progress.")}
-                        value={resources.progress_timeout}
+                        value={resources.progress_timeout || undefined}
                         setInvalid={value => this.setState({invalid_3: value})}
                         setValue={value => this.props.setResources({
                             progress_timeout: value})} />
@@ -557,20 +597,71 @@ class NewCollectionResources extends React.Component {
                     <Col sm="8">
                       <ValidatedInteger
                         placeholder={this.getMaxRows(this.props.artifacts)}
-                        value={resources.max_rows}
+                        value={resources.max_rows || undefined}
                         setInvalid={value => this.setState({invalid_4: value})}
                         setValue={value => this.props.setResources({max_rows: value})} />
                     </Col>
                   </Form.Group>
 
                   <Form.Group as={Row}>
-                    <Form.Label column sm="3">{T("Max Mb Uploaded")}</Form.Label>
+                    <Form.Label column sm="3">{T("Max Logs")}</Form.Label>
+                    <Col sm="8">
+                      <ValidatedInteger
+                        placeholder={"100000"}
+                        value={resources.max_logs || undefined}
+                        setInvalid={value => this.setState({invalid_6: value})}
+                        setValue={value => this.props.setResources({max_logs: value})} />
+                    </Col>
+                  </Form.Group>
+
+                  <Form.Group as={Row}>
+                    <Form.Label column sm="3">{T("Max MB uploaded")}</Form.Label>
                     <Col sm="8">
                       <ValidatedInteger
                         placeholder={this.getMaxUploadBytes(this.props.artifacts)}
-                        value={resources.max_mbytes}
+                        value={resources.max_mbytes || undefined}
                         setInvalid={value => this.setState({invalid_5: value})}
                         setValue={value => this.props.setResources({max_mbytes: value})} />
+                    </Col>
+                  </Form.Group>
+
+                  <Form.Group as={Row}>
+                    <Form.Label column sm="3">{T("Trace Frequency Seconds")}</Form.Label>
+                    <Col sm="8">
+                      <Dropdown>
+                        <Dropdown.Toggle
+                          variant="default"
+                          className="trace-selector">
+                          {this.state.trace ||
+                           T("To enable tracing, specify trace update frequency in seconds ")}
+                        </Dropdown.Toggle>
+                        <Dropdown.Menu>
+                          <Dropdown.Item onClick={()=>{
+                              this.props.setResources({trace_freq_sec: 0});
+                              this.setState({trace: ""});
+                            }} >
+                            {T("Disable tracing")}
+                          </Dropdown.Item>
+                          <Dropdown.Item onClick={()=>{
+                              this.props.setResources({trace_freq_sec: 10});
+                              this.setState({trace: T("Every 10 Seconds")});
+                            }} >
+                            {T("Every 10 Seconds")}
+                          </Dropdown.Item>
+                          <Dropdown.Item onClick={()=>{
+                              this.props.setResources({trace_freq_sec: 30});
+                              this.setState({trace: T("Every 30 Seconds")});
+                            }} >
+                            {T("Every 30 Seconds")}
+                          </Dropdown.Item>
+                          <Dropdown.Item onClick={()=>{
+                              this.props.setResources({trace_freq_sec: 60});
+                              this.setState({trace: T("Every 60 Seconds")});
+                            }} >
+                            {T("Every 60 Seconds")}
+                          </Dropdown.Item>
+                        </Dropdown.Menu>
+                      </Dropdown>
                     </Col>
                   </Form.Group>
 
@@ -641,7 +732,7 @@ class NewCollectionLaunch extends React.Component {
     }
 
     componentDidMount() {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
     }
 
     componentWillUnmount() {
@@ -756,10 +847,11 @@ class NewCollectionWizard extends React.Component {
         baseFlow: PropTypes.object,
         onResolve: PropTypes.func,
         onCancel: PropTypes.func,
+        client: PropTypes.object,
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.initializeFromBaseFlow();
 
         // A bit hacky but whatevs...
@@ -792,6 +884,8 @@ class NewCollectionWizard extends React.Component {
             timeout: request.timeout,
             progress_timeout: request.progress_timeout,
             max_rows: request.max_rows,
+            max_logs: request.max_logs,
+            trace_freq_sec: request.trace_freq_sec,
             max_mbytes: Math.round(
                 request.max_upload_bytes / 1024 / 1024 * 100) / 100  || undefined,
         };
@@ -801,6 +895,12 @@ class NewCollectionWizard extends React.Component {
             resources: resources,
             initialized_from_parent: true,
         });
+
+        if (_.isEmpty(request.artifacts)) {
+            this.setState({artifacts:[]});
+            return;
+        }
+
 
         // Resolve the artifacts from the request into a list of descriptors.
         api.post("v1/GetArtifacts",
@@ -856,7 +956,29 @@ class NewCollectionWizard extends React.Component {
             };
 
             _.each(this.state.parameters[item.name], (v, k) => {
-                spec.parameters.env.push({key: k, value: v});
+                if (k==="cpu_limit") {
+                    spec.cpu_limit = v;
+                    return;
+                }
+                if (k==="max_batch_wait") {
+                    spec.max_batch_wait = v;
+                    return;
+                }
+                if (k==="max_batch_rows") {
+                    spec.max_batch_rows = v;
+                    return;
+                }
+                if (k==="timeout") {
+                    spec.timeout = v;
+                    return;
+                }
+
+                // If the value is cleared just let the artifact use
+                // its own default value and dont mention it in the
+                // request at all.
+                if (v !== "") {
+                    spec.parameters.env.push({key: k, value: v});
+                }
             });
             specs.push(spec);
             artifacts.push(item.name);
@@ -893,6 +1015,14 @@ class NewCollectionWizard extends React.Component {
             result.max_rows = this.state.resources.max_rows;
         }
 
+        if (this.state.resources.max_logs) {
+            result.max_logs = this.state.resources.max_logs;
+        }
+
+        if (this.state.resources.trace_freq_sec) {
+            result.trace_freq_sec = this.state.resources.trace_freq_sec;
+        }
+
         if (this.state.resources.max_mbytes) {
             result.max_upload_bytes = parseInt(
                 this.state.resources.max_mbytes * 1024 * 1024);
@@ -923,7 +1053,6 @@ class NewCollectionWizard extends React.Component {
     }
 
     render() {
-        let request = this.state.original_flow && this.state.original_flow.request;
         let client_id = this.props.client && this.props.client.client_id;
         let type = "CLIENT";
         if (!client_id || client_id==="server") {
@@ -959,45 +1088,46 @@ class NewCollectionWizard extends React.Component {
                    onHide={this.props.onCancel}>
               <HotKeys keyMap={keymap} handlers={handlers}><ObserveKeys>
                   <StepWizard ref={n=>this.step=n}>
-                  <NewCollectionSelectArtifacts
-                    artifacts={this.state.artifacts}
-                    artifactType={type}
-                    paginator={new PaginationBuilder(
-                        "Select Artifacts",
-                        "New Collection: Select Artifacts to collect")}
-                    setArtifacts={this.setArtifacts}
-                    setParameters={this.setParameters}
+                    <NewCollectionSelectArtifacts
+                      artifacts={this.state.artifacts}
+                      artifactType={type}
+                      paginator={new PaginationBuilder(
+                          T("Select Artifacts"),
+                          T("New Collection: Select Artifacts to collect"))}
+                      setArtifacts={this.setArtifacts}
+                      setParameters={this.setParameters}
                     />
 
-                  <NewCollectionConfigParameters
-                    parameters={this.state.parameters}
-                    setParameters={this.setParameters}
-                    artifacts={this.state.artifacts}
-                    setArtifacts={this.setArtifacts}
-                    paginator={new PaginationBuilder(
-                        "Configure Parameters",
-                        "New Collection: Configure Parameters")}
-                    request={request}/>
+                    <NewCollectionConfigParameters
+                      parameters={this.state.parameters}
+                      setParameters={this.setParameters}
+                      artifacts={this.state.artifacts}
+                      setArtifacts={this.setArtifacts}
+                      configureResourceControl={true}
+                      paginator={new PaginationBuilder(
+                          T("Configure Parameters"),
+                          T("New Collection: Configure Parameters"))}
+                      />
 
-                  <NewCollectionResources
-                    artifacts={this.state.artifacts}
-                    resources={this.state.resources}
-                    paginator={new PaginationBuilder(
-                        "Specify Resources",
-                        "New Collection: Specify Resources")}
-                    setResources={this.setResources} />
+                    <NewCollectionResources
+                      artifacts={this.state.artifacts}
+                      resources={this.state.resources}
+                      paginator={new PaginationBuilder(
+                          T("Specify Resources"),
+                          T("New Collection: Specify Resources"))}
+                      setResources={this.setResources} />
 
-                  <NewCollectionRequest
-                    paginator={new PaginationBuilder(
-                        "Review",
-                        "New Collection: Review request")}
-                    request={this.prepareRequest()} />
+                    <NewCollectionRequest
+                      paginator={new PaginationBuilder(
+                          T("Review"),
+                          T("New Collection: Review request"))}
+                      request={this.prepareRequest()} />
 
                     <NewCollectionLaunch
                       artifacts={this.state.artifacts}
                       paginator={new PaginationBuilder(
-                          "Launch",
-                          "New Collection: Launch collection")}
+                          T("Launch"),
+                          T("New Collection: Launch collection"))}
                       launch={this.launch} />
                 </StepWizard>
                 </ObserveKeys></HotKeys>

@@ -1,21 +1,22 @@
-// +build windows,amd64
+//go:build (windows && amd64) || (windows && arm64)
+// +build windows,amd64 windows,arm64
 
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package windows
 
@@ -40,6 +41,7 @@ type (
 	LPWSTR         *uint16
 	LPCWSTR        *uint16
 	NET_API_STATUS DWORD
+	HANDLE         uint64
 
 	USER_INFO_3 struct {
 		Name             LPWSTR
@@ -187,6 +189,7 @@ const (
 
 	// NtQueryInformationThread
 	ThreadBasicInformation   = 0
+	ThreadTimes              = 1
 	ThreadImpersonationToken = 5
 
 	PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -252,6 +255,13 @@ type THREAD_BASIC_INFORMATION struct {
 	AffinityMask    uint64
 	Priority        uint32
 	BasePriority    uint32
+}
+
+type KERNEL_USER_TIMES struct {
+	CreateTime uint64 // The creation time of the process or thread.
+	ExitTime   uint64 // The exit time of the process or thread.
+	KernelTime uint64 // The amount of time the process has executed in kernel mode.
+	UserTime   uint64
 }
 
 type OBJECT_TYPE_INFORMATION struct {
@@ -369,6 +379,7 @@ type PROCESS_MEMORY_COUNTERS struct {
 //sys NtOpenDirectoryObject(DirectoryHandle *uint32,DesiredAccess uint32, ObjectAttributes *OBJECT_ATTRIBUTES) (status uint32) = ntdll.NtOpenDirectoryObject
 //sys AdjustTokenPrivileges(TokenHandle syscall.Token, DisableAllPrivileges bool, NewState uintptr, BufferLength int, PreviousState uintptr, ReturnLength *int) (err error) = Advapi32.AdjustTokenPrivileges
 //sys LookupPrivilegeValue(lpSystemName uintptr, lpName uintptr, out uintptr) (err error) = Advapi32.LookupPrivilegeValueW
+//sys LookupPrivilegeName(lpSystemName *uint16, luid *LUID, out *uint16, ReturnLength *uint32) (err error) = Advapi32.LookupPrivilegeNameW
 //sys NtDuplicateObject(SourceProcessHandle syscall.Handle, SourceHandle syscall.Handle, TargetProcessHandle syscall.Handle, TargetHandle *syscall.Handle, DesiredAccess uint32, InheritHandle uint32, Options uint32) (status uint32) = ntdll.NtDuplicateObject
 //sys NtQueryInformationProcess(Handle syscall.Handle, ObjectInformationClass uint32, ProcessInformation *byte, ProcessInformationLength uint32, ReturnLength *uint32) (status uint32) = ntdll.NtQueryInformationProcess
 //sys NtQueryInformationThread(Handle syscall.Handle, ObjectInformationClass uint32, ThreadInformation *byte, ThreadInformationLength uint32, ReturnLength *uint32) (status uint32, err error) = ntdll.NtQueryInformationThread
@@ -385,6 +396,8 @@ type PROCESS_MEMORY_COUNTERS struct {
 //sys NetApiBufferFree(Buffer uintptr) (status NET_API_STATUS) = netapi32.NetApiBufferFree
 //sys NetUserEnum(servername *uint16, level uint32, filter uint32, bufptr *uintptr, prefmaxlen uint32, entriesread *uint32, totalentries *uint32, resume_handle *uint32) (status NET_API_STATUS) = netapi32.NetUserEnum
 //sys NetUserGetGroups(servername *LPCWSTR, username *LPCWSTR, level DWORD, bufptr *LPBYTE, prefmaxlen DWORD, entriesread *LPDWORD, totalentries *LPDWORD) (status NET_API_STATUS) = netapi32.NetUserGetGroups
+//sys QueryAllTracesW(PropertyArray uintptr, PropertyArrayCount uint32, LoggerCount *uint32) (status uint32) = advapi32.QueryAllTracesA
+//sys RegEnumValue(key syscall.Handle, index uint32, name *byte, nameLen *uint32, reserved *uint32, valtype *uint32, buf *byte, buflen *uint32) (regerrno error) = advapi32.RegEnumValueW
 
 // Converts a pointer to a wide string to a regular go string. The
 // underlying buffer may be freed afterwards by the Windows API.
@@ -444,50 +457,70 @@ func HasWintrustDll() error {
 //sys CryptCATAdminEnumCatalogFromHash(handle syscall.Handle, pbHash *byte, pcbHash uint32, dwFlags uint32, phPrevCatInfo *syscall.Handle) (HCATINFO syscall.Handle) = wintrust.CryptCATAdminEnumCatalogFromHash
 //sys CryptCATCatalogInfoFromContext(handle syscall.Handle, psCatInfo *CATALOG_INFO, dwFlags uint32) (err error) = wintrust.CryptCATCatalogInfoFromContext
 //sys CryptCATAdminReleaseCatalogContext(handle syscall.Handle, handle2 syscall.Handle, dwFlags uint32) (err error) = wintrust.CryptCATAdminReleaseCatalogContext
-//sys WinVerifyTrust(handle syscall.Handle, action *GUID, data *WINTRUST_DATA) (ret uint32, err error) [failretval!=0] = wintrust.WinVerifyTrust
+//sys WinVerifyTrust[dataT WINTRUST_DATA](handle syscall.Handle, action *GUID, data *dataT) (ret uint32, err error) [failretval!=0] = wintrust.WinVerifyTrust
 //sys WTHelperProvDataFromStateData(handle syscall.Handle) (provider *CRYPT_PROVIDER_DATA, err error) [failretval==nil] = wintrust.WTHelperProvDataFromStateData
 //sys WTHelperGetProvSignerFromChain(pProvData *CRYPT_PROVIDER_DATA, idxSigner uint32, fCounterSigner bool, idxCounterSigner uint32) (signer *CRYPT_PROVIDER_SGNR, err error) [failretval==nil] = wintrust.WTHelperGetProvSignerFromChain
 
 type WINTRUST_FILE_INFO struct {
 	CbStruct       uint32
-	PcwszFilePath  uintptr
+	PcwszFilePath  *uint16
 	HFile          uintptr
 	PgKnownSubject *GUID
 }
 
 type CATALOG_INFO struct {
 	CbStruct       uint32
-	WszCatalogFile [1024]byte
+	WszCatalogFile [512]uint16
 }
 
 type WINTRUST_CATALOG_INFO struct {
 	CbStruct             uint32
 	DwCatalogVersion     uint32
-	PcwszCatalogFilePath uintptr
-	PcwszMemberTag       uintptr
-	PcwszMemberFilePath  uintptr
-	HMemberFile          uintptr
-	PbCalculatedFileHash uintptr
+	PcwszCatalogFilePath *uint16
+	PcwszMemberTag       *uint16
+	PcwszMemberFilePath  *uint16
+	HMemberFile          syscall.Handle
+	PbCalculatedFileHash *uint8
 	CbCalculatedFileHash uint32
 	PcCatalogContext     uintptr
 	HCatAdmin            syscall.Handle
 }
 
-type WINTRUST_DATA struct {
-	CbStruct            uint32                       //0-4
-	PPolicyCallbackData uintptr                      //4-12
-	PSIPClientData      uintptr                      //12-20
-	DwUIChoice          uint32                       //20-24
-	FdwRevocationChecks uint32                       //24-28
-	DwUnionChoice       uint32                       //28-32
-	Union               uintptr                      //32-40
-	DwStateAction       uint32                       //40-44
-	HWVTStateData       syscall.Handle               //44-48
-	PwszURLReference    uintptr                      //48-56
-	DwProvFlags         uint32                       //56-60
-	DwUIContext         uint32                       // 60-64
-	PSignatureSettings  *WINTRUST_SIGNATURE_SETTINGS // 64-72
-} // 72
+type WINTRUST_DATA_FILE_INFO struct {
+	CbStruct            uint32
+	PPolicyCallbackData uintptr
+	PSIPClientData      uintptr
+	DwUIChoice          uint32
+	FdwRevocationChecks uint32
+	DwUnionChoice       uint32
+	PFile               *WINTRUST_FILE_INFO
+	DwStateAction       uint32
+	HWVTStateData       syscall.Handle
+	PwszURLReference    uintptr
+	DwProvFlags         uint32
+	DwUIContext         uint32
+	PSignatureSettings  *WINTRUST_SIGNATURE_SETTINGS
+}
+
+type WINTRUST_DATA_CATALOG_INFO struct {
+	CbStruct            uint32
+	PPolicyCallbackData uintptr
+	PSIPClientData      uintptr
+	DwUIChoice          uint32
+	FdwRevocationChecks uint32
+	DwUnionChoice       uint32
+	PCatalog            *WINTRUST_CATALOG_INFO
+	DwStateAction       uint32
+	HWVTStateData       syscall.Handle
+	PwszURLReference    uintptr
+	DwProvFlags         uint32
+	DwUIContext         uint32
+	PSignatureSettings  *WINTRUST_SIGNATURE_SETTINGS
+}
+
+type WINTRUST_DATA interface {
+	WINTRUST_DATA_CATALOG_INFO | WINTRUST_DATA_FILE_INFO
+}
 
 type WINTRUST_SIGNATURE_SETTINGS struct {
 	CbStruct           uint32
@@ -579,3 +612,13 @@ const (
 
 	INVALID_HANDLE_VALUE = syscall.Handle(0xFFFFFFFF)
 )
+
+type LUID struct {
+	LowPart  uint32
+	HighPart int32
+}
+
+type LUIDAndAttributes struct {
+	Luid       LUID
+	Attributes uint32
+}

@@ -12,6 +12,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/fs"
 	"net/http"
@@ -25,7 +26,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -93,14 +93,14 @@ func (self *CachedFilesystem) Open(name string) (http.File, error) {
 	// We do not support gz files at all - it is either brotli or
 	// uncompressed.
 	if strings.HasSuffix(name, ".gz") {
-		return nil, services.NotFoundError
+		return nil, services.OrgNotFoundError
 	}
 
 	fd, err := self.FileSystem.Open(name)
 	if err != nil {
 		// If there is not brotli file, it is just not there.
 		if strings.HasSuffix(name, ".br") {
-			return nil, services.NotFoundError
+			return nil, services.OrgNotFoundError
 		}
 
 		// Check if a compressed .br file exists
@@ -124,13 +124,13 @@ func (self *CachedFilesystem) Open(name string) (http.File, error) {
 			brotliDecompressionCounter.Inc()
 
 			// Cache for next time.
-			self.lru.Set(name, out_fd.Bytes())
+			err = self.lru.Set(name, out_fd.Bytes())
 
 			return &brotliBuffer{
 				Reader: bytes.NewReader(out_fd.Bytes()),
 				name:   name,
 				size:   n,
-			}, nil
+			}, err
 		}
 	}
 	return fd, err
@@ -145,29 +145,20 @@ func (self *CachedFilesystem) Exists(path string) bool {
 	return true
 }
 
-func NewCachedFilesystem(fs http.FileSystem) *CachedFilesystem {
+func NewCachedFilesystem(
+	ctx context.Context, fs http.FileSystem) *CachedFilesystem {
 	result := &CachedFilesystem{
 		FileSystem: fs,
 		lru:        ttlcache.NewCache(),
 	}
 
-	result.lru.SetTTL(10 * time.Minute)
+	_ = result.lru.SetTTL(10 * time.Minute)
+	result.lru.SkipTTLExtensionOnHit(true)
+
+	go func() {
+		<-ctx.Done()
+		result.lru.Close()
+	}()
+
 	return result
-}
-
-func serveStaticAsset(fs http.FileSystem) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		fd, err := fs.Open(path)
-		if err != nil {
-			returnError(w, 404, "Not Found")
-			return
-		}
-		defer fd.Close()
-
-		w.Header().Set("Content-Type", "binary/octet-stream")
-		w.WriteHeader(200)
-
-		utils.Copy(r.Context(), w, fd)
-	})
 }

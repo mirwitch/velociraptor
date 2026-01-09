@@ -4,33 +4,32 @@ import PropTypes from 'prop-types';
 import _ from 'lodash';
 
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { withRouter }  from "react-router-dom";
+import { withRouter, Link }  from "react-router-dom";
 import VeloTimestamp from "../utils/time.jsx";
 import ShellViewer from "./shell-viewer.jsx";
 import VeloReportViewer from "../artifacts/reporting.jsx";
-import VeloForm from '../forms/form.jsx';
 import { LabelClients } from './clients-list.jsx';
 
-import ToggleButtonGroup from 'react-bootstrap/ToggleButtonGroup';
-import ToggleButton from 'react-bootstrap/ToggleButton';
-import CardDeck from 'react-bootstrap/CardDeck';
+import Navbar from 'react-bootstrap/Navbar';
+import ButtonGroup from 'react-bootstrap/ButtonGroup';
+import Row from 'react-bootstrap/Row';
 import Card from 'react-bootstrap/Card';
 import Button from 'react-bootstrap/Button';
 import Modal from 'react-bootstrap/Modal';
 import Spinner from '../utils/spinner.jsx';
 import Form from 'react-bootstrap/Form';
-
-import { Link } from  "react-router-dom";
+import UserConfig from '../core/user.jsx';
+import MetadataEditor from "./metadata.jsx";
 import api from '../core/api-service.jsx';
-import axios from 'axios';
-import { parseCSV } from '../utils/csv.jsx';
+import {CancelToken} from 'axios';
 import "./host-info.css";
 import { runArtifact } from "../flows/utils.jsx";
+import InFlightViewer from "./inflight_viewer.jsx";
+import ToolTip from '../widgets/tooltip.jsx';
+import classNames from "classnames";
+
 import T from '../i8n/i8n.jsx';
-import { serializeCSV } from '../utils/csv.jsx';
 
-
-const POLL_TIME = 5000;
 const INTERROGATE_POLL_TIME = 2000;
 
 var quarantine_artifacts = {
@@ -56,7 +55,7 @@ class QuarantineDialog extends Component {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.checkQuarantineAvailability();
     }
 
@@ -180,10 +179,16 @@ class QuarantineDialog extends Component {
 }
 
 class VeloHostInfo extends Component {
+    static contextType = UserConfig;
+
     static propTypes = {
         // We must be viewing an actual client.
         client: PropTypes.object,
         setClient: PropTypes.func.isRequired,
+
+        // React router props.
+        match: PropTypes.object,
+        history: PropTypes.object,
     }
 
     state = {
@@ -192,25 +197,17 @@ class VeloHostInfo extends Component {
 
         // The mode of the host info tab set.
         mode: this.props.match.params.action || 'brief',
-
-        metadata: "Key,Value\n,\n",
-
         loading: false,
-        metadata_loading: false,
-
         showQuarantineDialog: false,
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
-        this.interval = setInterval(this.fetchMetadata, POLL_TIME);
+        this.source = CancelToken.source();
         this.updateClientInfo();
-        this.fetchMetadata();
     }
 
     componentWillUnmount() {
         this.source.cancel();
-        clearInterval(this.interval);
         if (this.interrogate_interval) {
             clearInterval(this.interrogate_interval);
         }
@@ -234,50 +231,13 @@ class VeloHostInfo extends Component {
         if (client_id) {
             api.get("v1/GetClient/" + client_id, params, this.source.token).then(
                 response=>{
+                    if (!response.data || response.data.client_id !== client_id) {
+                        return false;
+                    }
                     this.setState({loading: false});
                     return this.props.setClient(response.data);
                 }, this.source);
         };
-    }
-
-    fetchMetadata = () => {
-        if (_.isEmpty(this.props.client.client_id)) {
-            return;
-        }
-        this.setState({metadata_loading: true});
-
-        this.source.cancel();
-        this.source = axios.CancelToken.source();
-
-        api.get("v1/GetClientMetadata/" + this.props.client.client_id,
-                {}, this.source.token).then(response=>{
-                    if (response.cancel) return;
-
-                    let data = [];
-                    var items = response.data["items"] || [];
-                    for (var i=0; i<items.length; i++) {
-                        var key = items[i]["key"] || "";
-                        var value = items[i]["value"] || "";
-                        if (!_.isUndefined(key)) {
-                            data.push([key, value]);
-                        }
-                    };
-                    let metadata = serializeCSV(data, ["Key", "Value"]);
-                    this.setState({metadata: metadata,
-                                   metadata_loading: false});
-                });
-    }
-
-    setMetadata = (value) => {
-        var data = parseCSV(value);
-        let items = _.map(data.data, (x) => {
-            return {key: x.Key, value: x.Value};
-        });
-
-        var params = {client_id: this.props.client.client_id, items: items};
-        api.post("v1/SetClientMetadata", params, this.source.token).then(() => {
-            this.fetchMetadata();
-        });
     }
 
     setMode = (mode) => {
@@ -335,9 +295,10 @@ class VeloHostInfo extends Component {
 
     renderContent = () => {
         let info = this.getClientInfo();
+        let client_id = this.props.client && this.props.client.client_id;
         if (this.state.mode === 'brief') {
             return (
-                <CardDeck className="dashboard">
+                <Row className="dashboard">
                   <Card>
                     <Card.Header>{ info.os_info.fqdn }</Card.Header>
                     <Card.Body>
@@ -413,16 +374,26 @@ class VeloHostInfo extends Component {
                         <dd className="col-sm-9">
                           { info.os_info.machine }
                         </dd>
+                        <dt className="col-sm-3">MAC Addresses</dt>
+                        <dd className="col-sm-9">
+                          { _.map(info.os_info.mac_addresses, (address, idx) => {
+                              return <div key={idx}>{address}</div>;
+                          })}
+                        </dd>
                       </dl>
                       <hr />
-                      <VeloForm
-                        param={{type: "csv", name: T("Client Metadata")}}
-                        value={this.state.metadata}
-                        setValue={this.setMetadata}
-                      />
+                      { info.in_flight_flows &&
+                        <>
+                          <InFlightViewer client_info={info}/>
+                          <hr />
+                        </>}
+                    </Card.Body>
+                    <Card.Header>{T("Client Metadata")}</Card.Header>
+                    <Card.Body>
+                      <MetadataEditor client_id={client_id} />
                     </Card.Body>
                   </Card>
-                </CardDeck>
+                </Row>
             );
         };
 
@@ -498,10 +469,34 @@ class VeloHostInfo extends Component {
         });
     }
 
-    render() {
-        let client_id = this.props.client && this.props.client.client_id;
+    renderQuarantine = ()=>{
+        if(this.context.traits &&
+           this.context.traits.disable_quarantine_button) {
+            return <></>;
+        }
         let info = this.getClientInfo();
         let is_quarantined = info.labels.includes("Quarantine");
+
+        if (is_quarantined) {
+            return <ToolTip tooltip={T("Unquarantine Host")}>
+                     <Button variant="default"
+                             onClick={this.unquarantineHost}>
+                       <FontAwesomeIcon icon="virus-slash" />
+                     </Button>
+                   </ToolTip>;
+        }
+        return <ToolTip tooltip={T("Quarantine Host")}>
+                 <Button variant="default"
+                         onClick={()=>this.setState({
+                             showQuarantineDialog: true,
+                         })}>
+                   <FontAwesomeIcon icon="medkit" />
+                 </Button>
+               </ToolTip>;
+    }
+
+    render() {
+        let client_id = this.props.client && this.props.client.client_id;
 
         return (
             <>
@@ -512,11 +507,15 @@ class VeloHostInfo extends Component {
                                 })}
               />}
               <div className="full-width-height">
-                <div className="client-info">
-                  <div className="btn-group float-left toolbar" data-toggle="buttons">
+                <Navbar className="toolbar">
+                  <ButtonGroup className="" data-toggle="buttons">
                     <Button variant="default"
                             as="a"
-                            onClick={this.startInterrogate}
+                            onClick={e=>{
+                                this.startInterrogate();
+                                e.preventDefault();
+                                return false;
+                            }}
                             disabled={this.state.interrogateOperationId}>
                       { this.state.interrogateOperationId ?
                         <FontAwesomeIcon icon="spinner" spin/>:
@@ -533,24 +532,7 @@ class VeloHostInfo extends Component {
                       <i><FontAwesomeIcon icon="history"/></i>
                       <span className="button-label">{T("Collected")}</span>
                     </Link>
-                    { is_quarantined ?
-                      <Button variant="default"
-                              data-tooltip={T("Unquarantine Host")}
-                              data-position="right"
-                              className="btn-tooltip"
-                              onClick={this.unquarantineHost}>
-                        <FontAwesomeIcon icon="virus-slash" />
-                      </Button> :
-                      <Button variant="default"
-                              data-tooltip={T("Quarantine Host")}
-                              data-position="right"
-                              className="btn-tooltip"
-                              onClick={()=>this.setState({
-                                  showQuarantineDialog: true,
-                              })}>
-                        <FontAwesomeIcon icon="medkit" />
-                    </Button>
-                    }
+                    { this.renderQuarantine() }
                     { this.state.showLabelDialog &&
                       <LabelClients
                         affectedClients={[{
@@ -560,39 +542,41 @@ class VeloHostInfo extends Component {
                             this.setState({showLabelDialog: false});
                             this.updateClientInfo();
                         }}/>}
-                    <Button variant="default"
-                            data-tooltip={T("Add Label")}
-                            data-position="right"
-                            className="btn-tooltip"
-                            onClick={()=>this.setState({
-                                showLabelDialog: true,
-                            })}>
+                    <ToolTip tooltip={T("Add Label")}>
+                      <Button variant="default"
+                              onClick={e=>{
+                                  this.setState({showLabelDialog: true});
+                                  e.preventDefault();
+                              }}>
                         <FontAwesomeIcon icon="tags" />
-                    </Button>
-                  </div>
+                      </Button>
+                    </ToolTip>
+                  </ButtonGroup>
 
-                  <ToggleButtonGroup type="radio"
-                                     name="mode"
-                                     defaultValue={this.state.mode}
-                                     onChange={(mode) => this.setMode(mode)}
-                                     className="mb-2">
-                    <ToggleButton variant="default"
-                                  value='brief'>
+                  <ButtonGroup className="float-right">
+                    <Button variant="default"
+                            className={classNames({
+                                active: this.state.mode === "brief"})}
+                            onClick={(mode) => this.setMode("brief")}>
                       <FontAwesomeIcon icon="laptop"/>
                       <span className="button-label">{T("Overview")}</span>
-                    </ToggleButton>
-                    <ToggleButton variant="default"
-                                  value='detailed'>
+                    </Button>
+                    <Button variant="default"
+                            className={classNames({
+                                active: this.state.mode === "detailed"})}
+                            onClick={(mode) => this.setMode("detailed")}>
                       <FontAwesomeIcon icon="tasks"/>
                       <span className="button-label">{T("VQL Drilldown")}</span>
-                    </ToggleButton>
-                    <ToggleButton variant="default"
-                                  value='shell'>
+                    </Button>
+                    <Button variant="default"
+                            className={classNames({
+                                active: this.state.mode === "shell"})}
+                            onClick={(mode) => this.setMode("shell")}>
                       <FontAwesomeIcon icon="terminal"/>
                       <span className="button-label">{T("Shell")}</span>
-                    </ToggleButton>
-                  </ToggleButtonGroup>
-                </div>
+                    </Button>
+                  </ButtonGroup>
+                </Navbar>
                 <div className="clearfix"></div>
                 { this.renderContent() }
               </div>

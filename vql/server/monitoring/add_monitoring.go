@@ -8,7 +8,9 @@ import (
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	vql_utils "www.velocidex.com/golang/velociraptor/vql/utils"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
@@ -16,7 +18,7 @@ import (
 type AddClientMonitoringFunctionArgs struct {
 	Artifact   string           `vfilter:"required,field=artifact,doc=The name of the artifact to add"`
 	Parameters vfilter.LazyExpr `vfilter:"optional,field=parameters,doc=A dict of artifact parameters"`
-	Label      string           `vfilter:"optional,field=label,doc=Add this artifact to this label group (default all)"`
+	Label      string           `vfilter:"optional,field=label,doc=Add the artifact to this label group (default all)"`
 }
 
 type AddClientMonitoringFunction struct{}
@@ -26,7 +28,7 @@ func (self AddClientMonitoringFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.COLLECT_CLIENT)
 	if err != nil {
 		scope.Log("add_client_monitoring: %s", err)
 		return vfilter.Null{}
@@ -39,26 +41,26 @@ func (self AddClientMonitoringFunction) Call(
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("add_client_monitoring: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("add_client_monitoring: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
 	// Now verify the artifact actually exists
-	manager, err := services.GetRepositoryManager(config_obj)
+	repository, err := vql_utils.GetRepository(scope)
 	if err != nil {
 		scope.Log("add_client_monitoring: %v", err)
 		return vfilter.Null{}
 	}
 
-	repository, err := manager.GetGlobalRepository(config_obj)
-	if err != nil {
-		scope.Log("add_client_monitoring: %v", err)
-		return vfilter.Null{}
-	}
-
-	artifact, pres := repository.Get(config_obj, arg.Artifact)
+	artifact, pres := repository.Get(ctx, config_obj, arg.Artifact)
 	if !pres {
 		scope.Log("add_client_monitoring: artifact %v not found", arg.Artifact)
 		return vfilter.Null{}
@@ -101,17 +103,16 @@ func (self AddClientMonitoringFunction) Call(
 			return vfilter.Null{}
 		}
 
-		for _, k := range params_dict.Keys() {
-			v, _ := params_dict.Get(k)
-			v_str, ok := v.(string)
+		for _, i := range params_dict.Items() {
+			v_str, ok := i.Value.(string)
 			if !ok {
 				scope.Log(
 					"add_client_monitoring: parameter %v should has a string value",
-					k)
+					i.Key)
 				return vfilter.Null{}
 			}
 			new_specs.Parameters.Env = append(new_specs.Parameters.Env,
-				&actions_proto.VQLEnv{Key: k, Value: v_str})
+				&actions_proto.VQLEnv{Key: i.Key, Value: v_str})
 		}
 	}
 
@@ -131,9 +132,10 @@ func (self AddClientMonitoringFunction) Call(
 
 func (self AddClientMonitoringFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "add_client_monitoring",
-		Doc:     "Adds a new artifact to the client monitoring table.",
-		ArgType: type_map.AddType(scope, &AddClientMonitoringFunctionArgs{}),
+		Name:     "add_client_monitoring",
+		Doc:      "Adds a new artifact to the client monitoring table.",
+		ArgType:  type_map.AddType(scope, &AddClientMonitoringFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_CLIENT).Build(),
 	}
 }
 
@@ -189,7 +191,7 @@ func (self AddServerMonitoringFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.COLLECT_SERVER)
 	if err != nil {
 		scope.Log("add_server_monitoring: %s", err)
 		return vfilter.Null{}
@@ -202,26 +204,26 @@ func (self AddServerMonitoringFunction) Call(
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("add_server_monitoring: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("add_server_monitoring: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
 	// Now verify the artifact actually exists
-	manager, err := services.GetRepositoryManager(config_obj)
+	repository, err := vql_utils.GetRepository(scope)
 	if err != nil {
 		scope.Log("add_server_monitoring: %v", err)
 		return vfilter.Null{}
 	}
 
-	repository, err := manager.GetGlobalRepository(config_obj)
-	if err != nil {
-		scope.Log("add_server_monitoring: %v", err)
-		return vfilter.Null{}
-	}
-
-	artifact, pres := repository.Get(config_obj, arg.Artifact)
+	artifact, pres := repository.Get(ctx, config_obj, arg.Artifact)
 	if !pres {
 		scope.Log("add_server_monitoring: artifact %v not found", arg.Artifact)
 		return vfilter.Null{}
@@ -264,23 +266,22 @@ func (self AddServerMonitoringFunction) Call(
 		}
 	}
 
-	for _, k := range params_dict.Keys() {
-		v, _ := params_dict.Get(k)
-		v_str, ok := v.(string)
+	for _, i := range params_dict.Items() {
+		v_str, ok := i.Value.(string)
 		if !ok {
 			scope.Log(
 				"add_server_monitoring: parameter %v should has a string value",
-				k)
+				i.Key)
 			return vfilter.Null{}
 		}
 		new_specs.Parameters.Env = append(new_specs.Parameters.Env,
-			&actions_proto.VQLEnv{Key: k, Value: v_str})
+			&actions_proto.VQLEnv{Key: i.Key, Value: v_str})
 	}
 	event_config.Specs = append(event_config.Specs, new_specs)
 
 	// Actually set the table
 	principal := vql_subsystem.GetPrincipal(scope)
-	err = server_event_manager.Update(config_obj, principal, event_config)
+	err = server_event_manager.Update(ctx, config_obj, principal, event_config)
 	if err != nil {
 		scope.Log("add_server_monitoring: %v", err)
 		return vfilter.Null{}
@@ -291,9 +292,10 @@ func (self AddServerMonitoringFunction) Call(
 
 func (self AddServerMonitoringFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "add_server_monitoring",
-		Doc:     "Adds a new artifact to the server monitoring table.",
-		ArgType: type_map.AddType(scope, &AddServerMonitoringFunctionArgs{}),
+		Name:     "add_server_monitoring",
+		Doc:      "Adds a new artifact to the server monitoring table.",
+		ArgType:  type_map.AddType(scope, &AddServerMonitoringFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_SERVER).Build(),
 	}
 }
 

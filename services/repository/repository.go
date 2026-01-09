@@ -2,7 +2,7 @@ package repository
 
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -21,9 +21,6 @@ package repository
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -38,20 +35,16 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
-	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
 
-var (
-	artifactNameRegex = regexp.MustCompile("^[a-zA-Z0-9_.]+$")
-)
-
 // Holds multiple artifact definitions.
 type Repository struct {
-	mu          sync.Mutex
-	Data        map[string]*artifacts_proto.Artifact
-	loaded_dirs []string
+	mu       sync.Mutex
+	Data     map[string]*artifacts_proto.Artifact
+	metadata *metadataManager
 
 	// Each repository may have a parent - we search for the artifact
 	// in our parents as well.
@@ -59,6 +52,8 @@ type Repository struct {
 	parent_config_obj *config_proto.Config
 }
 
+// A Parent repository is another repository we can delegate to if we
+// dont have the artifact definition we require.
 func (self *Repository) SetParent(
 	parent services.Repository, parent_config_obj *config_proto.Config) {
 	self.mu.Lock()
@@ -81,51 +76,6 @@ func (self *Repository) Copy() services.Repository {
 		result.Data[k] = v
 	}
 	return result
-}
-
-// FIXME: Deprecate this method.
-func (self *Repository) LoadDirectory(
-	config_obj *config_proto.Config, dirname string,
-	override_builtins bool) (int, error) {
-	self.mu.Lock()
-
-	count := 0
-	if utils.InString(self.loaded_dirs, dirname) {
-		self.mu.Unlock()
-		return count, nil
-	}
-	dirname = filepath.Clean(dirname)
-	self.loaded_dirs = append(self.loaded_dirs, dirname)
-
-	self.mu.Unlock()
-
-	logger := logging.GetLogger(config_obj, &logging.GenericComponent)
-	err := filepath.Walk(dirname,
-		func(file_path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return errors.Wrap(err, 0)
-			}
-
-			if !info.IsDir() && (strings.HasSuffix(info.Name(), ".yaml") ||
-				strings.HasSuffix(info.Name(), ".yml")) {
-				data, err := ioutil.ReadFile(file_path)
-				if err != nil {
-					logger.Error("Could not load %s: %s", info.Name(), err)
-					return nil
-				}
-				_, err = self.LoadYaml(string(data),
-					!services.ValidateArtifact, override_builtins)
-				if err != nil {
-					logger.Error("Could not load %s: %s", info.Name(), err)
-					return nil
-				}
-				logger.Info("Loaded %s", file_path)
-				count += 1
-			}
-			return nil
-		})
-
-	return count, err
 }
 
 var query_regexp = regexp.MustCompile(`(?im)^[\s-]*(precondition|query):\s*$`)
@@ -159,8 +109,9 @@ func sanitize_artifact_yaml(data string) string {
 	return result
 }
 
-func (self *Repository) LoadYaml(data string, validate, built_in bool) (
-	*artifacts_proto.Artifact, error) {
+func (self *Repository) LoadYaml(
+	data string,
+	options services.ArtifactOptions) (*artifacts_proto.Artifact, error) {
 	artifact := &artifacts_proto.Artifact{}
 	err := yaml.UnmarshalStrict([]byte(sanitize_artifact_yaml(data)), artifact)
 	if err != nil {
@@ -168,13 +119,13 @@ func (self *Repository) LoadYaml(data string, validate, built_in bool) (
 	}
 
 	artifact.Raw = data
-	artifact.BuiltIn = built_in
-	artifact.Compiled = false
-	return self.LoadProto(artifact, validate)
+
+	return self.LoadProto(artifact, options)
 }
 
-func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate bool) (
-	*artifacts_proto.Artifact, error) {
+func (self *Repository) LoadProto(
+	artifact *artifacts_proto.Artifact,
+	options services.ArtifactOptions) (*artifacts_proto.Artifact, error) {
 
 	if artifact == nil {
 		return nil, errors.New("Invalid artifact")
@@ -183,9 +134,27 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 	// Make a copy of the artifact to store in the repository.
 	artifact = proto.Clone(artifact).(*artifacts_proto.Artifact)
 
-	if !artifactNameRegex.MatchString(artifact.Name) {
-		return nil, errors.New(
-			"Invalid artifact name. Can only contain characted in this set 'a-zA-Z0-9_.'")
+	// Clear fields that are used internally and should not be set by
+	// the yaml.
+	artifact.Compiled = false
+	artifact.IsAlias = false
+	artifact.IsInherited = false
+	artifact.Metadata = nil
+	artifact.BuiltIn = options.ArtifactIsBuiltIn
+	artifact.CompiledIn = options.ArtifactIsCompiledIn
+
+	if len(options.Tags) > 0 {
+		artifact.Metadata = &artifacts_proto.ArtifactMetadata{
+			Tags: options.Tags,
+		}
+		if self.metadata != nil {
+			self.metadata.Set(artifact.Name, artifact.Metadata)
+		}
+	}
+
+	err := validateArtifactName(artifact.Name)
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate the artifact.
@@ -206,7 +175,7 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 	// Make sure none of the aliases already exist
 	for _, alias := range artifact.Aliases {
 		_, pres := self.Data[alias]
-		if pres {
+		if pres && !options.AllowOverridingAlias {
 			return nil, fmt.Errorf("%s: Artifact Alias is already taken %s",
 				artifact.Name, alias)
 		}
@@ -219,7 +188,8 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 		// By default use the client type.
 		artifact.Type = "client"
 
-	case "client", "client_event", "server", "server_event", "internal":
+	case "client", "client_event", "server",
+		"server_event", "notebook", "internal":
 		// These types are acceptable.
 
 	default:
@@ -243,11 +213,11 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 	// Validate the artifact contains syntactically correct
 	// VQL. We do not need to validate embedded artifacts since we
 	// assume they are ok if they passed CI.
-	if validate {
+	if options.ValidateArtifact {
 		// Check RequiredPermissions
 		for _, perm := range artifact.RequiredPermissions {
 			if acls.GetPermission(perm) == acls.NO_PERMISSIONS {
-				return nil, errors.New("Invalid artifact permission")
+				return nil, fmt.Errorf("Invalid artifact permission: %v", perm)
 			}
 		}
 
@@ -257,7 +227,8 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 			_, err := vfilter.MultiParse(artifact.Precondition)
 			if err != nil {
 				return nil, fmt.Errorf(
-					"While parsing artifact precondition: %w", err)
+					"While parsing artifact precondition: %w",
+					reportError(err, artifact, "precondition", 0))
 			}
 		}
 
@@ -266,12 +237,13 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 			_, err := vfilter.MultiParse(artifact.Export)
 			if err != nil {
 				return nil, fmt.Errorf(
-					"While parsing artifact export: %w", err)
+					"While parsing artifact export: %w",
+					reportError(err, artifact, "export", 0))
 			}
 		}
 
 		// Check each source for validity
-		for _, source := range artifact.Sources {
+		for idx, source := range artifact.Sources {
 			if source.Precondition != "" {
 				if artifact.Precondition != "" {
 					return nil, fmt.Errorf(
@@ -281,37 +253,39 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 
 				_, err := vfilter.MultiParse(source.Precondition)
 				if err != nil {
-					return nil, fmt.Errorf("While parsing precondition: %w", err)
+					return nil, fmt.Errorf("While parsing precondition: %w",
+						reportError(err, artifact,
+							"sources.[].precondition", idx))
 				}
 			}
 
-			if len(source.Query) == 0 {
-				return nil, fmt.Errorf(
-					"Source %s in artifact %s contains no queries!",
-					source.Name, artifact.Name)
-			}
+			if len(source.Query) > 0 {
 
-			// Check we can parse it properly.
-			queries, err := vfilter.MultiParse(source.Query)
-			if err != nil {
-				return nil, fmt.Errorf("While parsing source query: %w", err)
-			}
+				// Check we can parse it properly.
+				queries, err := vfilter.MultiParse(source.Query)
+				if err != nil {
+					return nil, fmt.Errorf("While parsing source query %v: %w",
+						source.Name,
+						reportError(err, artifact,
+							"sources.[].query", idx))
+				}
 
-			// Make sure the source format is correct
-			for idx2, vql := range queries {
-				if idx2 < len(queries)-1 {
-					if vql.Let == "" {
-						return nil, fmt.Errorf(
-							"Invalid artifact %s: All Queries in a source "+
-								"must be LET queries, except for the "+
-								"final one.", artifact.Name)
-					}
-				} else {
-					if vql.Let != "" {
-						return nil, fmt.Errorf(
-							"Invalid artifact  %s: All Queries in a source "+
-								"must be LET queries, except for the "+
-								"final one.", artifact.Name)
+				// Make sure the source format is correct
+				for idx2, vql := range queries {
+					if idx2 < len(queries)-1 {
+						if vql.Let == "" {
+							return nil, fmt.Errorf(
+								"Invalid artifact %s: All Queries in a source "+
+									"must be LET queries, except for the "+
+									"final one.", artifact.Name)
+						}
+					} else {
+						if vql.Let != "" {
+							return nil, fmt.Errorf(
+								"Invalid artifact  %s: All Queries in a source "+
+									"must be LET queries, except for the "+
+									"final one.", artifact.Name)
+						}
 					}
 				}
 			}
@@ -321,7 +295,7 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 			for _, cell := range source.Notebook {
 				cell.Type = strings.ToLower(cell.Type)
 				switch cell.Type {
-				case "md", "markdown", "vql", "vql_suggestion":
+				case "md", "markdown", "vql", "vql_suggestion", "notebook", "none":
 				default:
 					return nil, fmt.Errorf(
 						"Artifact %s contains an invalid notebook cell type: %v",
@@ -331,12 +305,8 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 		}
 	}
 
-	if artifact.Name == "" {
-		return nil, errors.New("No artifact name")
-	}
-
-	// Prevent artifact from being overridden.
-	if !artifact.BuiltIn {
+	// Prevent built in artifacts from being overridden.
+	if !options.ArtifactIsBuiltIn {
 		self.mu.Lock()
 		existing_artifact, pres := self.Data[artifact.Name]
 		self.mu.Unlock()
@@ -361,8 +331,9 @@ func (self *Repository) LoadProto(artifact *artifacts_proto.Artifact, validate b
 }
 
 func (self *Repository) GetArtifactType(
-	config_obj *config_proto.Config, artifact_name string) (string, error) {
-	artifact, pres := self.Get(config_obj, artifact_name)
+	ctx context.Context, config_obj *config_proto.Config,
+	artifact_name string) (string, error) {
+	artifact, pres := self.Get(ctx, config_obj, artifact_name)
 	if !pres {
 		return "", fmt.Errorf("Artifact %s not known", artifact_name)
 	}
@@ -371,9 +342,10 @@ func (self *Repository) GetArtifactType(
 }
 
 func (self *Repository) GetSource(
-	config_obj *config_proto.Config, name string) (*artifacts_proto.ArtifactSource, bool) {
+	ctx context.Context, config_obj *config_proto.Config,
+	name string) (*artifacts_proto.ArtifactSource, bool) {
 	artifact_name, source_name := paths.SplitFullSourceName(name)
-	artifact, pres := self.Get(config_obj, artifact_name)
+	artifact, pres := self.Get(ctx, config_obj, artifact_name)
 	if !pres {
 		return nil, false
 	}
@@ -386,8 +358,24 @@ func (self *Repository) GetSource(
 	return nil, false
 }
 
+func (self *Repository) DecorateMetadata(
+	artifact *artifacts_proto.Artifact) *artifacts_proto.Artifact {
+
+	if self.metadata == nil {
+		return artifact
+	}
+
+	// Query the metadataManager for metadata about this artifact.
+	metadata, pres := self.metadata.Get(artifact.Name)
+	if pres {
+		artifact.Metadata = metadata
+	}
+	return artifact
+}
+
 func (self *Repository) Get(
-	config_obj *config_proto.Config, name string) (*artifacts_proto.Artifact, bool) {
+	ctx context.Context, config_obj *config_proto.Config,
+	name string) (*artifacts_proto.Artifact, bool) {
 	self.mu.Lock()
 	cached_artifact, pres := self.get(name)
 	if !pres {
@@ -395,7 +383,16 @@ func (self *Repository) Get(
 
 		// If we have a parent repository just get it from there.
 		if self.parent != nil {
-			return self.parent.Get(self.parent_config_obj, name)
+			artifact, found := self.parent.Get(ctx, self.parent_config_obj, name)
+			if !found || artifact == nil {
+				return nil, false
+			}
+
+			// Tag this artifact as inherited.
+			artifact = self.DecorateMetadata(artifact)
+			artifact.IsInherited = true
+
+			return artifact, true
 		}
 		return nil, false
 	}
@@ -405,12 +402,12 @@ func (self *Repository) Get(
 	self.mu.Unlock()
 
 	if result.Compiled {
-		return result, true
+		return self.DecorateMetadata(result), true
 	}
 
 	// Delay processing until we need it. This means loading
 	// artifacts is faster.
-	err := compileArtifact(config_obj, result)
+	err := compileArtifact(ctx, config_obj, result)
 	if err != nil {
 		logger := logging.GetLogger(config_obj, &logging.GenericComponent)
 		logger.Error("While compiling artifact %v: %v", name, err)
@@ -421,11 +418,11 @@ func (self *Repository) Get(
 	self.mu.Lock()
 	_, pres = self.Data[name]
 	if pres {
-		self.Data[name] = result
+		self.Data[name] = proto.Clone(result).(*artifacts_proto.Artifact)
 	}
 	self.mu.Unlock()
 
-	return result, true
+	return self.DecorateMetadata(result), true
 }
 
 func (self *Repository) get(name string) (*artifacts_proto.Artifact, bool) {
@@ -464,6 +461,18 @@ func (self *Repository) Del(name string) {
 	defer self.mu.Unlock()
 
 	delete(self.Data, name)
+
+	if self.metadata != nil {
+		self.metadata.Clear(name)
+	}
+}
+
+func (self *Repository) Tags(ctx context.Context,
+	config_obj *config_proto.Config) ([]string, error) {
+	if self.metadata != nil {
+		return self.metadata.Tags(), nil
+	}
+	return nil, utils.NotFoundError
 }
 
 func (self *Repository) List(ctx context.Context,
@@ -489,6 +498,8 @@ func (self *Repository) List(ctx context.Context,
 		}
 	}
 
+	sort.Strings(results)
+
 	return results, nil
 }
 
@@ -497,33 +508,17 @@ func (self *Repository) list() []string {
 	for k := range self.Data {
 		result = append(result, k)
 	}
-	sort.Strings(result)
 	return result
 }
 
 func NewArtifactRepositoryPlugin(
 	self services.Repository, config_obj *config_proto.Config) vfilter.PluginGeneratorInterface {
 	return &ArtifactRepositoryPlugin{
-		repository: self,
-		config_obj: config_obj,
-		mocks:      make(map[string][]vfilter.Row),
+		repository:      self,
+		config_obj:      config_obj,
+		mocks:           make(map[string][]vfilter.Row),
+		mock_call_count: make(map[string]int),
 	}
-}
-
-func Parse(filename string) (*artifacts_proto.Artifact, error) {
-	result := &artifacts_proto.Artifact{}
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, errors.Wrap(err, 0)
-	}
-
-	err = yaml.UnmarshalStrict(data, result)
-	if err != nil {
-		return nil, errors.Wrap(err, 0)
-	}
-	result.Raw = string(data)
-
-	return result, nil
 }
 
 func splitQueryToQueries(query string) ([]string, error) {
@@ -542,14 +537,15 @@ func splitQueryToQueries(query string) ([]string, error) {
 }
 
 func compileArtifact(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	artifact *artifacts_proto.Artifact) error {
+
 	if artifact.Compiled {
 		return nil
 	}
 
 	for _, source := range artifact.Sources {
-		if source.Queries == nil {
+		if source.Queries == nil && source.Query != "" {
 			// The Queries field contains the compiled queries -
 			// removing any comments.
 			queries, err := splitQueryToQueries(source.Query)
@@ -561,6 +557,23 @@ func compileArtifact(
 		}
 	}
 
+	// Also compile the export section to alert immediately about any
+	// problems.
+	if artifact.Export != "" {
+		_, err := splitQueryToQueries(artifact.Export)
+		if err != nil {
+			return fmt.Errorf("While compiling Exports from %v: %w",
+				artifact.Name, err)
+		}
+	}
+	artifact.Compiled = true
+
+	return updateTools(ctx, config_obj, artifact)
+}
+
+func updateTools(
+	ctx context.Context, config_obj *config_proto.Config,
+	artifact *artifacts_proto.Artifact) error {
 	// Make sure tools are all defined.
 	inventory, err := services.GetInventory(config_obj)
 	if err != nil {
@@ -568,15 +581,37 @@ func compileArtifact(
 	}
 
 	for _, tool := range artifact.Tools {
-		err := inventory.AddTool(
-			config_obj, tool,
-			services.ToolOptions{Upgrade: true})
+		tool_request := proto.Clone(tool).(*artifacts_proto.Tool)
+		tool_request.Artifact = artifact.Name
+		err := inventory.AddTool(ctx, config_obj, tool_request,
+			services.ToolOptions{
+				Upgrade:            true,
+				ArtifactDefinition: true,
+			})
 		if err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
-	artifact.Compiled = true
+var (
+	artifactNameRegex      = regexp.MustCompile("^[a-zA-Z0-9_.]+$")
+	artifactComponentRegex = regexp.MustCompile("^[0-9]")
+)
+
+func validateArtifactName(name string) error {
+	if !artifactNameRegex.MatchString(name) {
+		return errors.New(
+			"Invalid artifact name. Can only contain characted in this set 'a-zA-Z0-9_.'")
+	}
+
+	for _, part := range strings.Split(name, ".") {
+		if artifactComponentRegex.MatchString(part) {
+			return errors.New(
+				"Invalid artifact name. Name parts can not start with a number'")
+		}
+	}
 
 	return nil
 }

@@ -1,9 +1,9 @@
 package api
 
 import (
+	"context"
 	"sync"
 
-	context "golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -22,6 +22,8 @@ func (self *ApiServer) GetSubject(
 	ctx context.Context,
 	in *api_proto.DataRequest) (*api_proto.DataResponse, error) {
 
+	defer Instrument("GetSubject")()
+
 	users := services.GetUserManager()
 	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
 	if err != nil {
@@ -36,7 +38,7 @@ func (self *ApiServer) GetSubject(
 
 	perm, err := services.CheckAccessWithToken(token, acls.DATASTORE_ACCESS)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to access datastore.")
 	}
 
@@ -74,6 +76,8 @@ func (self *ApiServer) SetSubject(
 	ctx context.Context,
 	in *api_proto.DataRequest) (*api_proto.DataResponse, error) {
 
+	defer Instrument("SetSubject")()
+
 	users := services.GetUserManager()
 	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
 	if err != nil {
@@ -88,7 +92,7 @@ func (self *ApiServer) SetSubject(
 
 	perm, err := services.CheckAccessWithToken(token, acls.DATASTORE_ACCESS)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to access datastore.")
 	}
 
@@ -138,6 +142,8 @@ func (self *ApiServer) ListChildren(
 	ctx context.Context,
 	in *api_proto.DataRequest) (*api_proto.ListChildrenResponse, error) {
 
+	defer Instrument("ListChildren")()
+
 	users := services.GetUserManager()
 	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
 	if err != nil {
@@ -152,7 +158,7 @@ func (self *ApiServer) ListChildren(
 
 	perm, err := services.CheckAccessWithToken(token, acls.DATASTORE_ACCESS)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to access datastore.")
 	}
 
@@ -197,6 +203,8 @@ func (self *ApiServer) DeleteSubject(
 	ctx context.Context,
 	in *api_proto.DataRequest) (*emptypb.Empty, error) {
 
+	defer Instrument("DeleteSubject")()
+
 	users := services.GetUserManager()
 	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
 	if err != nil {
@@ -211,7 +219,7 @@ func (self *ApiServer) DeleteSubject(
 
 	perm, err := services.CheckAccessWithToken(token, acls.DATASTORE_ACCESS)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to access datastore.")
 	}
 

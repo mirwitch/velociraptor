@@ -4,8 +4,7 @@ import "./user.css";
 
 import PropTypes from 'prop-types';
 import React, { Component } from 'react';
-import Tabs from 'react-bootstrap/Tabs';
-import Tab from 'react-bootstrap/Tab';
+import Nav from 'react-bootstrap/Nav';
 import T from '../i8n/i8n.jsx';
 import { withRouter }  from "react-router-dom";
 import UserConfig from '../core/user.jsx';
@@ -23,7 +22,8 @@ import AddUserDialog from './add_user.jsx';
 import EditUserDialog from './edit-user.jsx';
 
 import api from '../core/api-service.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
+import ToolTip from '../widgets/tooltip.jsx';
 
 const POLL_TIME = 5000;
 
@@ -75,11 +75,10 @@ class ConfirmDialog extends Component {
     }
 }
 
-
-
-
 class PermissionViewer extends Component {
     static propTypes = {
+        username: PropTypes.string,
+        org: PropTypes.object,
         acls: PropTypes.object,
         setACL: PropTypes.func.isRequired,
     }
@@ -134,12 +133,25 @@ class PermissionViewer extends Component {
     }
 
     render() {
-        if (_.size(this.props.acls) === 0) {
-           return <></>;
+        if (!this.props.username) {
+            return <></>;
+        }
+
+        if (_.isEmpty(this.props.org)) {
+            return <div className="no-content">
+                     <FontAwesomeIcon icon="angles-left"
+                                      className="fa-fade"/>
+                     {T("Please Select an Org")}
+                   </div>;
+        }
+
+        if (_.isEmpty(this.props.acls)) {
+            return <div className="no-content">
+                       {T("Loading ACLs")}
+                       </div> ;
         }
 
         let org_name = this.props.acls.org_name || "root";
-
         return (
             <Container className="permission-viewer">
               <Modal show={this.state.showHelpDialog}
@@ -273,7 +285,7 @@ class UsersOverview extends Component {
 
     state = {
         user_name: "",
-        org: "",
+        org: {},
         acl: {},
 
         showAddUserDialog: false,
@@ -282,8 +294,8 @@ class UsersOverview extends Component {
     }
 
     componentDidMount = () => {
-        this.setACLsource = axios.CancelToken.source();
-        this.getACLsource = axios.CancelToken.source();
+        this.setACLsource = CancelToken.source();
+        this.getACLsource = CancelToken.source();
     }
 
     componentWillUnmount() {
@@ -293,7 +305,7 @@ class UsersOverview extends Component {
 
     setACL = (acl) => {
         this.setACLsource.cancel();
-        this.setACLsource = axios.CancelToken.source();
+        this.setACLsource = CancelToken.source();
 
         api.post("v1/SetUserRoles", acl,
                  this.setACLsource.token).then(response=>{
@@ -307,7 +319,7 @@ class UsersOverview extends Component {
 
     getACL = (user_name, org) => {
         this.getACLsource.cancel();
-        this.getACLsource = axios.CancelToken.source();
+        this.getACLsource = CancelToken.source();
 
         this.setState({acl: {}});
         let org_id = org && org.id;
@@ -368,37 +380,43 @@ class UsersOverview extends Component {
 
 
               <Col sm="4">
-                  <Container className="selectable">
-                    <Table  bordered hover size="sm">
+                  <Container className="selectable user-list">
+                    <Table size="sm">
                       <thead>
                         <tr>
                           <th>
                             {T("Users")}
                             { !this.context.traits.password_less &&
+                              <ToolTip tooltip={T("Update User Password")}>
+                                <Button
+                                  disabled={!this.state.user_name}
+                                  onClick={()=>this.setState({
+                                      showEditUserDialog: true
+                                  })}
+                                  className="new-user-btn"
+                                  variant="outline-default"
+                                  as="button">
+                                  <FontAwesomeIcon icon="edit"/>
+                                  <span className="sr-only">
+                                    {T("Update User Password")}
+                                  </span>
+                                </Button>
+                              </ToolTip>
+                            }
+                            <ToolTip tooltip={T("Add a new user")}>
                               <Button
-                                disabled={!this.state.user_name}
-                                data-tooltip={T("Update User Password")}
-                                data-position="top"
                                 onClick={()=>this.setState({
-                                    showEditUserDialog: true
+                                    showAddUserDialog: true
                                 })}
-                                className="btn-tooltip new-user-btn"
+                                className="new-user-btn"
                                 variant="outline-default"
                                 as="button">
-                                <FontAwesomeIcon icon="edit"/>
+                                <FontAwesomeIcon icon="plus"/>
+                                <span className="sr-only">
+                                  {T("Add a new user")}
+                                </span>
                               </Button>
-                            }
-                            <Button
-                              data-tooltip={T("Add a new user")}
-                              data-position="top"
-                              onClick={()=>this.setState({
-                                  showAddUserDialog: true
-                              })}
-                              className="btn-tooltip new-user-btn"
-                              variant="outline-default"
-                              as="button">
-                              <FontAwesomeIcon icon="plus"/>
-                            </Button>
+                            </ToolTip>
                           </th>
                         </tr>
                       </thead>
@@ -421,30 +439,35 @@ class UsersOverview extends Component {
                   </Container>
               </Col>
               <Col sm="4">
-                  <Container className="selectable">
-                    <Table  bordered hover size="sm">
+                  <Container className="selectable org-list">
+                    <Table size="sm">
                       <thead>
                         <tr>
                           <th>
                             {T("Orgs")}
-                            <Button
-                              disabled={!this.state.user_name}
-                              data-tooltip={T("Assign user to Orgs")}
-                              data-position="top"
-                              onClick={()=>this.setState({
-                                  showAddOrgDialog: true
-                              })}
-                              className="new-user-btn btn-tooltip"
-                              variant="outline-default"
-                              as="button">
-                              <FontAwesomeIcon icon="plus"/>
-                            </Button>
+                            <ToolTip tooltip={T("Assign user to Orgs")}>
+                              <Button
+                                disabled={!this.state.user_name}
+                                onClick={()=>this.setState({
+                                    showAddOrgDialog: true
+                                })}
+                                className="new-user-btn"
+                                variant="outline-default"
+                                as="button">
+                                <FontAwesomeIcon icon="plus"/>
+                                <span className="sr-only">
+                                  {T("Assign user to Orgs")}
+                                </span>
+                              </Button>
+                            </ToolTip>
                           </th></tr>
                       </thead>
                       <tbody>
-                        { _.isEmpty(selected_orgs) &&
-                          <tr className="no-content">
-                            <td>
+                      { _.isEmpty(selected_orgs) &&
+                        <tr className="no-content">
+                          <td>
+                              <FontAwesomeIcon icon="angles-left"
+                                               className="fa-fade"/>
                               {T("Please Select a User")}
                             </td>
                           </tr> }
@@ -467,6 +490,8 @@ class UsersOverview extends Component {
               </Col>
               <Col sm="4">
                 <PermissionViewer
+                  username={this.state.user_name}
+                  org={this.state.org}
                   acls={this.state.acl}
                   setACL={this.setACL}
                 />
@@ -501,8 +526,8 @@ class OrgsOverview extends UsersOverview {
         return (
             <Row>
                  <Col sm="4">
-                   <Container className="selectable">
-                    <Table  bordered hover size="sm">
+                   <Container className="selectable org-list">
+                    <Table size="sm">
                      <thead>
                        <tr><th>{T("Orgs")}</th></tr>
                        </thead>
@@ -532,8 +557,8 @@ class OrgsOverview extends UsersOverview {
                     </Container>
                    </Col>
                  <Col sm="4">
-            <Container className="selectable">
-             <Table  bordered hover size="sm">
+            <Container className="selectable user-list">
+             <Table size="sm">
                      <thead>
                        <tr><th>{T("Users")}</th></tr>
                      </thead>
@@ -556,6 +581,8 @@ class OrgsOverview extends UsersOverview {
             </Col>
               <Col sm="4">
                 <PermissionViewer
+                  username={this.state.user_name}
+                  org={this.state.org}
                   acls={this.state.acl}
                   setACL={this.setACL}
                 />
@@ -568,6 +595,10 @@ class OrgsOverview extends UsersOverview {
 class UserInspector extends Component {
     static contextType = UserConfig;
 
+    static propTypes = {
+        history: PropTypes.object,
+    }
+
     state = {
         tab: "users",
         users_initialized: false,
@@ -575,7 +606,7 @@ class UserInspector extends Component {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.interval = setInterval(this.loadUsers, POLL_TIME);
         this.loadUsers();
     }
@@ -598,7 +629,7 @@ class UserInspector extends Component {
 
     loadUsers = () => {
         this.source.cancel();
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
 
         this.setState({loading: true});
 
@@ -620,21 +651,28 @@ class UserInspector extends Component {
         return (
             <div className="users-search-panel">
               <div className="padded">
-                <Tabs activeKey={this.state.tab}
-                      onSelect={this.setDefaultTab}>
-                  <Tab eventKey="users" title={T("Users")}>
-                    { this.state.tab === "users" &&
-                      <UsersOverview
-                        updateUsers={this.loadUsers}
-                        users={this.state.users} />}
-                  </Tab>
-                  <Tab eventKey="orgs" title={T("Orgs")}>
-                    { this.state.tab === "orgs" &&
-                      <OrgsOverview
-                        updateUsers={this.loadUsers}
-                        users={this.state.users} /> }
-                  </Tab>
-                </Tabs>
+                <Nav activeKey={this.state.tab} variant="tab"
+                     onSelect={this.setDefaultTab}>
+                  <Nav.Item>
+                    <Nav.Link as="button" className="btn btn-default"
+                              eventKey="users">{T("Users")}</Nav.Link>
+                  </Nav.Item>
+
+                  <Nav.Item>
+                    <Nav.Link as="button" className="btn btn-default"
+                              eventKey="orgs">{T("Orgs")}</Nav.Link>
+                  </Nav.Item>
+                </Nav>
+                <div className="card-deck">
+                  { this.state.tab === "users" &&
+                    <UsersOverview
+                      updateUsers={this.loadUsers}
+                      users={this.state.users} />}
+                  { this.state.tab === "orgs" &&
+                    <OrgsOverview
+                      updateUsers={this.loadUsers}
+                      users={this.state.users} /> }
+                </div>
               </div>
             </div>
         );

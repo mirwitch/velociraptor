@@ -6,11 +6,12 @@ import Col from 'react-bootstrap/Col';
 import Button from 'react-bootstrap/Button';
 import logo from  "../sidebar/velo.svg";
 import "./login.css";
+import api from '../core/api-service.jsx';
+
 
 export default class LogoffPage extends Component {
     render() {
         let username = window.ErrorState && window.ErrorState.Username;
-        let base_path = (window.ErrorState && window.ErrorState.BasePath) || "/";
 
         return (
             <Modal className="full-height"
@@ -19,7 +20,7 @@ export default class LogoffPage extends Component {
                    enforceFocus={true}
                    scrollable={true}
                    onHide={() => {
-                       window.location = '/';
+                       window.location = api.href("/app/index.html");
                    }}>
               <Modal.Header closeButton>
                 <Modal.Title>Velociraptor Login</Modal.Title>
@@ -42,10 +43,10 @@ export default class LogoffPage extends Component {
                     <Col sm="6">
                       <Button
                         variant="outline" className="login">
-                        <a href={base_path}>
+                        <a href={api.base_path()}>
                           <Row>
                             <Col sm="1">
-                              <img src={logo}
+                              <img src={api.src_of(logo)}
                                    className="velo-logo" alt="velo logo"/>
                             </Col>
                             <Col sm="9" className="provider">

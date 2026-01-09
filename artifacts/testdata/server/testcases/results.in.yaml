@@ -3,7 +3,7 @@
 
 Queries:
   # A collection from a client.
-  - SELECT Authors, FullPath, License, Name, Summary, Version
+  - SELECT Authors, OSPath, License, Name, Summary, Version
     FROM source(
        client_id='C.4f5e52adf0a337a9',
        flow_id="F.BN2HP3OSS3LK6",
@@ -31,11 +31,13 @@ Queries:
 
   # Reading server event artifacts
   - SELECT * from source(
+       start_time=1694102596,
        artifact='Server.Monitor.Health/Prometheus')
     LIMIT 2
 
   # Page it a bit.
   - SELECT * from source(
        start_row=1,
+       start_time=1694102596,
        artifact='Server.Monitor.Health/Prometheus')
     LIMIT 1

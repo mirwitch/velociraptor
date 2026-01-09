@@ -2,7 +2,8 @@
 
    This service provides a runner to execute artifacts on the server.
    Server artifacts run with high privilege and so only users with the
-   COLLECT_SERVER permission can run those.
+   COLLECT_SERVER permission can run those, unless the artifact is
+   marked as BASIC by the artifact metadata.
 
    Server artifacts are used for administration or information purposes.
 
@@ -13,25 +14,23 @@ package server_artifacts
 import (
 	"context"
 	"sync"
-	"time"
 
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
+	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
-
 	"www.velocidex.com/golang/velociraptor/services"
 )
 
 // The Server Artifact Service is responsible for running server side
 // VQL artifacts.
 
-// Currently there is only a single server artifact runner, running on
-// the master node.
+// Currently there is only a single server artifact runner (for each
+// org), running on the master node.
 
-type ServerArtifactsRunner struct {
-	config_obj *config_proto.Config
-	mu         sync.Mutex
+type ServerArtifactRunner struct {
+	mu sync.Mutex
 
 	ctx context.Context
 	wg  *sync.WaitGroup
@@ -44,72 +43,61 @@ type ServerArtifactsRunner struct {
 // Create a bare ServerArtifactsService without the extra management.
 func NewServerArtifactRunner(
 	ctx context.Context,
-	config_obj *config_proto.Config, wg *sync.WaitGroup) *ServerArtifactsRunner {
-	return &ServerArtifactsRunner{
-		config_obj:            config_obj,
+	config_obj *config_proto.Config, wg *sync.WaitGroup) *ServerArtifactRunner {
+	return &ServerArtifactRunner{
 		in_flight_collections: make(map[string]CollectionContextManager),
 		ctx:                   ctx,
 		wg:                    wg,
 	}
 }
 
-// Retrieve any tasks waiting in the queues and evaluate them.
-func (self *ServerArtifactsRunner) process(
-	ctx context.Context,
+// Start a new collection in the current process.
+func (self *ServerArtifactRunner) LaunchServerArtifact(
 	config_obj *config_proto.Config,
-	wg *sync.WaitGroup) error {
+	session_id string,
+	req *crypto_proto.FlowRequest,
+	collection_context *flows_proto.ArtifactCollectorContext) error {
 
-	client_info_manager, err := services.GetClientInfoManager(config_obj)
+	collection_context_manager, err := NewCollectionContextManager(
+		self.ctx, self.wg, config_obj, req, collection_context)
 	if err != nil {
 		return err
 	}
 
-	messages, err := client_info_manager.GetClientTasks(ctx, "server")
-	if err != nil {
-		return err
-	}
+	// Install the manager now so it is available for cancellation
+	self.mu.Lock()
+	self.in_flight_collections[session_id] = collection_context_manager
+	self.mu.Unlock()
 
-	// We only support two message types - FlowRequest to evaluate a
-	// flow and Cancel to cancel it.
-	for _, req := range messages {
-		session_id := req.SessionId
+	sub_ctx, cancel := context.WithCancel(self.ctx)
 
-		if req.Cancel != nil {
-			// This collection is now done, cancel it.
-			self.Cancel(session_id, req.Cancel.Principal)
-			return nil
+	collection_context_manager.StartRefresh(self.wg)
+
+	self.wg.Add(1)
+	go func() {
+		defer self.wg.Done()
+		defer cancel()
+		defer collection_context_manager.Close(self.ctx)
+
+		err := self.ProcessTask(sub_ctx, config_obj,
+			session_id, collection_context_manager, req)
+		if err != nil {
+			logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+			logger.Error("<red>ServerArtifactRunner ProcessTask</> %v", err)
 		}
-
-		if req.FlowRequest != nil {
-			sub_ctx, cancel := context.WithCancel(ctx)
-			collection_context, err := NewCollectionContextManager(
-				sub_ctx, wg, self.config_obj, req)
-			if err != nil {
-				return err
-			}
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				defer cancel()
-				defer collection_context.Save()
-
-				self.ProcessTask(config_obj,
-					req.SessionId, collection_context, req.FlowRequest)
-			}()
-		}
-	}
+	}()
 
 	return nil
 }
 
-func (self *ServerArtifactsRunner) Cancel(flow_id, principal string) {
+func (self *ServerArtifactRunner) Cancel(
+	ctx context.Context, flow_id, principal string) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
 	context_manager, pres := self.in_flight_collections[flow_id]
 	if pres {
-		context_manager.Cancel(principal)
+		context_manager.Cancel(ctx, principal)
 		delete(self.in_flight_collections, flow_id)
 	}
 }
@@ -118,20 +106,23 @@ func (self *ServerArtifactsRunner) Cancel(flow_id, principal string) {
 // represents a single source to be run in parallel. The artifact
 // compiler will decide how to structure the artifact into multiple
 // VQLClientActions (e.g. by considering precondition clauses).
-func (self *ServerArtifactsRunner) ProcessTask(
-	config_obj *config_proto.Config,
+func (self *ServerArtifactRunner) ProcessTask(
+	ctx context.Context, config_obj *config_proto.Config,
 	session_id string,
 	collection_context CollectionContextManager,
 	req *crypto_proto.FlowRequest) error {
 
-	self.mu.Lock()
-	self.in_flight_collections[session_id] = collection_context
-	self.mu.Unlock()
+	var (
+		err error
+		mu  sync.Mutex
+	)
+
+	defer collection_context.Close(ctx)
 
 	// Wait here for all the queries to exit then remove them from the
 	// in_flight_collections map.
 	defer func() {
-		collection_context.Close()
+		collection_context.Close(ctx)
 
 		self.mu.Lock()
 		delete(self.in_flight_collections, session_id)
@@ -143,79 +134,37 @@ func (self *ServerArtifactsRunner) ProcessTask(
 		// We expect each source to be run in parallel.
 		wg.Add(1)
 		go func(task *actions_proto.VQLCollectorArgs) {
-			collection_context.RunQuery(task)
-			wg.Done()
+			defer wg.Done()
+
+			err1 := collection_context.RunQuery(task)
+			if err1 != nil {
+				mu.Lock()
+				if err == nil {
+					err = err1
+				}
+				mu.Unlock()
+			}
 		}(task)
 	}
 
 	wg.Wait()
 
-	return nil
+	mu.Lock()
+	defer mu.Unlock()
+	return err
 }
 
 func NewServerArtifactService(
 	ctx context.Context,
 	wg *sync.WaitGroup,
-	config_obj *config_proto.Config) error {
+	config_obj *config_proto.Config) (services.ServerArtifactRunner, error) {
 
 	self := NewServerArtifactRunner(ctx, config_obj, wg)
 
 	logger := logging.GetLogger(
 		config_obj, &logging.FrontendComponent)
-	logger.Info("<green>Starting</> Server Artifact Runner Service")
+	logger.Info("<green>Starting</> Server Artifact Runner Service for %v",
+		services.GetOrgName(config_obj))
 
-	notifier, err := services.GetNotifier(config_obj)
-	if err != nil {
-		return err
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-
-		// Listen for notifications from the server.
-		notification, cancel := notifier.ListenForNotification("server")
-		defer cancel()
-
-		err := self.process(ctx, config_obj, wg)
-		if err != nil {
-			logger.Error("ServerArtifactsRunner: %v", err)
-			return
-		}
-
-		for {
-			select {
-			// Check the queues anyway every minute in case we miss the
-			// notification.
-			case <-time.After(time.Duration(60) * time.Second):
-				err = self.process(ctx, config_obj, wg)
-				if err != nil {
-					logger.Error("ServerArtifactsRunner: %v", err)
-					continue
-				}
-
-			case <-ctx.Done():
-				return
-
-			case quit := <-notification:
-				if quit {
-					logger.Info("ServerArtifactsRunner: quit.")
-					return
-				}
-				err := self.process(ctx, config_obj, wg)
-				if err != nil {
-					logger.Error("ServerArtifactsRunner: %v", err)
-					continue
-				}
-
-				// Listen again.
-				cancel()
-				notification, cancel = notifier.ListenForNotification("server")
-			}
-		}
-	}()
-
-	return nil
+	return self, nil
 }

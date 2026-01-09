@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +23,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/third_party/zip"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 )
 
 var (
@@ -43,7 +42,6 @@ type CollectorTestSuite struct {
 	tmpdir      string
 	config_file string
 	config_obj  *config_proto.Config
-	test_server *httptest.Server
 
 	OS_TYPE string
 }
@@ -76,7 +74,7 @@ func (self *CollectorTestSuite) findAndPrepareBinary() {
 	self.binary, _ = filepath.Abs(binaries[0])
 	fmt.Printf("Found binary %v\n", self.binary)
 
-	self.tmpdir, err = ioutil.TempDir("", "tmp")
+	self.tmpdir, err = tempfile.TempDir("tmp")
 	assert.NoError(t, err)
 
 	// Copy the binary into the tmpdir
@@ -100,18 +98,6 @@ func (self *CollectorTestSuite) findAndPrepareBinary() {
 	self.config_obj.Datastore.Location = self.tmpdir
 	self.config_obj.Datastore.FilestoreDirectory = self.tmpdir
 	self.config_obj.Frontend.DoNotCompressArtifacts = true
-
-	// Start a web server that serves the filesystem - NOTE: Normally
-	// this would be served from the Velociraptor server itself but
-	// here we dont want to start it so we serve simple HTTP server
-	// and require all tools to be served remotely from these URL.
-	self.test_server = httptest.NewServer(
-		http.FileServer(http.Dir(self.tmpdir)))
-
-	// Set the server URL correctly.
-	self.config_obj.Client.ServerUrls = []string{
-		self.test_server.URL + "/",
-	}
 
 	serialized, err := yaml.Marshal(self.config_obj)
 	assert.NoError(t, err)
@@ -143,15 +129,16 @@ func (self *CollectorTestSuite) addArtifactDefinitions() {
 	fd.Write([]byte(`name: Custom.TestArtifactDependent
 tools:
   - name: MyTool
+    version: 1
   - name: MyDataFile
 
 sources:
  - query: |
-     LET binary <= SELECT FullPath, Name
+     LET binary <= SELECT OSPath, Name
          FROM Artifact.Generic.Utils.FetchBinary(
               ToolName="MyTool", SleepDuration='0')
 
-     LET data_file <= SELECT FullPath, Name
+     LET data_file <= SELECT OSPath, Name
          FROM Artifact.Generic.Utils.FetchBinary(
               ToolName="MyDataFile", SleepDuration='0',
               IsExecutable=FALSE)
@@ -159,10 +146,10 @@ sources:
      LET _ <= sleep(time=1)
 
      SELECT "Foobar", Stdout, binary[0].Name,
-            data_file[0].FullPath AS DataFilePath,
-            data_file[0].FullPath =~ ".yar$" AS HasYarExtension,
-            read_file(filename=data_file[0].FullPath) AS Data
-     FROM execve(argv=[binary[0].FullPath, "artifacts", "list"])
+            data_file[0].OSPath AS DataFilePath,
+            data_file[0].OSPath =~ ".yar$" AS HasYarExtension,
+            read_file(filename=data_file[0].OSPath) AS Data
+     FROM execve(argv=[binary[0].OSPath, "artifacts", "list"])
 `))
 	fd.Close()
 
@@ -199,23 +186,11 @@ sources:
 func (self *CollectorTestSuite) uploadToolDefinitions() {
 	t := self.T()
 
-	// Upload a small file (the config file) for all the other
-	// architectures.
-	for _, os_name := range []string{"Windows", "Windows_x86", "Linux", "Darwin"} {
-		cmd := exec.Command(self.binary, "--config", self.config_file,
-			"tools", "upload", "--name", "Velociraptor"+os_name,
-			self.config_file,
-			"--serve_remote")
-		out, err := cmd.CombinedOutput()
-		fmt.Println(string(out))
-		require.NoError(t, err)
-	}
-
-	// Upload the real thing for the architecture we are running on.
+	// Upload the real binary for the architecture we are running on.
 	cmd := exec.Command(self.binary, "--config", self.config_file,
 		"tools", "upload", "--name", "Velociraptor"+self.OS_TYPE,
-		self.test_server.URL+"/"+filepath.Base(self.binary),
-		"--serve_remote")
+		"--tool_version", constants.VERSION,
+		self.binary)
 	out, err := cmd.CombinedOutput()
 	fmt.Println(string(out))
 	require.NoError(t, err)
@@ -223,17 +198,14 @@ func (self *CollectorTestSuite) uploadToolDefinitions() {
 	// Make sure the binary is proprly added.
 	assert.Regexp(t, "name: Velociraptor", string(out))
 
-	// Not served locally - download on demand should have no hash
-	// and serve_locally should be false.
-	assert.NotRegexp(t, "serve_locally", string(out))
-	assert.NotRegexp(t, "hash: .+", string(out))
+	// Should have a hash
+	assert.Regexp(t, "hash: .+", string(out))
 
 	// Add ourselves again as a tool called MyTool - the artifact will
 	// call it.
 	cmd = exec.Command(self.binary, "--config", self.config_file,
 		"tools", "upload", "--name", "MyTool",
-		self.test_server.URL+"/"+filepath.Base(self.binary),
-		"--serve_remote")
+		"--tool_version", "1", self.binary)
 	out, err = cmd.CombinedOutput()
 	fmt.Println(string(out))
 	require.NoError(t, err)
@@ -241,10 +213,9 @@ func (self *CollectorTestSuite) uploadToolDefinitions() {
 
 func (self *CollectorTestSuite) TearDownSuite() {
 	os.RemoveAll(self.tmpdir)
-	self.test_server.Close()
 }
 
-func (self *CollectorTestSuite) TestCollector() {
+func (self *CollectorTestSuite) TestCollectorPlain() {
 	t := self.T()
 
 	// Change into the tmpdir
@@ -265,9 +236,7 @@ func (self *CollectorTestSuite) TestCollector() {
 
 	// Add it as a tool
 	cmd := exec.Command(self.binary, "--config", self.config_file,
-		"tools", "upload", "--name", "MyDataFile",
-		self.test_server.URL+"/test.yar",
-		"--serve_remote")
+		"tools", "upload", "--name", "MyDataFile", data_file_name)
 	out, err := cmd.CombinedOutput()
 	fmt.Println(string(out))
 	require.NoError(t, err)
@@ -285,7 +254,6 @@ func (self *CollectorTestSuite) TestCollector() {
 		"--args", "target=ZIP",
 		"--args", "opt_admin=N",
 		"--args", "opt_prompt=N",
-		"--args", "template=Custom.TestArtifact",
 		"--output", output_zip,
 	}
 
@@ -306,7 +274,7 @@ func (self *CollectorTestSuite) TestCollector() {
 	for _, f := range r.File {
 		fmt.Printf("Contents of collector:  %s (%v bytes)\n",
 			f.Name, f.UncompressedSize)
-		if strings.HasPrefix(f.Name, "uploads/file/Collector") {
+		if strings.HasPrefix(f.Name, "uploads/scope/Collector") {
 			fmt.Printf("Extracting %v to %v\n", f.Name, output_executable)
 
 			rc, err := f.Open()
@@ -432,7 +400,7 @@ func (self *CollectorTestSuite) TestCollectorEncrypted() {
 	for _, f := range r.File {
 		fmt.Printf("Contents of collector:  %s (%v bytes)\n",
 			f.Name, f.UncompressedSize)
-		if strings.HasPrefix(f.Name, "uploads/file/Collector") {
+		if strings.HasPrefix(f.Name, "uploads/scope/Collector") {
 			fmt.Printf("Extracting %v to %v\n", f.Name, output_executable)
 
 			rc, err := f.Open()

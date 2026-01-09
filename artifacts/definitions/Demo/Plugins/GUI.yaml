@@ -12,12 +12,23 @@ resources:
 
 parameters:
   - name: ChoiceSelector
+    description: Choose one item from a selection
     type: choices
     default: First Choice
     choices:
       - First Choice
       - Second Choice
       - Third Choice
+
+  - name: MultiChoiceSelector
+    description: Choose one or more items from a selection
+    type: multichoice
+    default: '["Bananas"]'
+    choices:
+      - Apples
+      - Bananas
+      - Oranges
+      - Grapes
 
   - name: Hashes
     validating_regex: '^\s*([A-F0-9]+\s*)+$'
@@ -37,7 +48,7 @@ parameters:
   - name: Flag
     friendly_name: A Flag with a name
     type: bool
-    default: Y
+    default: True
 
   - name: Flag2
     type: bool
@@ -66,25 +77,30 @@ parameters:
       A,B
       C,D
 
-  - name: CSVData2
-    type: csv
-    default: |
-      Column1,Column2
-      A,B
-      C,D
-
   - name: JSONData
     type: json_array
-    default: "[]"
+    default: '["First","Second"]'
 
-  - name: JSONData2
+  - name: JSONDataWithObject
     type: json_array
     default: |
       [{"foo": "bar"}]
 
   - name: FileUpload1
     type: upload
-    description: FileUpload1 can receive a file upload. The upload content will be available in this variable when executing on the client.
+    description: |
+      FileUpload1 can receive a file upload.
+
+      The upload content will be available in this variable when
+      executing on the client.
+
+  - name: FileUpload2
+    type: upload_file
+    description: |
+      FileUpload2 can receive a file upload.
+
+      The upload content will be stored in a temp file which will be
+      available in this variable when executing on the client.
 
   - name: ArtifactSelections
     type: artifactset
@@ -97,16 +113,17 @@ parameters:
       Windows.Events.ServiceCreation
 
 column_types:
-  - name: Hex
+  - name: Base64Hex
     type: base64hex
 
 sources:
   - query: |
-      SELECT base64encode(string="This should popup in a hex editor") AS Hex,
-             ChoiceSelector, Flag, Flag2, Flag3,
+      SELECT base64encode(string="This should popup in a hex editor") AS Base64Hex,
+             ChoiceSelector, MultiChoiceSelector, Flag, Flag2, Flag3,
              OffFlag, StartDate, StartDate2, StartDate3,
-             CSVData, CSVData2, JSONData, JSONData2,
-             len(list=FileUpload1) AS FileUpload1Length
+             CSVData, JSONData, JSONDataWithObject,
+             len(list=FileUpload1) AS FileUpload1Length,
+             stat(filename=FileUpload2) AS FileUpload2Stats
       FROM scope()
 
     notebook:
@@ -120,7 +137,8 @@ sources:
           */
           SELECT * FROM info()
 
-      - type: md
+      - type: markdown
+        name: Test Template
         template: |
           # GUI Notebook tests
 
@@ -131,15 +149,21 @@ sources:
           **Each of the below cells should have a H2 heading**
 
           ## Check that notebook environment variables are populated
-          {{ $x := Query "SELECT * FROM items(\
-             item=dict(NotebookId=NotebookId, ClientId=ClientId,\
-                       FlowId=FlowId, ArtifactName=ArtifactName))" | Expand }}
+
+          Some of these are populated from the artifact parameters.
+
+          {{ $x := Query "LET X = scope() SELECT * FROM items(\
+             item=dict(NotebookId=X.NotebookId, ClientId=X.ClientId,\
+                       FlowId=X.FlowId, ArtifactName=X.ArtifactName, \
+                       ChoiceSelector=X.ChoiceSelector, StartDate=X.StartDate, \
+                       HuntId=X.HuntId))" | Expand }}
 
           {{ range $x }}
           * {{ Get . "_key" }} - {{ Get . "_value" }}
           {{- end -}}
 
-      - type: md
+      - type: markdown
+        name: Test Code Highlighting
         template: |
           ## Code syntax highlighting for VQL
 
@@ -148,6 +172,7 @@ sources:
           ```
 
       - type: vql
+        name: Test Markdown in VQL cell
         template: |
           /*
           ## A VQL cell with a heading.
@@ -184,10 +209,20 @@ sources:
 
                  FlowId, ClientId, URL, URL AS SafeURL, Base64Data,
 
-                 "Hello" AS Data
+                 format(format="%02x", args="Hello") AS Data,
+                 TRUE, 4, NULL
           FROM scope()
 
+      - type: VQL
+        name: Test Default ColumnTypes
+        template: |
+          /*
+          ## Ensure that Base64hex data is automatically typed
+          */
+          SELECT base64encode(string="This should popup in a hex editor") AS Base64Hex FROM scope()
+
       - type: Markdown
+        name: Scatter Chart
         template: |
           ## Scatter Chart with a named column
 
@@ -246,6 +281,7 @@ sources:
           {{ Query "LineTest" | LineChart }}
 
       - type: Markdown
+        name: Line Chart
         template: |
           ## A Line Chart
 
@@ -254,6 +290,7 @@ sources:
           {{ define "Q" }}
             SELECT _ts, CPUPercent
             FROM monitoring(
+                  client_id="server",
                   artifact="Server.Monitor.Health/Prometheus",
                   start_time=now() - 10 * 60)
             LIMIT 100
@@ -262,6 +299,7 @@ sources:
           {{ Query "Q" | TimeChart }}
 
       - type: vql
+        name: Test Timeline
         template: |
           /*
           ## Adding timelines
@@ -272,6 +310,7 @@ sources:
           */
           SELECT timestamp(epoch=_ts) AS Timestamp, CPUPercent
           FROM monitoring(
+            client_id="server",
             source="Prometheus",
             artifact="Server.Monitor.Health",
             start_time=now() - 10 * 60)
@@ -280,6 +319,7 @@ sources:
                timestamp(epoch=_ts) AS Timestamp,
                dict(X=CPUPercent, Y=1) AS Dict
           FROM monitoring(
+            client_id="server",
             source="Prometheus",
             artifact="Server.Monitor.Health",
             start_time=now() - 10 * 60)
@@ -294,6 +334,7 @@ sources:
           FROM scope()
 
       - type: Markdown
+        name: Test Cell Environment
         env:
           - key: Timeline
             value: Test "Timeline 你好世界"
@@ -306,6 +347,7 @@ sources:
           {{ Scope "Timeline" | Timeline }}
 
       - type: VQL
+        name: Test Table Scrolling
         template: |
           /*
           # Test table scrolling.
@@ -324,6 +366,7 @@ sources:
           FROM range(start=0, end=100, step=1)
 
       - type: VQL
+        name: Test Column Types
         template: |
           /*
           # Column types set in the artifact's `column_types` field
@@ -331,11 +374,74 @@ sources:
           These apply to notebooks automatically without needing to
           define them again.
 
-          Hash column should right click to VT
+          * Hash column should right click to VT
+          * upload preview should show the uploaded file.
 
           */
 
-          LET ColumnTypes = dict(`StartDate`='timestamp')
+          LET ColumnTypes = dict(`StartDate`='timestamp', Download='download',
+                                 Hex='hex', Upload='preview_upload')
+          LET Hex = "B0 EC 48 5F 18 77"
 
-          SELECT Hex, StartDate, hash(accessor="data", path="Hello") AS Hash
+          SELECT Hex, StartDate, hash(accessor="data", path="Hello") AS Hash,
+                 upload(accessor="data", file="Hello world",
+                        name="test.txt") AS Upload,
+                 upload(accessor="data", file="Hello world",
+                        name="test.txt") AS Download
           FROM source()
+
+      - type: VQL
+        name: Test JSON renderer
+        template: |
+          /* Test the JSON renderer. */
+          LET Strings = SELECT "Hello World" AS A FROM range(end=100)
+
+          LET MultiColumn = SELECT * FROM chain(a={
+            SELECT 1 AS A FROM range(end=10)
+          }, b={
+            SELECT 1 AS B FROM range(end=10)
+          })
+
+          SELECT dict(
+            MultiColumn=MultiColumn,
+            Strings=Strings.A,
+            `NULL`=NULL,
+            Bool=TRUE,
+            BoolF=FALSE,
+            BinaryData=base64encode(string="hello world"),
+            Rows={
+              SELECT count() AS Count,
+                     rand() AS R
+              FROM range(end=20)
+            },
+            Integer=1, Float=1.235,
+            LongString="Hello world " * 100,
+            MixedList=[1, 2, dict(A=3)],
+            NestedDict=dict(
+                Foo=dict(A=1,
+                         B=dict(z=1,
+                                nesting=dict(Foo="Hello world"))))) AS A
+          FROM scope()
+
+      - type: VQL
+        name: Test Links
+        template: |
+          /*
+          # Test the link_to() VQL Function
+          */
+          LET ColumnTypes <= dict(
+            LinkToFlow="url_internal",
+            LinkToHunt="url_internal",
+            LinkToArtifact="url_internal",
+            Download="url_internal",
+            LinkToClient="url_internal")
+
+          LET s = scope()
+          LET Uploaded <= upload(accessor="data", file="Hello", name="test.txt")
+
+          SELECT link_to(client_id=ClientId, flow_id=s.FlowId || "F.123") AS LinkToFlow,
+                 link_to(client_id=ClientId) AS LinkToClient,
+                 link_to(hunt_id=s.HuntId || "H.123") AS LinkToHunt,
+                 link_to(artifact=ArtifactName) AS LinkToArtifact,
+                 link_to(upload=Uploaded) AS Download
+          FROM scope()

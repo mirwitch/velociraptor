@@ -2,7 +2,6 @@ package hunt_manager_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -12,7 +11,6 @@ import (
 	"google.golang.org/protobuf/proto"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
@@ -20,6 +18,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/services/hunt_manager"
+	"www.velocidex.com/golang/velociraptor/services/launcher"
+	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 
@@ -29,10 +29,10 @@ import (
 type HuntTestSuite struct {
 	test_utils.TestSuite
 
-	client_id string
-	hunt_id   string
-	flow_id   string
-	expected  *flows_proto.ArtifactCollectorArgs
+	client_id       string
+	hunt_id         string
+	expected        *flows_proto.ArtifactCollectorArgs
+	storage_manager launcher.FlowStorageManager
 }
 
 func (self *HuntTestSuite) SetupTest() {
@@ -45,21 +45,16 @@ func (self *HuntTestSuite) SetupTest() {
 
 	self.hunt_id += "A"
 	self.expected.Creator = self.hunt_id
-
-	launcher, err := services.GetLauncher(self.ConfigObj)
-	assert.NoError(self.T(), err)
-
-	launcher.SetFlowIdForTests("F.1234")
-	self.flow_id = "F.1234." + self.hunt_id
+	self.expected.FlowId = utils.CreateFlowIdFromHuntId(self.hunt_id)
 
 	// Write a client record.
-	client_info_obj := &actions_proto.ClientInfo{
-		ClientId: self.client_id,
-	}
-	client_path_manager := paths.NewClientPathManager(self.client_id)
-	db, _ := datastore.GetDB(self.ConfigObj)
-	err = db.SetSubject(self.ConfigObj,
-		client_path_manager.Path(), client_info_obj)
+	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	err = client_info_manager.Set(self.Ctx, &services.ClientInfo{
+		ClientInfo: &actions_proto.ClientInfo{
+			ClientId: self.client_id,
+		}})
 	assert.NoError(self.T(), err)
 }
 
@@ -84,13 +79,13 @@ func (self *HuntTestSuite) TestHuntManager() {
 
 	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(t, err)
-	hunt_dispatcher.Refresh(self.ConfigObj)
+	hunt_dispatcher.Refresh(self.Ctx, self.ConfigObj)
 
 	// Simulate a System.Hunt.Participation event
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(t, err)
 
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("HuntId", self.hunt_id).
 			Set("ClientId", self.client_id),
@@ -100,6 +95,7 @@ func (self *HuntTestSuite) TestHuntManager() {
 	indexer, err := services.GetIndexer(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
+	flow_id := hunt_obj.StartRequest.FlowId
 	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
 		// The hunt index is updated.
 		err = indexer.CheckSimpleIndex(self.ConfigObj, paths.HUNT_INDEX,
@@ -107,14 +103,14 @@ func (self *HuntTestSuite) TestHuntManager() {
 		if err != nil {
 			return false
 		}
-		_, err = LoadCollectionContext(self.ConfigObj,
-			self.client_id, self.flow_id)
+		_, err = self.storage_manager.LoadCollectionContext(self.Ctx,
+			self.ConfigObj, self.client_id, flow_id)
 		return err == nil
 	})
 
 	// Check that a flow was launched.
-	collection_context, err := LoadCollectionContext(self.ConfigObj,
-		self.client_id, self.flow_id)
+	collection_context, err := self.storage_manager.LoadCollectionContext(
+		self.Ctx, self.ConfigObj, self.client_id, flow_id)
 	assert.NoError(t, err)
 	assert.Equal(t, collection_context.Request.Artifacts, self.expected.Artifacts)
 }
@@ -146,13 +142,13 @@ func (self *HuntTestSuite) TestHuntWithLabelClientNoLabel() {
 	assert.NoError(t, err)
 
 	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
-	hunt_dispatcher.Refresh(self.ConfigObj)
+	hunt_dispatcher.Refresh(self.Ctx, self.ConfigObj)
 
 	// Simulate a System.Hunt.Participation event
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(t, err)
 
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("HuntId", self.hunt_id).
 			Set("ClientId", self.client_id).
@@ -163,7 +159,9 @@ func (self *HuntTestSuite) TestHuntWithLabelClientNoLabel() {
 	time.Sleep(time.Second)
 
 	// No flow should be launched.
-	_, err = LoadCollectionContext(self.ConfigObj, self.client_id, self.flow_id)
+	flow_id := hunt_obj.StartRequest.FlowId
+	_, err = self.storage_manager.LoadCollectionContext(self.Ctx,
+		self.ConfigObj, self.client_id, flow_id)
 	assert.Error(t, err)
 
 	// Now add the label to the client. The hunt will now be
@@ -184,7 +182,8 @@ func (self *HuntTestSuite) TestHuntWithLabelClientNoLabel() {
 	})
 
 	// The flow is now created.
-	_, err = LoadCollectionContext(self.ConfigObj, self.client_id, self.flow_id)
+	_, err = self.storage_manager.LoadCollectionContext(self.Ctx,
+		self.ConfigObj, self.client_id, flow_id)
 	assert.NoError(t, err)
 }
 
@@ -222,13 +221,15 @@ func (self *HuntTestSuite) TestHuntWithLabelClientHasLabelDifferentCase() {
 
 	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(t, err)
-	hunt_dispatcher.Refresh(self.ConfigObj)
+	hunt_dispatcher.Refresh(self.Ctx, self.ConfigObj)
 
 	// Simulate a System.Hunt.Participation event
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(t, err)
 
-	journal.PushRowsToArtifact(self.ConfigObj,
+	flow_id := hunt_obj.StartRequest.FlowId
+
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("HuntId", self.hunt_id).
 			Set("ClientId", self.client_id).
@@ -247,13 +248,13 @@ func (self *HuntTestSuite) TestHuntWithLabelClientHasLabelDifferentCase() {
 		if err != nil {
 			return false
 		}
-		_, err := LoadCollectionContext(
-			self.ConfigObj, self.client_id, self.flow_id)
+		_, err := self.storage_manager.LoadCollectionContext(self.Ctx,
+			self.ConfigObj, self.client_id, flow_id)
 		return err == nil
 	})
 
-	collection_context, err := LoadCollectionContext(self.ConfigObj,
-		self.client_id, self.flow_id)
+	collection_context, err := self.storage_manager.LoadCollectionContext(
+		self.Ctx, self.ConfigObj, self.client_id, flow_id)
 	assert.Equal(t, collection_context.Request.Artifacts, self.expected.Artifacts)
 }
 
@@ -278,13 +279,13 @@ func (self *HuntTestSuite) TestHuntWithOverride() {
 
 	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(t, err)
-	hunt_dispatcher.Refresh(self.ConfigObj)
+	hunt_dispatcher.Refresh(self.Ctx, self.ConfigObj)
 
 	// Simulate a System.Hunt.Participation event
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(t, err)
 
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("HuntId", self.hunt_id).
 			Set("ClientId", self.client_id).
@@ -295,6 +296,8 @@ func (self *HuntTestSuite) TestHuntWithOverride() {
 	indexer, err := services.GetIndexer(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
+	flow_id := hunt_obj.StartRequest.FlowId
+
 	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
 		// The hunt index is updated since we have seen this client
 		// already (even if we decided not to launch on it).
@@ -304,13 +307,13 @@ func (self *HuntTestSuite) TestHuntWithOverride() {
 			return false
 		}
 
-		_, err := LoadCollectionContext(
-			self.ConfigObj, self.client_id, self.flow_id)
+		_, err := self.storage_manager.LoadCollectionContext(self.Ctx,
+			self.ConfigObj, self.client_id, flow_id)
 		return err == nil
 	})
 
-	collection_context, err := LoadCollectionContext(self.ConfigObj,
-		self.client_id, self.flow_id)
+	collection_context, err := self.storage_manager.LoadCollectionContext(
+		self.Ctx, self.ConfigObj, self.client_id, flow_id)
 	assert.NoError(t, err)
 	assert.Equal(t, collection_context.Request.Artifacts, self.expected.Artifacts)
 }
@@ -348,13 +351,13 @@ func (self *HuntTestSuite) TestHuntWithLabelClientHasLabel() {
 
 	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(t, err)
-	hunt_dispatcher.Refresh(self.ConfigObj)
+	hunt_dispatcher.Refresh(self.Ctx, self.ConfigObj)
 
 	// Simulate a System.Hunt.Participation event
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(t, err)
 
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("HuntId", self.hunt_id).
 			Set("ClientId", self.client_id).
@@ -365,6 +368,7 @@ func (self *HuntTestSuite) TestHuntWithLabelClientHasLabel() {
 	indexer, err := services.GetIndexer(self.ConfigObj)
 	assert.NoError(t, err)
 
+	flow_id := hunt_obj.StartRequest.FlowId
 	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
 		// The hunt index is updated since we have seen this client
 		// already (even if we decided not to launch on it).
@@ -374,13 +378,13 @@ func (self *HuntTestSuite) TestHuntWithLabelClientHasLabel() {
 			return false
 		}
 
-		_, err := LoadCollectionContext(
-			self.ConfigObj, self.client_id, self.flow_id)
+		_, err := self.storage_manager.LoadCollectionContext(
+			self.Ctx, self.ConfigObj, self.client_id, flow_id)
 		return err == nil
 	})
 
-	collection_context, err := LoadCollectionContext(self.ConfigObj,
-		self.client_id, self.flow_id)
+	collection_context, err := self.storage_manager.LoadCollectionContext(
+		self.Ctx, self.ConfigObj, self.client_id, flow_id)
 	assert.NoError(t, err)
 	assert.Equal(t, collection_context.Request.Artifacts, self.expected.Artifacts)
 }
@@ -408,6 +412,8 @@ func (self *HuntTestSuite) TestHuntWithLabelClientHasExcludedLabel() {
 		},
 	}
 
+	flow_id := hunt_obj.StartRequest.FlowId
+
 	db, err := datastore.GetDB(self.ConfigObj)
 	assert.NoError(t, err)
 
@@ -427,13 +433,13 @@ func (self *HuntTestSuite) TestHuntWithLabelClientHasExcludedLabel() {
 
 	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(t, err)
-	hunt_dispatcher.Refresh(self.ConfigObj)
+	hunt_dispatcher.Refresh(self.Ctx, self.ConfigObj)
 
 	// Simulate a System.Hunt.Participation event
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(t, err)
 
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("HuntId", self.hunt_id).
 			Set("ClientId", self.client_id).
@@ -444,8 +450,68 @@ func (self *HuntTestSuite) TestHuntWithLabelClientHasExcludedLabel() {
 	time.Sleep(time.Second)
 
 	// No flow should be launched.
-	_, err = LoadCollectionContext(
-		self.ConfigObj, self.client_id, self.flow_id)
+	_, err = self.storage_manager.LoadCollectionContext(
+		self.Ctx, self.ConfigObj, self.client_id, flow_id)
+	assert.Error(t, err)
+}
+
+func (self *HuntTestSuite) TestHuntWithLabelClientHasOnlyExcludedLabel() {
+	t := self.T()
+
+	// The hunt will launch the Generic.Client.Info on the client.
+	hunt_obj := &api_proto.Hunt{
+		HuntId:       self.hunt_id,
+		StartRequest: self.expected,
+		State:        api_proto.Hunt_RUNNING,
+		Stats:        &api_proto.HuntStats{},
+		Expires:      uint64(time.Now().Add(7*24*time.Hour).UTC().UnixNano() / 1000),
+		Condition: &api_proto.HuntCondition{
+			ExcludedLabels: &api_proto.HuntLabelCondition{
+				Label: []string{"DoNotRunHunts"},
+			},
+		},
+	}
+
+	flow_id := hunt_obj.StartRequest.FlowId
+
+	db, err := datastore.GetDB(self.ConfigObj)
+	assert.NoError(t, err)
+
+	hunt_path_manager := paths.NewHuntPathManager(hunt_obj.HuntId)
+	err = db.SetSubject(self.ConfigObj, hunt_path_manager.Path(), hunt_obj)
+	assert.NoError(t, err)
+
+	labeler := services.GetLabeler(self.ConfigObj)
+	err = labeler.SetClientLabel(
+		context.Background(), self.ConfigObj, self.client_id, "MyLabel")
+	assert.NoError(t, err)
+
+	// Also set the excluded label - this trumps an include label.
+	err = labeler.SetClientLabel(
+		context.Background(), self.ConfigObj, self.client_id, "DoNotRunHunts")
+	assert.NoError(t, err)
+
+	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
+	assert.NoError(t, err)
+	hunt_dispatcher.Refresh(self.Ctx, self.ConfigObj)
+
+	// Simulate a System.Hunt.Participation event
+	journal, err := services.GetJournal(self.ConfigObj)
+	assert.NoError(t, err)
+
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
+		[]*ordereddict.Dict{ordereddict.NewDict().
+			Set("HuntId", self.hunt_id).
+			Set("ClientId", self.client_id).
+			Set("Fqdn", "MyHost"),
+		},
+		"System.Hunt.Participation", self.client_id, "")
+
+	time.Sleep(time.Second)
+
+	// No flow should be launched.
+	_, err = self.storage_manager.LoadCollectionContext(
+		self.Ctx, self.ConfigObj, self.client_id, flow_id)
 	assert.Error(t, err)
 }
 
@@ -467,26 +533,32 @@ func (self *HuntTestSuite) TestHuntClientOSCondition() {
 			},
 		},
 	}
+	flow_id := hunt_obj.StartRequest.FlowId
 
-	db, err := datastore.GetDB(self.ConfigObj)
+	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
 	assert.NoError(t, err)
 
 	// Create a windows and linux client
 	client_id_1 := "C.12321"
 	client_id_2 := "C.12322"
 
-	client_path_manager := paths.NewClientPathManager(client_id_1)
-	err = db.SetSubject(self.ConfigObj,
-		client_path_manager.Path(), &actions_proto.ClientInfo{
-			System: "windows",
-		})
+	err = client_info_manager.Set(self.Ctx, &services.ClientInfo{
+		ClientInfo: &actions_proto.ClientInfo{
+			ClientId: client_id_1,
+			System:   "windows",
+		},
+	})
 	assert.NoError(t, err)
 
-	client_path_manager = paths.NewClientPathManager(client_id_2)
-	err = db.SetSubject(self.ConfigObj,
-		client_path_manager.Path(), &actions_proto.ClientInfo{
-			System: "linux",
-		})
+	err = client_info_manager.Set(self.Ctx, &services.ClientInfo{
+		ClientInfo: &actions_proto.ClientInfo{
+			ClientId: client_id_2,
+			System:   "linux",
+		},
+	})
+	assert.NoError(t, err)
+
+	db, err := datastore.GetDB(self.ConfigObj)
 	assert.NoError(t, err)
 
 	hunt_path_manager := paths.NewHuntPathManager(hunt_obj.HuntId)
@@ -495,13 +567,13 @@ func (self *HuntTestSuite) TestHuntClientOSCondition() {
 
 	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(t, err)
-	hunt_dispatcher.Refresh(self.ConfigObj)
+	hunt_dispatcher.Refresh(self.Ctx, self.ConfigObj)
 
 	// Simulate a System.Hunt.Participation event
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(t, err)
 
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{
 			ordereddict.NewDict().
 				Set("HuntId", self.hunt_id).
@@ -516,12 +588,14 @@ func (self *HuntTestSuite) TestHuntClientOSCondition() {
 
 	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
 		// Flow should be launched on client id because it is a Windows client.
-		_, err = LoadCollectionContext(self.ConfigObj, client_id_1, self.flow_id)
+		_, err = self.storage_manager.LoadCollectionContext(
+			self.Ctx, self.ConfigObj, client_id_1, flow_id)
 		return err == nil
 	})
 
 	// No flow should be launched on client_id_2 because it is a Linux client.
-	_, err = LoadCollectionContext(self.ConfigObj, client_id_2, self.flow_id)
+	_, err = self.storage_manager.LoadCollectionContext(
+		self.Ctx, self.ConfigObj, client_id_2, flow_id)
 	assert.Error(t, err)
 }
 
@@ -532,17 +606,17 @@ func (self *HuntTestSuite) TestHuntClientOSCondition() {
 func (self *HuntTestSuite) TestHuntClientOSConditionInterrogation() {
 	t := self.T()
 
-	db, err := datastore.GetDB(self.ConfigObj)
-	assert.NoError(t, err)
-
 	// Create initial client with no OS set.
 	self.client_id = "C.12326"
 
-	client_path_manager := paths.NewClientPathManager(self.client_id)
-	err = db.SetSubject(self.ConfigObj,
-		client_path_manager.Path(), &actions_proto.ClientInfo{
+	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
+	assert.NoError(t, err)
+
+	err = client_info_manager.Set(self.Ctx, &services.ClientInfo{
+		ClientInfo: &actions_proto.ClientInfo{
 			ClientId: self.client_id,
-		})
+		},
+	})
 	assert.NoError(t, err)
 
 	// The hunt will launch the Generic.Client.Info on the client.
@@ -565,12 +639,14 @@ func (self *HuntTestSuite) TestHuntClientOSConditionInterrogation() {
 	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(t, err)
 
-	self.hunt_id, err = hunt_dispatcher.CreateHunt(
+	new_hunt, err := hunt_dispatcher.CreateHunt(
 		self.Ctx, self.ConfigObj, acl_manager, hunt_obj)
 	assert.NoError(t, err)
 
+	self.hunt_id = new_hunt.HuntId
+
 	// Force the hunt manager to process a participation row
-	err = hunt_manager.HuntManagerForTests.ProcessParticipation(
+	err = hunt_manager.HuntManagerForTests.ProcessParticipationWithError(
 		self.Ctx, self.ConfigObj,
 		ordereddict.NewDict().
 			Set("HuntId", self.hunt_id).
@@ -579,32 +655,28 @@ func (self *HuntTestSuite) TestHuntClientOSConditionInterrogation() {
 	assert.Contains(t, err.Error(), "does not match OS condition")
 
 	// Write a new OS to it
-	err = db.SetSubject(self.ConfigObj,
-		client_path_manager.Path(), &actions_proto.ClientInfo{
-			System: "windows",
-		})
+	err = client_info_manager.Set(self.Ctx, &services.ClientInfo{
+		ClientInfo: &actions_proto.ClientInfo{
+			ClientId: self.client_id,
+			System:   "windows",
+		},
+	})
 	assert.NoError(t, err)
-
-	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
-	assert.NoError(t, err)
-
-	client_info_manager.Flush(context.Background(), self.client_id)
 
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	assert.NoError(self.T(), journal.PushRowsToArtifact(self.ConfigObj,
+	assert.NoError(self.T(), journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("ClientId", self.client_id),
 		}, "Server.Internal.Interrogation", self.client_id, ""))
 
-	time.Sleep(time.Second)
-
 	// Ensure the hunt is collected on the client.
 	mdb := test_utils.GetMemoryDataStore(self.T(), self.ConfigObj)
+	flow_id := hunt_obj.StartRequest.FlowId
 	vtesting.WaitUntil(time.Second, self.T(), func() bool {
 		task := &crypto_proto.VeloMessage{}
-		path_manager := paths.NewFlowPathManager(self.client_id, self.flow_id)
+		path_manager := paths.NewFlowPathManager(self.client_id, flow_id)
 		err := mdb.GetSubject(self.ConfigObj,
 			path_manager.Task(), task)
 		return err != nil
@@ -631,14 +703,15 @@ func (self *HuntTestSuite) TestHuntManagerMutations() {
 
 	dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(self.T(), err)
-	dispatcher.Refresh(self.ConfigObj)
+	dispatcher.Refresh(self.Ctx, self.ConfigObj)
 
 	// Schedule a new hunt on this client if we receive a
 	// participation event.
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	assert.NoError(self.T(), journal.PushRowsToArtifact(self.ConfigObj,
+	assert.NoError(self.T(), journal.PushRowsToArtifact(
+		self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("HuntId", hunt_obj.HuntId).
 			Set("ClientId", self.client_id),
@@ -646,12 +719,12 @@ func (self *HuntTestSuite) TestHuntManagerMutations() {
 
 	// This will schedule a hunt on this client.
 	vtesting.WaitUntil(time.Second, self.T(), func() bool {
-		h, _ := dispatcher.GetHunt(hunt_obj.HuntId)
+		h, _ := dispatcher.GetHunt(self.Ctx, hunt_obj.HuntId)
 		return h.Stats.TotalClientsScheduled == 1
 	})
 
 	// However client has not completed yet.
-	h, _ := dispatcher.GetHunt(hunt_obj.HuntId)
+	h, _ := dispatcher.GetHunt(self.Ctx, hunt_obj.HuntId)
 	assert.Equal(self.T(), h.Stats.TotalClientsWithResults, uint64(0))
 
 	// For client to have completed we send a
@@ -665,22 +738,24 @@ func (self *HuntTestSuite) TestHuntManagerMutations() {
 		State:                flows_proto.ArtifactCollectorContext_FINISHED,
 	}
 
-	assert.NoError(self.T(), journal.PushRowsToArtifact(self.ConfigObj,
+	flow_id := hunt_obj.StartRequest.FlowId
+	assert.NoError(self.T(), journal.PushRowsToArtifact(
+		self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("Timestamp", time.Now().UTC().Unix()).
 			Set("Flow", flow_obj).
-			Set("FlowId", self.flow_id).
+			Set("FlowId", flow_id).
 			Set("ClientId", self.client_id),
 		}, "System.Flow.Completion", self.client_id, ""))
 
 	vtesting.WaitUntil(time.Second, self.T(), func() bool {
-		h, _ := dispatcher.GetHunt(hunt_obj.HuntId)
+		h, _ := dispatcher.GetHunt(self.Ctx, hunt_obj.HuntId)
 		return h.Stats.TotalClientsWithResults == 1
 	})
 
 	// To stop the hunt, we send a hunt mutation that sets the
 	// state of the hunt to stopped.
-	assert.NoError(self.T(), journal.PushRowsToArtifact(self.ConfigObj,
+	assert.NoError(self.T(), journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("HuntId", hunt_obj.HuntId).
 			Set("mutation", &api_proto.HuntMutation{
@@ -690,11 +765,11 @@ func (self *HuntTestSuite) TestHuntManagerMutations() {
 		}, "Server.Internal.HuntModification", "", ""))
 
 	vtesting.WaitUntil(time.Second, self.T(), func() bool {
-		h, _ := dispatcher.GetHunt(hunt_obj.HuntId)
+		h, _ := dispatcher.GetHunt(self.Ctx, hunt_obj.HuntId)
 		return h.State == api_proto.Hunt_STOPPED
 	})
 
-	h, _ = dispatcher.GetHunt(hunt_obj.HuntId)
+	h, _ = dispatcher.GetHunt(self.Ctx, hunt_obj.HuntId)
 	assert.Equal(self.T(), h.State, api_proto.Hunt_STOPPED)
 	assert.True(self.T(), h.Stats.Stopped)
 }
@@ -718,14 +793,14 @@ func (self *HuntTestSuite) TestHuntManagerErrors() {
 
 	dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(self.T(), err)
-	dispatcher.Refresh(self.ConfigObj)
+	dispatcher.Refresh(self.Ctx, self.ConfigObj)
 
 	// Schedule a new hunt on this client if we receive a
 	// participation event.
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	assert.NoError(self.T(), journal.PushRowsToArtifact(self.ConfigObj,
+	assert.NoError(self.T(), journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("HuntId", hunt_obj.HuntId).
 			Set("ClientId", self.client_id),
@@ -733,7 +808,7 @@ func (self *HuntTestSuite) TestHuntManagerErrors() {
 
 	// This will schedule a hunt on this client.
 	vtesting.WaitUntil(time.Second, self.T(), func() bool {
-		h, _ := dispatcher.GetHunt(hunt_obj.HuntId)
+		h, _ := dispatcher.GetHunt(self.Ctx, hunt_obj.HuntId)
 		return h.Stats.TotalClientsScheduled == 1
 	})
 
@@ -744,18 +819,19 @@ func (self *HuntTestSuite) TestHuntManagerErrors() {
 		State:                flows_proto.ArtifactCollectorContext_ERROR,
 	}
 
-	assert.NoError(self.T(), journal.PushRowsToArtifact(self.ConfigObj,
+	flow_id := hunt_obj.StartRequest.FlowId
+	assert.NoError(self.T(), journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("Timestamp", time.Now().UTC().Unix()).
 			Set("Flow", flow_obj).
-			Set("FlowId", self.flow_id).
+			Set("FlowId", flow_id).
 			Set("ClientId", self.client_id),
 		}, "System.Flow.Completion", self.client_id, ""))
 
 	// Both TotalClientsWithResults and TotalClientsWithErrors should
 	// increase.
 	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
-		h, _ := dispatcher.GetHunt(hunt_obj.HuntId)
+		h, _ := dispatcher.GetHunt(self.Ctx, hunt_obj.HuntId)
 		return h.Stats.TotalClientsWithResults == 1 &&
 			h.Stats.TotalClientsWithErrors == 1
 	})
@@ -771,28 +847,4 @@ func TestHuntTestSuite(t *testing.T) {
 			Artifacts: []string{"Generic.Client.Info"},
 		},
 	})
-}
-
-func LoadCollectionContext(
-	ConfigObj *config_proto.Config,
-	client_id, flow_id string) (*flows_proto.ArtifactCollectorContext, error) {
-
-	flow_path_manager := paths.NewFlowPathManager(client_id, flow_id)
-	collection_context := &flows_proto.ArtifactCollectorContext{}
-	db, err := datastore.GetDB(ConfigObj)
-	if err != nil {
-		return nil, err
-	}
-
-	err = db.GetSubject(ConfigObj, flow_path_manager.Path(),
-		collection_context)
-	if err != nil {
-		return nil, err
-	}
-
-	if collection_context.SessionId != flow_id {
-		return nil, errors.New("Not found")
-	}
-
-	return collection_context, nil
 }

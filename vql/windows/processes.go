@@ -1,8 +1,9 @@
+//go:build windows
 // +build windows
 
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -31,6 +32,8 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"golang.org/x/sys/windows"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -118,7 +121,7 @@ func (self *Win32_Process) getTimes(handle syscall.Handle) {
 }
 
 func (self *Win32_Process) getCmdLine(handle syscall.Handle) {
-	buffer := make([]byte, 1024*2)
+	buffer := utils.AllocateBuff(1024 * 2)
 	length := uint32(0)
 	status := NtQueryInformationProcess(handle, ProcessCommandLineInformation,
 		(*byte)(unsafe.Pointer(&buffer[0])), uint32(len(buffer)), &length)
@@ -191,10 +194,11 @@ func (self PslistPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "pslist", args)()
 
 		err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
 		if err != nil {
-			scope.Log("pslist: %s", err)
+			scope.Log("pslist: %v", err)
 			return
 		}
 
@@ -205,7 +209,7 @@ func (self PslistPlugin) Call(
 
 		err = arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 		if err != nil {
-			scope.Log("pslist: %s", err.Error())
+			scope.Log("pslist: %v", err)
 			return
 		}
 
@@ -273,9 +277,10 @@ func (self PslistPlugin) Call(
 
 func (self PslistPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "pslist",
-		Doc:     "Enumerate running processes.",
-		ArgType: type_map.AddType(scope, &PslistArgs{}),
+		Name:     "pslist",
+		Doc:      "Enumerate running processes.",
+		ArgType:  type_map.AddType(scope, &PslistArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 

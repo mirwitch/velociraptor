@@ -270,13 +270,16 @@ func interfaceAsStarlarkValue(ctx context.Context,
 		}
 
 		result := starlark.NewDict(new_dict.Len())
-		for key, value := range *new_dict.ToDict() {
+		for key, value := range new_dict.ToMap() {
 			mapValueStarlarked, err := interfaceAsStarlarkValue(ctx, scope, value)
 			if err != nil {
 				return nil, err
 			}
 
-			result.SetKey(starlark.String(key), mapValueStarlarked)
+			err = result.SetKey(starlark.String(key), mapValueStarlarked)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		//dict := starlarkstruct.FromStringDict(starlarkstruct.Default, result)
@@ -300,7 +303,7 @@ func reduceRecurse(obj vfilter.Any, ctx context.Context, scope vfilter.Scope) (v
 	case *ordereddict.Dict:
 		{
 			sub_dict := ordereddict.NewDict()
-			for key, value := range *t.ToDict() {
+			for key, value := range t.ToMap() {
 				results, err := reduceRecurse(value, ctx, scope)
 				if err != nil {
 					return nil, err
@@ -423,6 +426,8 @@ func (self StarlarkCompileFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
+	defer vql_subsystem.RegisterMonitor(ctx, "starl", args)()
+
 	arg := StarlarkCompileArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, &arg)
 	if err != nil {
@@ -541,6 +546,7 @@ func init() {
 	resolve.AllowRecursion = true
 	resolve.AllowLambda = true
 	resolve.AllowNestedDef = true
+	resolve.AllowGlobalReassign = true
 	vql_subsystem.RegisterFunction(&StarlarkCompileFunction{})
 	vql_subsystem.RegisterProtocol(&StarlModuleAssociative{})
 }

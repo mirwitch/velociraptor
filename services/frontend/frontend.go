@@ -42,6 +42,7 @@ func PushMetrics(ctx context.Context, wg *sync.WaitGroup,
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+
 		metrics := &FrontendMetrics{
 			NodeName: node_name,
 		}
@@ -53,7 +54,7 @@ func PushMetrics(ctx context.Context, wg *sync.WaitGroup,
 			case <-ctx.Done():
 				return
 
-			case <-time.After(10 * time.Second):
+			case <-time.After(utils.Jitter(10 * time.Second)):
 			}
 
 			// Journal may not be ready yet so it is not
@@ -68,7 +69,7 @@ func PushMetrics(ctx context.Context, wg *sync.WaitGroup,
 				rows[0] = ordereddict.NewDict().
 					Set("Node", node_name).
 					Set("Metrics", metrics.ToDict())
-				err = journal.PushRowsToArtifact(config_obj,
+				_ = journal.PushRowsToArtifact(ctx, config_obj,
 					rows, "Server.Internal.FrontendMetrics",
 					"server", "")
 			}
@@ -174,6 +175,40 @@ type MasterFrontendManager struct {
 
 	mu    sync.Mutex
 	stats map[string]*FrontendMetrics
+
+	messages []*api_proto.GlobalUserMessage
+}
+
+func (self *MasterFrontendManager) SetGlobalMessage(
+	message *api_proto.GlobalUserMessage) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	found := false
+	for idx, item := range self.messages {
+		if item.Key == message.Key {
+			self.messages[idx] = message
+			found = true
+		}
+	}
+
+	if !found {
+		self.messages = append(self.messages, message)
+	}
+}
+
+func (self *MasterFrontendManager) GetGlobalMessages() []*api_proto.GlobalUserMessage {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	res := []*api_proto.GlobalUserMessage{}
+	for _, item := range self.messages {
+		if item.Level != "" {
+			res = append(res, item)
+		}
+	}
+
+	return res
 }
 
 func (self *MasterFrontendManager) processMetrics(ctx context.Context,
@@ -272,7 +307,7 @@ func (self *MasterFrontendManager) UpdateStats(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(10 * time.Second):
+		case <-time.After(utils.Jitter(10 * time.Second)):
 		}
 
 		all_stats, err := self.prepareOrgStats()
@@ -300,7 +335,7 @@ func (self *MasterFrontendManager) UpdateStats(ctx context.Context) {
 				continue
 			}
 
-			_ = journal.PushRowsToArtifact(org_config_obj,
+			_ = journal.PushRowsToArtifact(ctx, org_config_obj,
 				[]*ordereddict.Dict{v},
 				"Server.Monitor.Health/Prometheus", "server", "")
 		}
@@ -333,7 +368,7 @@ func (self *MasterFrontendManager) Start(ctx context.Context, wg *sync.WaitGroup
 		return err
 	}
 
-	err = datastore.SetGlobalDatastore(implementation, config_obj)
+	err = datastore.SetGlobalDatastore(ctx, implementation, config_obj)
 	if err != nil {
 		return err
 	}
@@ -345,19 +380,34 @@ func (self *MasterFrontendManager) Start(ctx context.Context, wg *sync.WaitGroup
 	}
 
 	go self.UpdateStats(ctx)
-	go utils.Retry(ctx, func() error {
-		return journal.WatchQueueWithCB(ctx, config_obj, wg,
-			"Server.Internal.FrontendMetrics",
-			"FrontendService",
-			self.processMetrics)
-	}, 10, time.Second)
-
+	go func() {
+		_ = utils.Retry(ctx, func() error {
+			return journal.WatchQueueWithCB(ctx, config_obj, wg,
+				"Server.Internal.FrontendMetrics",
+				"FrontendService",
+				self.processMetrics)
+		}, 1000, time.Second)
+	}()
 	return err
 }
 
 type MinionFrontendManager struct {
 	config_obj *config_proto.Config
 	name       string
+}
+
+func NewMinionFrontendManager(
+	config_obj *config_proto.Config,
+	name string) *MinionFrontendManager {
+	return &MinionFrontendManager{config_obj: config_obj, name: name}
+}
+
+func (self MinionFrontendManager) SetGlobalMessage(
+	message *api_proto.GlobalUserMessage) {
+}
+
+func (self MinionFrontendManager) GetGlobalMessages() []*api_proto.GlobalUserMessage {
+	return nil
 }
 
 func (self MinionFrontendManager) GetMinionCount() int {
@@ -368,10 +418,19 @@ func (self MinionFrontendManager) IsMaster() bool {
 	return false
 }
 
+func (self MinionFrontendManager) GUIBasePath(config_obj *config_proto.Config) string {
+	if config_obj.GUI != nil {
+		return config_obj.GUI.BasePath
+	}
+	return ""
+}
+
 // The minion frontend replicates to the master node.
 func (self MinionFrontendManager) GetMasterAPIClient(ctx context.Context) (
 	api_proto.APIClient, func() error, error) {
-	client, closer, err := grpc_client.Factory.GetAPIClient(ctx, self.config_obj)
+	// Connect as the SuperUser
+	client, closer, err := grpc_client.Factory.GetAPIClient(
+		ctx, grpc_client.SuperUser, self.config_obj)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -409,7 +468,7 @@ func (self *MinionFrontendManager) Start(ctx context.Context, wg *sync.WaitGroup
 		return err
 	}
 
-	err = datastore.SetGlobalDatastore(implementation, config_obj)
+	err = datastore.SetGlobalDatastore(ctx, implementation, config_obj)
 	if err != nil {
 		return err
 	}
@@ -428,7 +487,7 @@ func NewFrontendService(ctx context.Context, wg *sync.WaitGroup,
 	}
 
 	// Sub orgs just use the same frontend manager
-	if config_obj.OrgId != "" {
+	if !utils.IsRootOrg(config_obj.OrgId) {
 		org_manager, err := services.GetOrgManager()
 		if err != nil {
 			return nil, err

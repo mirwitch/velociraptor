@@ -7,6 +7,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 const (
@@ -15,12 +16,33 @@ const (
 )
 
 type MultiGetSubjectRequest struct {
-	Path    api.DSPathSpec
-	Message proto.Message
-	Err     error
+	mu      sync.Mutex
+	message proto.Message
+
+	Path api.DSPathSpec
+	Err  error
 
 	// Free form data that goes with the request.
 	Data interface{}
+}
+
+// Return a copy so there is no race
+func (self *MultiGetSubjectRequest) Message() proto.Message {
+	return proto.Clone(self.message)
+}
+
+func (self *MultiGetSubjectRequest) Error() error {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	return self.Err
+}
+
+func NewMultiGetSubjectRequest(message proto.Message, path api.DSPathSpec, data interface{}) *MultiGetSubjectRequest {
+	return &MultiGetSubjectRequest{
+		message: proto.Clone(message),
+		Path:    path,
+		Data:    data,
+	}
 }
 
 // A helper function to read multipe subjects at the same time.
@@ -28,25 +50,23 @@ func MultiGetSubject(
 	config_obj *config_proto.Config,
 	requests []*MultiGetSubjectRequest) error {
 
-	var mu sync.Mutex
-
 	db, err := GetDB(config_obj)
 	if err != nil {
 		return err
 	}
 
 	var wg sync.WaitGroup
-	mu.Lock()
 	for _, request := range requests {
 		wg.Add(1)
+
 		go func(request *MultiGetSubjectRequest) {
-			mu.Lock()
-			defer mu.Unlock()
-			request.Err = db.GetSubject(config_obj, request.Path, request.Message)
-			wg.Done()
+			defer wg.Done()
+
+			request.mu.Lock()
+			defer request.mu.Unlock()
+			request.Err = db.GetSubject(config_obj, request.Path, request.message)
 		}(request)
 	}
-	mu.Unlock()
 
 	wg.Wait()
 	return nil
@@ -57,7 +77,7 @@ func Walk(config_obj *config_proto.Config,
 	with_directories bool,
 	walkFn WalkFunc) error {
 
-	TraceDirectory(config_obj, "Walk", root)
+	TraceDirectory(datastore, config_obj, "Walk", root)
 	all_children, err := datastore.ListChildren(config_obj, root)
 	if err != nil {
 		return err
@@ -103,6 +123,18 @@ func Walk(config_obj *config_proto.Config,
 	return nil
 }
 
+func RecursiveDelete(
+	config_obj *config_proto.Config,
+	datastore DataStore, root api.DSPathSpec) error {
+	return Walk(config_obj, datastore, root, false,
+		func(urn api.DSPathSpec) error {
+			// Ignore errors so we can keep going as much as possible.
+			_ = datastore.DeleteSubjectWithCompletion(
+				config_obj, urn, utils.BackgroundWriter)
+			return nil
+		})
+}
+
 func GetImplementationName(
 	config_obj *config_proto.Config) (string, error) {
 	if config_obj.Datastore == nil {
@@ -123,4 +155,29 @@ func GetImplementationName(
 	}
 
 	return config_obj.Datastore.Implementation, nil
+}
+
+type Flusher interface {
+	Flush()
+}
+
+func FlushDatastore(config_obj *config_proto.Config) error {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	db, err := GetDB(config_obj)
+	if err != nil {
+		return err
+	}
+
+	flusher, ok := db.(Flusher)
+	if ok {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			flusher.Flush()
+		}()
+	}
+
+	return nil
 }

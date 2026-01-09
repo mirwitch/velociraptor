@@ -1,8 +1,9 @@
+//go:build darwin
 // +build darwin
 
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -44,6 +45,8 @@ var (
 )
 
 func doRemove() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().WithRequiredClient().
 		WithWriteback().LoadAndValidate()
 	if err != nil {
@@ -65,6 +68,8 @@ func doRemove() error {
 }
 
 func doInstall() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().WithRequiredClient().
 		WithWriteback().LoadAndValidate()
 	if err != nil {
@@ -78,7 +83,7 @@ func doInstall() error {
 
 	service_name := config_obj.Client.DarwinInstaller.ServiceName
 	logger := logging.GetLogger(config_obj, &logging.ClientComponent)
-	target_path := os.ExpandEnv(config_obj.Client.DarwinInstaller.InstallPath)
+	target_path := utils.ExpandEnv(config_obj.Client.DarwinInstaller.InstallPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -89,7 +94,7 @@ func doInstall() error {
 		dirname := filepath.Dir(target_path)
 		logger.Info("Attempting to create intermediate directory %s.",
 			dirname)
-		err = os.MkdirAll(dirname, 0700)
+		err = os.MkdirAll(dirname, 0755)
 		if err != nil {
 			return fmt.Errorf("Create intermediate directories: %w", err)
 		}

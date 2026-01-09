@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/result_sets"
@@ -41,20 +44,28 @@ import (
 // quick.
 
 type TimedResultSetReader struct {
-	files              []*api.ResultSetFileProperties
-	current_files_idx  int
-	current_reader     *timelines.TimelineReader
-	start              time.Time
-	end                time.Time
-	file_store_factory api.FileStore
+	mu sync.Mutex
+
+	files             []*api.ResultSetFileProperties
+	current_files_idx int
+	current_reader    *timelines.TimelineReader
+	start             time.Time
+	end               time.Time
+	config_obj        *config_proto.Config
 }
 
 func (self *TimedResultSetReader) GetAvailableFiles(
 	ctx context.Context) []*api.ResultSetFileProperties {
-	return self.files
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return append([]*api.ResultSetFileProperties{}, self.files...)
 }
 
 func (self *TimedResultSetReader) Debug() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
 	fmt.Printf("Current idx %v\n", self.current_files_idx)
 	for _, file := range self.files {
 		fmt.Printf("%v %v-%v\n", file.Path, file.StartTime, file.EndTime)
@@ -62,7 +73,10 @@ func (self *TimedResultSetReader) Debug() {
 }
 
 func (self *TimedResultSetReader) SeekToTime(offset time.Time) error {
-	self.Close()
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self._Close()
 
 	self.start = offset
 	for idx, file := range self.files {
@@ -77,15 +91,16 @@ func (self *TimedResultSetReader) SeekToTime(offset time.Time) error {
 			self.current_files_idx = idx
 
 			reader, err := self.getReader()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 
 			if err != nil {
 				return err
 			}
+
 			err = reader.SeekToTime(offset)
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 
@@ -103,10 +118,24 @@ func (self *TimedResultSetReader) SetMaxTime(end time.Time) {
 }
 
 func (self *TimedResultSetReader) Close() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self._Close()
+}
+
+func (self *TimedResultSetReader) _Close() {
 	if self.current_reader != nil {
 		self.current_reader.Close()
 		self.current_reader = nil
 	}
+}
+
+func (self *TimedResultSetReader) GetReader() (*timelines.TimelineReader, error) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.getReader()
 }
 
 func (self *TimedResultSetReader) getReader() (*timelines.TimelineReader, error) {
@@ -122,10 +151,12 @@ func (self *TimedResultSetReader) getReader() (*timelines.TimelineReader, error)
 			return nil, io.EOF
 		}
 
+		reader_factory := timelines.TimelineReader{}
+
 		path_manager := paths.NewTimelinePathManager(
 			"", current_file.Path)
-		reader, err := timelines.NewTimelineReader(
-			self.file_store_factory, path_manager)
+		reader, err := reader_factory.New(
+			self.config_obj, timelines.UnitTransformer, path_manager)
 		if err != nil {
 			// Try to upgrade the index from older
 			// versions.
@@ -146,8 +177,9 @@ func (self *TimedResultSetReader) maybeUpgradeIndex(
 	path_manager paths.TimelinePathManagerInterface) (
 	*timelines.TimelineReader, error) {
 
+	file_store_factory := file_store.GetFileStore(self.config_obj)
 	reader, err := result_sets.NewResultSetReader(
-		self.file_store_factory, path_manager.Path())
+		file_store_factory, path_manager.Path())
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +195,7 @@ func (self *TimedResultSetReader) maybeUpgradeIndex(
 	// Write the tmp file synchronously and then read it again with
 	// the benefit of the index.
 	tmp_writer, err := timelines.NewTimelineWriter(
-		self.file_store_factory, tmp_path_manager,
+		self.config_obj, tmp_path_manager,
 		utils.SyncCompleter, result_sets.TruncateMode)
 	if err != nil {
 		return nil, err
@@ -172,7 +204,11 @@ func (self *TimedResultSetReader) maybeUpgradeIndex(
 	for row := range reader.Rows(ctx) {
 		ts, pres := row.GetInt64("_ts")
 		if pres {
-			tmp_writer.Write(time.Unix(ts, 0), row)
+			err := tmp_writer.Write(time.Unix(ts, 0), row)
+			if err != nil {
+				tmp_writer.Close()
+				return nil, err
+			}
 		}
 	}
 
@@ -180,12 +216,16 @@ func (self *TimedResultSetReader) maybeUpgradeIndex(
 
 	// Update the json file itself, and leave the new index
 	// around.
-	self.file_store_factory.Move(tmp_path_manager.Path(),
-		path_manager.Path())
+	err = file_store_factory.Move(tmp_path_manager.Path(), path_manager.Path())
+	if err != nil {
+		return nil, err
+	}
+
+	reader_factory := timelines.TimelineReader{}
 
 	// Try to open the file again.
-	return timelines.NewTimelineReader(
-		self.file_store_factory, path_manager)
+	return reader_factory.New(
+		self.config_obj, timelines.UnitTransformer, path_manager)
 }
 
 func (self *TimedResultSetReader) Rows(
@@ -196,7 +236,7 @@ func (self *TimedResultSetReader) Rows(
 		defer close(output_chan)
 
 		for {
-			reader, err := self.getReader()
+			reader, err := self.GetReader()
 			if err != nil {
 				return
 			}
@@ -217,9 +257,12 @@ func (self *TimedResultSetReader) Rows(
 			}
 
 			// When the reader is exhausted reset it so
-			// next getReader() can pick the next reader.
+			// next GetReader() can pick the next reader.
 			self.Close()
+
+			self.mu.Lock()
 			self.current_files_idx++
+			self.mu.Unlock()
 		}
 	}()
 

@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package http_comms
 
@@ -32,28 +32,61 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	api_utils "www.velocidex.com/golang/velociraptor/api/utils"
 	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	crypto_test "www.velocidex.com/golang/velociraptor/crypto/testing"
 	"www.velocidex.com/golang/velociraptor/executor"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/rand"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 )
 
 var (
-	counter int
+	counter utils.Counter
 )
 
-type FakeClock struct {
-	utils.MockClock
+type EventRecorder struct {
+	mu     sync.Mutex
+	events []string
+}
 
-	events *[]string
+func (self *EventRecorder) Add(msg string) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.events = append(self.events, msg)
+}
+
+func (self *EventRecorder) Len() int {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return len(self.events)
+}
+
+func (self *EventRecorder) Get() []string {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return append([]string{}, self.events...)
+}
+
+type FakeClock struct {
+	*utils.MockClock
+
+	mu     sync.Mutex
+	events *EventRecorder
 }
 
 func (self *FakeClock) After(d time.Duration) <-chan time.Time {
-	*self.events = append(*self.events, fmt.Sprintf("%d sleep: %v\n", counter, d))
-	counter++
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.events.Add(fmt.Sprintf("%d sleep: %v\n", counter.Get(), d))
+	counter.Inc()
 	return time.After(0)
 }
 
@@ -68,7 +101,9 @@ type Response struct {
 }
 
 type FakeServer struct {
-	events []string
+	name string
+
+	events *EventRecorder
 
 	resp_idx  int
 	responses []*Response
@@ -82,22 +117,25 @@ func (self *FakeServer) Close() {
 }
 
 func (self *FakeServer) Log(fmtstring string, args ...interface{}) {
-	msg := fmt.Sprintf("%d ", counter)
-	counter++
+	msg := fmt.Sprintf("%d ", counter.Get())
+	counter.Inc()
 	msg += fmt.Sprintf(fmtstring, args...)
-	self.events = append(self.events, msg)
+	self.events.Add(msg)
 }
 
-func NewFakeServer() *FakeServer {
-	self := &FakeServer{}
-	self.server = httptest.NewServer(http.HandlerFunc(
+func NewFakeServer(name string) *FakeServer {
+	self := &FakeServer{
+		name:   name,
+		events: &EventRecorder{},
+	}
+	self.server = httptest.NewServer(api_utils.HandlerFunc(nil,
 		func(rw http.ResponseWriter, req *http.Request) {
 			self.Log("request: %v", req.URL.String())
 
 			// Break out of a runaway condition.
-			if len(self.events) > 100 {
+			if self.events.Len() > 100 {
 				fmt.Printf("Something went horribly wrong")
-				utils.Debug(self.events)
+				utils.Debug(self.events.Get())
 				os.Exit(-1)
 			}
 
@@ -137,12 +175,16 @@ type CommsTestSuite struct {
 	config_obj           *config_proto.Config
 
 	empty_response []byte
+	closer         func()
+
+	writeback_path string
 }
 
 func (self *CommsTestSuite) SetupTest() {
-	counter = 0
-	self.frontend1 = NewFakeServer()
-	self.frontend2 = NewFakeServer()
+	counter = utils.Counter{}
+
+	self.frontend1 = NewFakeServer("frontend1")
+	self.frontend2 = NewFakeServer("frontend2")
 
 	config_obj, err := new(config.Loader).WithFileLoader(
 		"../http_comms/test_data/server.config.yaml").
@@ -161,14 +203,24 @@ func (self *CommsTestSuite) SetupTest() {
 		"C.1234")
 
 	// Disable randomness for the test.
-	mu.Lock()
-	Rand = func(int) int { return 0 }
-	mu.Unlock()
+	self.closer = rand.DisableRand()
+
+	// Initialize the writeback
+	self.writeback_path = getTempFile(self.T())
+	self.config_obj.Client.WritebackLinux = self.writeback_path
+	self.config_obj.Client.WritebackWindows = self.writeback_path
+	self.config_obj.Client.WritebackDarwin = self.writeback_path
+
+	writeback_service := writeback.GetWritebackService()
+	writeback_service.LoadWriteback(self.config_obj)
 }
 
 func (self *CommsTestSuite) TearDownTest() {
 	self.frontend1.Close()
 	self.frontend2.Close()
+	self.closer()
+
+	os.Remove(self.writeback_path)
 }
 
 // Check that unexpected closing of the executor calls the abort
@@ -186,10 +238,7 @@ func (self *CommsTestSuite) TestAbort() {
 	urls := []string{self.frontend1.URL}
 
 	// Not a real executor but we can emulate closing channels.
-	exec := &executor.ClientExecutor{
-		Outbound: make(chan *crypto_proto.VeloMessage),
-		Inbound:  make(chan *crypto_proto.VeloMessage),
-	}
+	exec := executor.NewClientExecutorForTests(self.config_obj)
 
 	wg := &sync.WaitGroup{}
 	defer wg.Wait()
@@ -204,7 +253,11 @@ func (self *CommsTestSuite) TestAbort() {
 
 	// Start a communicator feeding data to the executor.
 	wg.Add(1)
-	go communicator.Run(ctx, wg)
+	go func() {
+		defer wg.Done()
+
+		communicator.Run(ctx, wg)
+	}()
 
 	// Emulate the case of the executor exiting early - this
 	// should never happen in practice but might happen due to a
@@ -227,16 +280,21 @@ func (self *CommsTestSuite) TestAbort() {
 
 func (self *CommsTestSuite) TestEnrollment() {
 	urls := []string{self.frontend1.URL}
+	mock_clock := utils.NewMockClock(time.Unix(100, 0))
+	cancel := utils.MockTime(mock_clock)
+	defer cancel()
 
-	clock := &FakeClock{events: &self.frontend1.events}
-	clock.MockNow = time.Now()
+	clock := &FakeClock{
+		MockClock: mock_clock,
+		events:    self.frontend1.events,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	crypto_manager := &crypto_test.NullCryptoManager{}
 	communicator, err := NewHTTPCommunicator(ctx, self.config_obj, crypto_manager,
-		&executor.TestExecutor{}, urls, nil, clock)
+		executor.NewTestExecutor(), urls, nil, clock)
 	assert.NoError(self.T(), err)
 
 	self.frontend1.responses = []*Response{
@@ -250,7 +308,7 @@ func (self *CommsTestSuite) TestEnrollment() {
 		context.Background(), nil, !URGENT,
 		crypto_proto.PackedMessageList_ZCOMPRESSION)
 
-	checkResponses(self.T(), self.frontend1.events, []string{
+	checkResponses(self.T(), self.frontend1.events.Get(), []string{
 		// First request looks for server.pem but fails on frontend1
 		"0 request: /server.pem",
 		"1 response: -----BEG",
@@ -264,16 +322,21 @@ func (self *CommsTestSuite) TestEnrollment() {
 
 func (self *CommsTestSuite) TestServerError() {
 	urls := []string{self.frontend1.URL}
+	mock_clock := utils.NewMockClock(time.Unix(100, 0))
+	cancel := utils.MockTime(mock_clock)
+	defer cancel()
 
-	clock := &FakeClock{events: &self.frontend1.events}
-	clock.MockNow = time.Now()
+	clock := &FakeClock{
+		MockClock: mock_clock,
+		events:    self.frontend1.events,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	crypto_manager := &crypto_test.NullCryptoManager{}
 	communicator, err := NewHTTPCommunicator(ctx, self.config_obj, crypto_manager,
-		&executor.TestExecutor{}, urls, nil, clock)
+		executor.NewTestExecutor(), urls, nil, clock)
 	assert.NoError(self.T(), err)
 
 	self.frontend1.responses = []*Response{
@@ -287,7 +350,7 @@ func (self *CommsTestSuite) TestServerError() {
 		context.Background(), nil, !URGENT,
 		crypto_proto.PackedMessageList_ZCOMPRESSION)
 
-	checkResponses(self.T(), self.frontend1.events, []string{
+	checkResponses(self.T(), self.frontend1.events.Get(), []string{
 		// First request looks for server.pem
 		"request: /server.pem",
 		"response: -----BEGIN CERTIFICATE-----",
@@ -297,8 +360,8 @@ func (self *CommsTestSuite) TestServerError() {
 		"response:  500",
 
 		// Client will sleep to back off and try to rekey
-		"sleep: 10",
-		"sleep: 10",
+		"sleep: 10m0s\n",
+		"sleep: 10m0s\n",
 		"request: /server.pem",
 		"response: -----BEGIN CERTIFICATE-----",
 
@@ -312,16 +375,22 @@ func (self *CommsTestSuite) TestServerError() {
 // 500, Frontend2 is down too.
 func (self *CommsTestSuite) TestMultiFrontends() {
 	urls := []string{self.frontend1.URL, self.frontend2.URL}
+	mock_clock := utils.NewMockClock(time.Unix(100, 0))
+	cancel := utils.MockTime(mock_clock)
+	defer cancel()
 
-	clock := &FakeClock{events: &self.frontend1.events}
-	clock.MockNow = time.Now()
+	clock := &FakeClock{
+		MockClock: mock_clock,
+		events:    self.frontend1.events,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	crypto_manager := &crypto_test.NullCryptoManager{}
-	communicator, err := NewHTTPCommunicator(ctx, self.config_obj, crypto_manager,
-		&executor.TestExecutor{}, urls, nil, clock)
+	communicator, err := NewHTTPCommunicator(
+		ctx, self.config_obj, crypto_manager,
+		executor.NewTestExecutor(), urls, nil, clock)
 	assert.NoError(self.T(), err)
 
 	// Frontend1 will return 500 all the time.
@@ -338,24 +407,26 @@ func (self *CommsTestSuite) TestMultiFrontends() {
 		{data: string(self.empty_response), status: 200},
 	}
 
+	assert.Equal(self.T(), urls[0], self.frontend1.URL)
+
 	communicator.receiver.sendMessageList(context.Background(), nil,
 		!URGENT, crypto_proto.PackedMessageList_ZCOMPRESSION)
 
 	// Message ordering is important
-	checkResponses(self.T(), self.frontend1.events, []string{
+	checkResponses(self.T(), self.frontend1.events.Get(), []string{
 		// First request looks for server.pem but fails on frontend1
 		"0 request: /server.pem",
 		"1 response:  500",
 
 		// After trying frontend2 immediately, we back off all frontends
-		"4 sleep: 10",
+		"4 sleep: 10m0s\n",
 
 		// We try frontend1 again but again it fails
 		"5 request: /server.pem",
 		"6 response:  500",
 	})
 
-	checkResponses(self.T(), self.frontend2.events, []string{
+	checkResponses(self.T(), self.frontend2.events.Get(), []string{
 		// First request on FE 2 fails.
 		"2 request: /server.pem",
 		"3 response:  500",
@@ -373,16 +444,21 @@ func (self *CommsTestSuite) TestMultiFrontends() {
 // Client configured with two frontends. Both keep failing.
 func (self *CommsTestSuite) TestMultiFrontendsAllIsBorked() {
 	urls := []string{self.frontend1.URL, self.frontend2.URL}
+	mock_clock := utils.NewMockClock(time.Unix(100, 0))
+	cancel := utils.MockTime(mock_clock)
+	defer cancel()
 
-	clock := &FakeClock{events: &self.frontend1.events}
-	clock.MockNow = time.Now()
+	clock := &FakeClock{
+		MockClock: mock_clock,
+		events:    self.frontend1.events,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	crypto_manager := &crypto_test.NullCryptoManager{}
 	communicator, err := NewHTTPCommunicator(ctx, self.config_obj, crypto_manager,
-		&executor.TestExecutor{}, urls, nil, clock)
+		executor.NewTestExecutor(), urls, nil, clock)
 	assert.NoError(self.T(), err)
 
 	// Frontend1 will return 500 all the time.
@@ -403,28 +479,28 @@ func (self *CommsTestSuite) TestMultiFrontendsAllIsBorked() {
 	communicator.receiver.sendMessageList(context.Background(), nil,
 		!URGENT, crypto_proto.PackedMessageList_ZCOMPRESSION)
 
-	//utils.Debug(self.frontend1.events)
-	//utils.Debug(self.frontend2.events)
+	//utils.Debug(self.frontend1.events.Get())
+	//utils.Debug(self.frontend2.events.Get())
 
-	checkResponses(self.T(), self.frontend1.events, []string{
+	checkResponses(self.T(), self.frontend1.events.Get(), []string{
 		// First request looks for server.pem but fails on frontend1
 		"0 request: /server.pem",
 		"1 response:  500",
 
 		// Must sleep now as both FE are down.
-		"4 sleep: 10",
+		"4 sleep: 10m0s\n",
 
 		// Try FE1 again
 		"5 request: /server.pem",
 		"6 response:  500",
 
 		// Must sleep again
-		"9 sleep: 10",
+		"9 sleep: 10m0s\n",
 		"10 request: /server.pem",
 		"11 response:  500",
 	})
 
-	checkResponses(self.T(), self.frontend2.events, []string{
+	checkResponses(self.T(), self.frontend2.events.Get(), []string{
 		// Immediately switch to FE2 but it is down as well.
 		"2 request: /server.pem",
 		"3 response:  500",
@@ -447,16 +523,21 @@ func (self *CommsTestSuite) TestMultiFrontendsAllIsBorked() {
 // switching to FE2
 func (self *CommsTestSuite) TestMultiFrontendsIntermittantFailure() {
 	urls := []string{self.frontend1.URL, self.frontend2.URL}
+	mock_clock := utils.NewMockClock(time.Unix(100, 0))
+	cancel := utils.MockTime(mock_clock)
+	defer cancel()
 
-	clock := &FakeClock{events: &self.frontend1.events}
-	clock.MockNow = time.Now()
+	clock := &FakeClock{
+		MockClock: mock_clock,
+		events:    self.frontend1.events,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	crypto_manager := &crypto_test.NullCryptoManager{}
 	communicator, err := NewHTTPCommunicator(ctx, self.config_obj, crypto_manager,
-		&executor.TestExecutor{}, urls, nil, clock)
+		executor.NewTestExecutor(), urls, nil, clock)
 	assert.NoError(self.T(), err)
 
 	// FE1 is not completely off just loaded - so initial
@@ -478,11 +559,11 @@ func (self *CommsTestSuite) TestMultiFrontendsIntermittantFailure() {
 	communicator.receiver.sendMessageList(context.Background(), nil,
 		!URGENT, crypto_proto.PackedMessageList_ZCOMPRESSION)
 
-	//utils.Debug(self.frontend1.events)
-	//utils.Debug(self.frontend2.events)
+	//utils.Debug(self.frontend1.events.Get())
+	//utils.Debug(self.frontend2.events.Get())
 
 	// Message ordering is important
-	checkResponses(self.T(), self.frontend1.events, []string{
+	checkResponses(self.T(), self.frontend1.events.Get(), []string{
 		// First request looks for server.pem is ok.
 		"0 request: /server.pem",
 		"1 response: -----BEGIN CERTIFICATE-",
@@ -490,10 +571,10 @@ func (self *CommsTestSuite) TestMultiFrontendsIntermittantFailure() {
 		// Now client tries to connect for real.
 		"2 request: /reader",
 		"3 response:  500",
-		"4 sleep: 10",
+		"4 sleep: 10m0s\n",
 	})
 
-	checkResponses(self.T(), self.frontend2.events, []string{
+	checkResponses(self.T(), self.frontend2.events.Get(), []string{
 		"5 request: /server.pem",
 		"6 response: -----BEGIN CERTIFICAT",
 
@@ -507,16 +588,21 @@ func (self *CommsTestSuite) TestMultiFrontendsIntermittantFailure() {
 // fails we switch back to FE1.
 func (self *CommsTestSuite) TestMultiFrontendsHeavyFailure() {
 	urls := []string{self.frontend1.URL, self.frontend2.URL}
+	mock_clock := utils.NewMockClock(time.Unix(100, 0))
+	cancel := utils.MockTime(mock_clock)
+	defer cancel()
 
-	clock := &FakeClock{events: &self.frontend1.events}
-	clock.MockNow = time.Now()
+	clock := &FakeClock{
+		MockClock: mock_clock,
+		events:    self.frontend1.events,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	crypto_manager := &crypto_test.NullCryptoManager{}
 	communicator, err := NewHTTPCommunicator(ctx, self.config_obj, crypto_manager,
-		&executor.TestExecutor{}, urls, nil, clock)
+		executor.NewTestExecutor(), urls, nil, clock)
 	assert.NoError(self.T(), err)
 
 	// FE1 is not completely off just loaded - so initial
@@ -539,11 +625,11 @@ func (self *CommsTestSuite) TestMultiFrontendsHeavyFailure() {
 	communicator.receiver.sendMessageList(context.Background(), nil,
 		!URGENT, crypto_proto.PackedMessageList_ZCOMPRESSION)
 
-	//utils.Debug(self.frontend1.events)
-	//utils.Debug(self.frontend2.events)
+	//utils.Debug(self.frontend1.events.Get())
+	//utils.Debug(self.frontend2.events.Get())
 
 	// Message ordering is important
-	checkResponses(self.T(), self.frontend1.events, []string{
+	checkResponses(self.T(), self.frontend1.events.Get(), []string{
 		// First request looks for server.pem is ok.
 		"0 request: /server.pem",
 		"1 response: -----BEGIN CERTIFICATE-",
@@ -553,9 +639,9 @@ func (self *CommsTestSuite) TestMultiFrontendsHeavyFailure() {
 		"2 request: /reader",
 		"3 response:  500",
 
-		"4 sleep: 10",
-		"9 sleep: 10",
-		"10 sleep: 10",
+		"4 sleep: 10m0s\n",
+		"9 sleep: 10m0s\n",
+		"10 sleep: 10m0s\n",
 
 		// Sleep after switching back from FE2
 		"11 request: /server.pem",
@@ -564,7 +650,7 @@ func (self *CommsTestSuite) TestMultiFrontendsHeavyFailure() {
 		"14 response: \n\vx\x01\x01\x00\x00\xff\xff\x00\x00\x00\x01 200",
 	})
 
-	checkResponses(self.T(), self.frontend2.events, []string{
+	checkResponses(self.T(), self.frontend2.events.Get(), []string{
 		// Rekey FE2
 		"5 request: /server.pem",
 
@@ -581,16 +667,21 @@ func (self *CommsTestSuite) TestMultiFrontendsHeavyFailure() {
 func (self *CommsTestSuite) TestMultiFrontendRedirect() {
 	// FE2 is not known to the client in advance.
 	urls := []string{self.frontend1.URL}
+	mock_clock := utils.NewMockClock(time.Unix(100, 0))
+	cancel := utils.MockTime(mock_clock)
+	defer cancel()
 
-	clock := &FakeClock{events: &self.frontend1.events}
-	clock.MockNow = time.Now()
+	clock := &FakeClock{
+		MockClock: mock_clock,
+		events:    self.frontend1.events,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	crypto_manager := &crypto_test.NullCryptoManager{}
 	communicator, err := NewHTTPCommunicator(ctx, self.config_obj, crypto_manager,
-		&executor.TestExecutor{}, urls, nil, clock)
+		executor.NewTestExecutor(), urls, nil, clock)
 	assert.NoError(self.T(), err)
 
 	// FE1 is not completely off just loaded - so initial
@@ -615,11 +706,11 @@ func (self *CommsTestSuite) TestMultiFrontendRedirect() {
 	communicator.receiver.sendMessageList(context.Background(), nil,
 		!URGENT, crypto_proto.PackedMessageList_ZCOMPRESSION)
 
-	//utils.Debug(self.frontend1.events)
-	//utils.Debug(self.frontend2.events)
+	//utils.Debug(self.frontend1.events.Get())
+	//utils.Debug(self.frontend2.events.Get())
 
 	// Message ordering is important
-	checkResponses(self.T(), self.frontend1.events, []string{
+	checkResponses(self.T(), self.frontend1.events.Get(), []string{
 		// First request looks for server.pem is ok.
 		"0 request: /server.pem",
 		"1 response: -----BEGIN CERTIFICATE-",
@@ -629,7 +720,7 @@ func (self *CommsTestSuite) TestMultiFrontendRedirect() {
 		"3 response:  301",
 	})
 
-	checkResponses(self.T(), self.frontend2.events, []string{
+	checkResponses(self.T(), self.frontend2.events.Get(), []string{
 		// Rekey this FE
 		"4 request: /server.pem",
 		"5 response: -----BEGIN CERTIFIC",
@@ -647,17 +738,23 @@ func (self *CommsTestSuite) TestMultiFrontendRedirect() {
 
 // Check that redirects do not cause un-neccesary sleeps.
 func (self *CommsTestSuite) TestMultiFrontendRedirectWithErrors() {
+	mock_clock := utils.NewMockClock(time.Unix(100, 0))
+	cancel := utils.MockTime(mock_clock)
+	defer cancel()
+
 	urls := []string{self.frontend1.URL}
 
-	clock := &FakeClock{events: &self.frontend1.events}
-	clock.MockNow = time.Now()
+	clock := &FakeClock{
+		MockClock: mock_clock,
+		events:    self.frontend1.events,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	crypto_manager := &crypto_test.NullCryptoManager{}
 	communicator, err := NewHTTPCommunicator(ctx, self.config_obj, crypto_manager,
-		&executor.TestExecutor{}, urls, nil, clock)
+		executor.NewTestExecutor(), urls, nil, clock)
 	assert.NoError(self.T(), err)
 
 	self.frontend1.responses = []*Response{
@@ -687,11 +784,11 @@ func (self *CommsTestSuite) TestMultiFrontendRedirectWithErrors() {
 	communicator.receiver.sendMessageList(context.Background(), nil,
 		!URGENT, crypto_proto.PackedMessageList_ZCOMPRESSION)
 
-	//utils.Debug(self.frontend1.events)
-	//utils.Debug(self.frontend2.events)
+	//utils.Debug(self.frontend1.events.Get())
+	//utils.Debug(self.frontend2.events.Get())
 
 	// Message ordering is important
-	checkResponses(self.T(), self.frontend1.events, []string{
+	checkResponses(self.T(), self.frontend1.events.Get(), []string{
 		// First request looks for server.pem is ok.
 		"0 request: /server.pem",
 		"1 response: -----BEGIN CERTIFICATE-",
@@ -701,7 +798,7 @@ func (self *CommsTestSuite) TestMultiFrontendRedirectWithErrors() {
 		"3 response:  301",
 
 		// Immediately switch to FE1 (no sleep)
-		"10 sleep: 10",
+		"10 sleep: 10m0s\n",
 		"11 request: /server.pem",
 		"12 response: -----BEGIN CERTIFICATE-",
 
@@ -712,11 +809,11 @@ func (self *CommsTestSuite) TestMultiFrontendRedirectWithErrors() {
 
 		// Now must sleep since we tried all endpoints and
 		// they all failed.
-		"15 sleep: 10",
-		"16 sleep: 10",
+		"15 sleep: 10m0s\n",
+		"16 sleep: 10m0s\n",
 	})
 
-	checkResponses(self.T(), self.frontend2.events, []string{
+	checkResponses(self.T(), self.frontend2.events.Get(), []string{
 		// Rekey FE2
 		"4 request: /server.pem",
 		"5 response: -----BEGIN CERTIFIC",
@@ -742,16 +839,21 @@ func (self *CommsTestSuite) TestMultiFrontendRedirectWithErrors() {
 // Frontends redirecting to each other.
 func (self *CommsTestSuite) TestMultiRedirects() {
 	urls := []string{self.frontend1.URL}
+	mock_clock := utils.NewMockClock(time.Unix(100, 0))
+	cancel := utils.MockTime(mock_clock)
+	defer cancel()
 
-	clock := &FakeClock{events: &self.frontend1.events}
-	clock.MockNow = time.Now()
+	clock := &FakeClock{
+		MockClock: mock_clock,
+		events:    self.frontend1.events,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	crypto_manager := &crypto_test.NullCryptoManager{}
 	communicator, err := NewHTTPCommunicator(ctx, self.config_obj, crypto_manager,
-		&executor.TestExecutor{}, urls, nil, clock)
+		executor.NewTestExecutor(), urls, nil, clock)
 	assert.NoError(self.T(), err)
 
 	self.frontend1.responses = []*Response{
@@ -774,15 +876,15 @@ func (self *CommsTestSuite) TestMultiRedirects() {
 	communicator.receiver.sendMessageList(context.Background(), nil,
 		!URGENT, crypto_proto.PackedMessageList_ZCOMPRESSION)
 
-	//utils.Debug(self.frontend1.events)
-	//utils.Debug(self.frontend2.events)
+	//utils.Debug(self.frontend1.events.Get())
+	//utils.Debug(self.frontend2.events.Get())
 
 	// Multiple redirections should not add duplicates to the url list.
 	assert.Equal(self.T(), communicator.receiver.connector.(*HTTPConnector).urls,
 		[]string{self.frontend1.URL, self.frontend2.URL})
 
 	// Message ordering is important
-	checkResponses(self.T(), self.frontend1.events, []string{
+	checkResponses(self.T(), self.frontend1.events.Get(), []string{
 		// First request looks for server.pem is ok.
 		"0 request: /server.pem",
 		"1 response: -----BEGIN CERTIFICATE-",
@@ -791,7 +893,7 @@ func (self *CommsTestSuite) TestMultiRedirects() {
 		"2 request: /reader",
 		"3 response:  301",
 
-		"8 sleep: 10",
+		"8 sleep: 10m0s\n",
 
 		// Immediately switch to FE1 (no sleep)
 		"9 request: /server.pem",
@@ -801,7 +903,7 @@ func (self *CommsTestSuite) TestMultiRedirects() {
 		"12 response: \n\vx\x01\x01\x00\x00\xff\xff\x00\x00\x00\x01 200",
 	})
 
-	checkResponses(self.T(), self.frontend2.events, []string{
+	checkResponses(self.T(), self.frontend2.events.Get(), []string{
 		// Rekey FE2
 		"4 request: /server.pem",
 		"5 response: -----BEGIN CERTIFIC",
@@ -812,9 +914,9 @@ func (self *CommsTestSuite) TestMultiRedirects() {
 	})
 }
 
-func checkResponses(t *testing.T, expected []string, seen []string) {
+func checkResponses(t *testing.T, seen []string, expected []string) {
 	for idx, seen_line := range seen {
-		assert.Contains(t, expected[idx], seen_line)
+		assert.Contains(t, seen_line, expected[idx])
 	}
 
 	assert.Equal(t, len(expected), len(seen))

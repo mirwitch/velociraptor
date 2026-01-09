@@ -1,8 +1,14 @@
+import _ from 'lodash';
+import hex2a from "./utils";
+import React from 'react';
 import Alert from 'react-bootstrap/Alert';
 import humanizeDuration from "humanize-duration";
+import api from '../core/api-service.jsx';
+
+import automated from "./fr.json";
 
 const French = {
-    SEARCH_CLIENTS: "Rechercher des clients",
+    "SEARCH_CLIENTS": "Rechercher des clients",
     "Quarantine description": (
         <>
           <p>Vous êtes sur le point de mettre cet hôte en quarantaine.</p>
@@ -61,7 +67,9 @@ const French = {
     "A new label": "Un nouveau label",
     "Add it!": "Ajoutez-le!",
     "Delete Clients": "Supprimer des clients",
+    "Kill Clients": "Terminer des clients",
     "DeleteMessage": "Vous êtes sur le point de supprimer définitivement les clients suivants",
+    "KillMessage": "Vous êtes sur le point de terminer les clients suivants",
     "Yeah do it!": "Oui, fais-le!",
     "Goto Page": "Aller à la page",
     "Table is Empty": "Le tableau est vide",
@@ -96,6 +104,10 @@ const French = {
     },
     "Create a new artifact": "Créer un nouvel artefact",
     "Save": "Enregistrer",
+    "Search": "Recherche",
+    "Toggle Main Menu": "Basculer le menu principal",
+    "Main Menu": "Menu principal",
+    "Welcome": "Bienvenu",
 
     // Navigation au clavier.
     "Global hotkeys": "Raccourcis globaux",
@@ -171,8 +183,8 @@ const French = {
     "Permanently delete collection": "Supprimer définitivement la collection",
     "ArtifactDeletionDialog": (session_id, artifacts, total_bytes, total_rows)=>
     <>
-       Vous êtes sur le point de supprimer définitivement la collection d'artefacts
-       <b>{session_id}</b>.
+       Vous êtes sur le point de supprimer définitivement la collection
+       d'artefacts <b>{session_id}</b>.
        <br/>
        Cette collection avait les artefacts <b className="wrapped-text">
           {artifacts}
@@ -244,7 +256,7 @@ const French = {
     "Max Execution Time in Seconds":"Temps d'exécution maximal en secondes",
     "Max Idle Time in Seconds":"Temps d'inactivité maximal en secondes",
     "If set collection will be terminated after this many seconds with no progress.":"Si l'ensemble de collecte sera terminé après ce nombre de secondes sans progression.",
-    "Max Mb Uploaded":"Max Mo téléversé",
+    "Max bytes Uploaded":"Max Mo téléversé",
     "Collection did not upload files":"La collection n'a pas de fichiers téléversés",
 
     "Create Offline collector: Select artifacts to collect":"Créer un collecteur hors ligne: sélectionnez les artefacts à collecter",
@@ -373,19 +385,19 @@ const French = {
     le hachage la prochaine fois qu'il en aura besoin.
     Les outils ne seront téléchargés que si leur hachage a changé.
     </>,
-    "ServedFromURL": (base_path, url)=>
+    "ServedFromURL": (url)=>
     <>
-    Les clients iront chercher l'outil directement à partir de
-    <a href={base_path + url}>{url}</a> si
+    Les clients iront chercher l'outil directement à partir
+    de <a href={api.href(url)}>{url}</a> si
     nécessaire. Notez que si le hachage ne correspond pas au
     hachage attendu, les clients rejetteront le fichier.
     </>,
     "ServedFromGithub": (github_project, github_asset_regex)=>
     <>
     L'URL de l'outil est mise à jour par
-    GitHub comme dernière version du projet
-    <b>{github_project}</b> qui correspond
-    <b>{github_asset_regex}</b>
+    GitHub comme dernière version du
+    projet <b>{github_project}</b> qui
+    correspond <b>{github_asset_regex}</b>
     </>,
     "PlaceHolder":
     <>
@@ -494,12 +506,16 @@ const French = {
     "Theme":"Thème",
     "Select a theme":"Sélectionnez un thème",
     "Default Velociraptor":"Vélociraptor standard",
+    "Velociraptor Classic (light)": "Vélociraptor Classique (léger)",
     "Velociraptor (light)":"Vélociraptor (léger)",
     "Velociraptor (dark)":"Vélociraptor (foncé)",
-    "Github dimmed (dark)":"Github estompé (sombre)",
-    "Ncurses (light)":"Ncurses (lumière)",
+    "Github (light)": "Github (léger)",
+    "Github dimmed (dark)":"Github estompé (foncé)",
+    "Ncurses (dark)": "Ncurses (foncé)",
+    "Ncurses (light)":"Ncurses (léger)",
     "Cool Gray (dark)":"Gris froid (foncé)",
     "Strawberry Milkshake (light)":"Milkshake aux fraises (léger)",
+    "Midnight Inferno (very dark)": "Minuit Inferno (très foncé)",
     "Downloads Password":"Télécharger le mot de passe",
     "Default password to use for downloads":"Mot de passe par défaut pour les téléchargements",
 
@@ -573,8 +589,6 @@ const French = {
     "vfs_path":"Chemin VFS",
     "file_size":"Taille du fichier",
     "uploaded_size":"Taille téléversée",
-    "TablePagination": (from, to, size)=>
-    <>Afficher la ligne { from } à { to } de { size }</>,
 
     "Select a language":"Sélectionner la langue",
     "English":"Anglais",
@@ -610,6 +624,59 @@ const French = {
     "Show client monitoring tables":"Afficher les tableaux de surveillance des clients",
     "Urgent": "Urgent",
     "Skip queues and run query urgently": "Ignorer les files d'attente et exécuter la requête de toute urgence",
+
+    // Below need verification
+    "Role_administrator": "Administrateur du serveur",
+    "Role_org_admin": "Administrateur de l'organisation",
+    "Role_reader": "Utilisateur en lecture seule",
+    "Rôle_analyste": "Analyste",
+    "Role_investigator": "Enquêteur",
+    "Role_artifact_writer": "Auteur d'artefacts",
+    "Role_api": "Client API en lecture seule",
+
+     "Perm_ANY_QUERY": "N'importe quelle requête",
+     "Perm_PUBISH": "Publier",
+     "Perm_READ_RESULTS": "Lire les résultats",
+     "Perm_LABEL_CLIENT": "Étiqueter les clients",
+     "Perm_COLLECT_CLIENT": "Recueillir le client",
+     "Perm_START_HUNT": "Démarrer la chasse",
+     "Perm_COLLECT_SERVER": "Serveur de collecte",
+     "Perm_ARTIFACT_WRITER": "Auteur d'artefacts",
+     "Perm_SERVER_ARTIFACT_WRITER": "Auteur d'artefacts de serveur",
+     "Perm_EXECVE": "EXECVE",
+     "Perm_NOTEBOOK_EDITOR": "Éditeur de bloc-notes",
+     "Perm_SERVER_ADMIN": "Administrateur du serveur",
+     "Perm_ORG_ADMIN": "Administrateur de l'organisation",
+     "Perm_IMPERSONATION": "Usurpation d'identité",
+     "Perm_FILESYSTEM_READ": "Lecture du système de fichiers",
+     "Perm_FILESYSTEM_WRITE": "Écriture du système de fichiers",
+     "Perm_MACHINE_STATE": "État de la machine",
+     "Perm_PREPARE_RESULTS": "Préparer les résultats",
+     "Perm_DATASTORE_ACCESS": "Accès à la banque de données",
+
+     "ToolPerm_ANY_QUERY": "Emettre n'importe quelle requête",
+     "ToolPerm_PUBISH": "Publier les événements dans les files d'attente côté serveur (généralement non nécessaires)",
+     "ToolPerm_READ_RESULTS": "Lire les résultats des chasses, des flux ou des cahiers déjà exécutés",
+     "ToolPerm_LABEL_CLIENT": "Peut manipuler les étiquettes et les métadonnées des clients",
+     "ToolPerm_COLLECT_CLIENT": "Planifier ou annuler de nouvelles collectes sur les clients",
+     "ToolPerm_START_HUNT": "Démarrer une nouvelle chasse",
+     "ToolPerm_COLLECT_SERVER": "Planifier de nouvelles collections d'artefacts sur les serveurs Velociraptor",
+     "ToolPerm_ARTIFACT_WRITER": "Ajouter ou modifier des artefacts personnalisés qui s'exécutent sur le serveur",
+     "ToolPerm_SERVER_ARTIFACT_WRITER": "Ajouter ou modifier des artefacts personnalisés qui s'exécutent sur le serveur",
+     "ToolPerm_EXECVE": "Autorisé à exécuter des commandes arbitraires sur les clients",
+     "ToolPerm_NOTEBOOK_EDITOR": "Autorisé à changer de cahiers et de cellules",
+     "ToolPerm_SERVER_ADMIN": "Autorisé à gérer la configuration du serveur",
+     "ToolPerm_ORG_ADMIN": "Autorisé à gérer les organisations",
+     "ToolPerm_IMPERSONATION": "Permet à l'utilisateur de spécifier un nom d'utilisateur différent pour le plugin query()",
+     "ToolPerm_FILESYSTEM_READ": "Autorisé à lire des fichiers arbitraires du système de fichiers",
+     "ToolPerm_FILESYSTEM_WRITE": "Autorisé à créer des fichiers sur le système de fichiers",
+     "ToolPerm_MACHINE_STATE": "Autorisé à collecter des informations sur l'état des machines (par exemple, pslist())",
+     "ToolPerm_PREPARE_RESULTS": "Autorisé à créer des fichiers zip",
+     "ToolPerm_DATASTORE_ACCESS": "Accès au magasin de données brut autorisé",
 };
+
+_.each(automated, (v, k)=>{
+    French[hex2a(k)] = v;
+});
 
 export default French;

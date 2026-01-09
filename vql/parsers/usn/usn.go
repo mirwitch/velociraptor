@@ -1,22 +1,125 @@
 package usn
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 
 	"github.com/Velocidex/ordereddict"
 	ntfs "www.velocidex.com/golang/go-ntfs/parser"
 	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/accessors/ntfs/readers"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/uploads"
 	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
+	"www.velocidex.com/golang/vfilter/types"
 )
 
 type USNPluginArgs struct {
-	Device   *accessors.OSPath `vfilter:"required,field=device,doc=The device file to open."`
-	Accessor string            `vfilter:"optional,field=accessor,doc=The accessor to use."`
-	StartUSN int64             `vfilter:"optional,field=start_offset,doc=The starting offset of the first USN record to parse."`
+	Device        *accessors.OSPath `vfilter:"optional,field=device,doc=The device file to open."`
+	ImageFilename *accessors.OSPath `vfilter:"optional,field=image_filename,doc=A raw image to open. You can also provide the accessor if using a raw image file."`
+	Accessor      string            `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	MFTFilename   *accessors.OSPath `vfilter:"optional,field=mft_filename,doc=A path to a raw $MFT file to use for path resolution."`
+	USNFilename   *accessors.OSPath `vfilter:"optional,field=usn_filename,doc=A path to a raw USN file to parse. If not provided we extract it from the Device or Image file."`
+
+	StartUSN  int64 `vfilter:"optional,field=start_offset,doc=The starting offset of the first USN record to parse."`
+	FastPaths bool  `vfilter:"optional,field=fast_paths,doc=If set we resolve full paths using faster but less accurate algorithm."`
+
+	disable_full_path_resolution bool
+}
+
+func (self *USNPluginArgs) GetStreams(scope types.Scope) (
+	ntfs_ctx *ntfs.NTFSContext,
+	usn_stream ntfs.RangeReaderAt,
+	err error,
+) {
+	// First get the ntfs_ctx from the args provided
+
+	// If we specified the device then we open the streams directly
+	// from it.
+	ntfs_ctx, source, err := self.getNTFSContext(scope)
+	if err != nil {
+		// Failing this we add an empty MFT and disable the full name
+		// resolution. This helps to resolve some names in the case
+		// of just a USN journal $J dump.
+		scope.Log("parse_usn: Unable to get MFT, Name resolution will be disabled.")
+		// Create an empty ntfs context
+		ntfs_ctx = ntfs.GetNTFSContextFromRawMFT(
+			bytes.NewReader(nil), 0x200, 0x200)
+		err = nil
+		self.disable_full_path_resolution = true
+	}
+
+	// Now resolve the USN stream.
+	if self.USNFilename != nil && len(self.USNFilename.Components) > 0 {
+		accessor, err := accessors.GetAccessor(self.Accessor, scope)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		stat, err := accessor.LstatWithOSPath(self.USNFilename)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%v: %w", self.USNFilename, err)
+		}
+
+		reader, err := accessor.OpenWithOSPath(self.USNFilename)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%v: %w", self.USNFilename, err)
+		}
+
+		usn_stream = NewRangeReaderAtWrapper(reader, stat.Size())
+
+	} else {
+		scope.Log("Openning default USN stream from %v", source)
+		usn_stream, err = ntfs.OpenUSNStream(ntfs_ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+
+	}
+
+	return ntfs_ctx, usn_stream, err
+}
+
+func (self *USNPluginArgs) getNTFSContext(scope types.Scope) (
+	*ntfs.NTFSContext, *accessors.OSPath, error) {
+
+	if self.Device != nil && len(self.Device.Components) > 0 {
+		ntfs_ctx, err := readers.GetNTFSContext(scope, self.Device, "ntfs")
+		if err != nil {
+			return nil, nil, fmt.Errorf("%v: %w", self.Device, err)
+		}
+		return ntfs_ctx, self.Device, nil
+
+		// Alternatively we can specify an image file.
+	} else if self.ImageFilename != nil &&
+		len(self.ImageFilename.Components) > 0 {
+		ntfs_ctx, err := readers.GetNTFSContext(
+			scope, self.ImageFilename, self.Accessor)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%v: %w", self.ImageFilename, err)
+		}
+		return ntfs_ctx, self.ImageFilename, nil
+
+		// We can read an $MFT dump directly.
+	} else if self.MFTFilename != nil &&
+		len(self.MFTFilename.Components) > 0 {
+
+		ntfs_ctx, err := readers.GetNTFSContextFromRawMFT(
+			scope, self.MFTFilename, self.Accessor)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%v: %w", self.MFTFilename, err)
+		}
+		return ntfs_ctx, self.MFTFilename, nil
+	}
+
+	return nil, nil, errors.New("No MFT specified")
 }
 
 type USNPlugin struct{}
@@ -30,6 +133,7 @@ func (self USNPlugin) Call(
 	go func() {
 		defer close(output_chan)
 		defer utils.RecoverVQL(scope)
+		defer vql_subsystem.RegisterMonitor(ctx, "parse_usn", args)()
 
 		arg := &USNPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -38,25 +142,7 @@ func (self USNPlugin) Call(
 			return
 		}
 
-		// If an accessor is not specified we interpret the path as an
-		// NTFS path.
-		if arg.Accessor == "" {
-			arg.Accessor = "ntfs"
-			arg.Device, err = accessors.NewWindowsNTFSPath(arg.Device.String())
-			if err != nil {
-				scope.Log("parse_usn: %v", err)
-				return
-			}
-		}
-
-		device, accessor, err := readers.GetRawDeviceAndAccessor(
-			scope, arg.Device, arg.Accessor)
-		if err != nil {
-			scope.Log("parse_usn: %v", err)
-			return
-		}
-
-		ntfs_ctx, err := readers.GetNTFSContext(scope, device, accessor)
+		ntfs_ctx, usn_stream, err := arg.GetStreams(scope)
 		if err != nil {
 			scope.Log("parse_usn: %v", err)
 			return
@@ -64,11 +150,56 @@ func (self USNPlugin) Call(
 		defer ntfs_ctx.Close()
 
 		options := readers.GetScopeOptions(scope)
-		options.PrefixComponents = arg.Device.Components
+		if arg.Device != nil {
+			options.PrefixComponents = arg.Device.Components
+		}
+
+		if !options.DisableFullPathResolution && arg.disable_full_path_resolution {
+			options.DisableFullPathResolution = true
+		}
 		ntfs_ctx.SetOptions(options)
 
-		for item := range ntfs.ParseUSN(ctx, ntfs_ctx, arg.StartUSN) {
-			output_chan <- makeUSNRecord(item)
+		if !arg.FastPaths {
+			preload_count := 0
+			now := utils.GetTime().Now()
+
+			for record := range ntfs.ParseUSN(
+				ctx, ntfs_ctx, usn_stream, arg.StartUSN) {
+				mft_id := record.FileReferenceNumberID()
+				mft_seq := uint16(record.FileReferenceNumberSequence())
+
+				ntfs_ctx.SetPreload(mft_id, mft_seq,
+					func(entry *ntfs.MFTEntrySummary) (*ntfs.MFTEntrySummary, bool) {
+						if entry != nil {
+							return entry, false
+						}
+
+						preload_count++
+
+						// Add a fake entry to resolve the filename
+						return &ntfs.MFTEntrySummary{
+							Sequence: mft_seq,
+							Filenames: []ntfs.FNSummary{{
+								Name:              record.Filename(),
+								NameType:          "DOS+Win32",
+								ParentEntryNumber: record.ParentFileReferenceNumberID(),
+								ParentSequenceNumber: uint16(
+									record.ParentFileReferenceNumberSequence()),
+							}},
+						}, true
+					})
+			}
+
+			scope.Log("parse_usn: Preloaded %v USN entries into path resolver in %v",
+				preload_count, utils.GetTime().Now().Sub(now))
+		}
+
+		for item := range ntfs.ParseUSN(ctx, ntfs_ctx, usn_stream, arg.StartUSN) {
+			select {
+			case <-ctx.Done():
+				return
+			case output_chan <- makeUSNRecord(item):
+			}
 		}
 	}()
 
@@ -77,9 +208,11 @@ func (self USNPlugin) Call(
 
 func (self USNPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "parse_usn",
-		Doc:     "Parse the USN journal from a device.",
-		ArgType: type_map.AddType(scope, &USNPluginArgs{}),
+		Name:     "parse_usn",
+		Doc:      "Parse the USN journal from a device.",
+		ArgType:  type_map.AddType(scope, &USNPluginArgs{}),
+		Version:  2,
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -98,6 +231,7 @@ func (self WatchUSNPlugin) Call(
 	go func() {
 		defer close(output_chan)
 		defer utils.RecoverVQL(scope)
+		defer vql_subsystem.RegisterMonitor(ctx, "watch_usn", args)()
 
 		arg := &WatchUSNPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -176,7 +310,7 @@ func makeUSNRecord(item *ntfs.USN_RECORD) *ordereddict.Dict {
 		Set("Timestamp", item.TimeStamp().Time).
 		Set("Filename", item.Filename()).
 		Set("_Links", links).
-		Set("FullPath", fullpath).
+		Set("OSPath", fullpath).
 		Set("FileAttributes", item.FileAttributes()).
 		Set("Reason", item.Reason()).
 		Set("SourceInfo", item.SourceInfo()).
@@ -184,4 +318,38 @@ func makeUSNRecord(item *ntfs.USN_RECORD) *ordereddict.Dict {
 		Set("_FileMFTSequence", item.FileReferenceNumberSequence()).
 		Set("_ParentMFTID", item.ParentFileReferenceNumberID()).
 		Set("_ParentMFTSequence", item.ParentFileReferenceNumberSequence())
+}
+
+type RangeReaderAtWrapper struct {
+	io.ReaderAt
+	runs []ntfs.Range
+}
+
+func (self RangeReaderAtWrapper) Ranges() []ntfs.Range {
+	return self.runs
+}
+
+func NewRangeReaderAtWrapper(
+	reader accessors.ReadSeekCloser, length int64) *RangeReaderAtWrapper {
+
+	result := &RangeReaderAtWrapper{ReaderAt: utils.MakeReaderAtter(reader)}
+
+	range_reader, ok := reader.(uploads.RangeReader)
+	if ok {
+		for _, run := range range_reader.Ranges() {
+			result.runs = append(result.runs, ntfs.Range{
+				Offset:   run.Offset,
+				Length:   run.Length,
+				IsSparse: run.IsSparse,
+			})
+		}
+	} else {
+		result.runs = append(result.runs, ntfs.Range{
+			Offset:   0,
+			Length:   length,
+			IsSparse: false,
+		})
+	}
+
+	return result
 }

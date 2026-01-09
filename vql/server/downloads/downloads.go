@@ -4,9 +4,7 @@ package downloads
 
 import (
 	"context"
-	"fmt"
 	"io"
-	"io/ioutil"
 	"sync"
 	"time"
 
@@ -17,6 +15,7 @@ import (
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
@@ -29,6 +28,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/uploads"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/files"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -42,8 +43,8 @@ type CreateFlowDownloadArgs struct {
 	ClientId     string `vfilter:"required,field=client_id,doc=Client ID to export."`
 	FlowId       string `vfilter:"required,field=flow_id,doc=The flow id to export."`
 	Wait         bool   `vfilter:"optional,field=wait,doc=If set we wait for the download to complete before returning."`
-	Type         string `vfilter:"optional,field=type,doc=Type of download to create (deperated Ignored)."`
-	Template     string `vfilter:"optional,field=template,doc=Report template to use (deperated Ignored)."`
+	Type         string `vfilter:"optional,field=type,doc=Type of download to create (deprecated Ignored)."`
+	Template     string `vfilter:"optional,field=template,doc=Report template to use (deprecated Ignored)."`
 	Password     string `vfilter:"optional,field=password,doc=An optional password to encrypt the collection zip."`
 	Format       string `vfilter:"optional,field=format,doc=Format to export (csv,json,csv_only) defaults to both."`
 	ExpandSparse bool   `vfilter:"optional,field=expand_sparse,doc=If set we expand sparse files in the archive."`
@@ -69,9 +70,15 @@ func (self *CreateFlowDownload) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("create_flow_download: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("create_flow_download: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -82,12 +89,17 @@ func (self *CreateFlowDownload) Call(ctx context.Context,
 	}
 
 	principal := vql_subsystem.GetPrincipal(scope)
-	logging.LogAudit(config_obj, principal, "create_flow_download",
-		logrus.Fields{
-			"format":    format,
-			"client_id": arg.ClientId,
-			"flow_id":   arg.FlowId,
-		})
+	err = services.LogAudit(ctx,
+		config_obj, principal, "create_flow_download",
+		ordereddict.NewDict().
+			Set("format", format).
+			Set("client_id", arg.ClientId).
+			Set("flow_id", arg.FlowId))
+	if err != nil {
+		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+		logger.Error("<red>create_flow_download</> %v %v %v",
+			principal, arg.ClientId, arg.FlowId)
+	}
 
 	result, err := createDownloadFile(
 		ctx, scope, config_obj, format,
@@ -98,14 +110,15 @@ func (self *CreateFlowDownload) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
-	return result
+	return path_specs.ToAnyType(result)
 }
 
 func (self CreateFlowDownload) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "create_flow_download",
-		Doc:     "Creates a download pack for the flow.",
-		ArgType: type_map.AddType(scope, &CreateFlowDownloadArgs{}),
+		Name:     "create_flow_download",
+		Doc:      "Creates a download pack for the flow.",
+		ArgType:  type_map.AddType(scope, &CreateFlowDownloadArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.PREPARE_RESULTS).Build(),
 	}
 }
 
@@ -138,9 +151,15 @@ func (self *CreateHuntDownload) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("create_hunt_download: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("create_hunt_download: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -164,9 +183,10 @@ func (self *CreateHuntDownload) Call(ctx context.Context,
 
 func (self CreateHuntDownload) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "create_hunt_download",
-		Doc:     "Creates a download pack for a hunt.",
-		ArgType: type_map.AddType(scope, &CreateHuntDownloadArgs{}),
+		Name:     "create_hunt_download",
+		Doc:      "Creates a download pack for a hunt.",
+		ArgType:  type_map.AddType(scope, &CreateHuntDownloadArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.PREPARE_RESULTS).Build(),
 	}
 }
 
@@ -182,8 +202,7 @@ func createDownloadFile(
 		return nil, errors.New("Client Id and Flow Id should be specified.")
 	}
 
-	hostname := services.GetHostname(
-		ctx, config_obj, client_id) + "-" + client_id
+	hostname := services.GetHostname(ctx, config_obj, client_id)
 	flow_path_manager := paths.NewFlowPathManager(client_id, flow_id)
 	download_file := flow_path_manager.GetDownloadsFile(hostname, password != "")
 	if name != "" {
@@ -197,8 +216,14 @@ func createDownloadFile(
 		"download_file": download_file,
 	}).Info("CreateDownload")
 
+	completion := utils.BackgroundWriter
+	if wait {
+		completion = utils.SyncCompleter
+	}
+
 	file_store_factory := file_store.GetFileStore(config_obj)
-	fd, err := file_store_factory.WriteFile(download_file)
+	fd, err := file_store_factory.WriteFileWithCompletion(
+		download_file, completion)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +236,7 @@ func createDownloadFile(
 	// Create a new ZipContainer to write on. The container will close
 	// the underlying writer.
 	zip_writer, err := reporting.NewContainerFromWriter(
+		download_file.String(),
 		config_obj, fd, password,
 		reporting.DEFAULT_COMPRESSION, reporting.NO_METADATA)
 	if err != nil {
@@ -219,24 +245,39 @@ func createDownloadFile(
 
 	// zip_writer now owns fd and will close it when it closes below.
 
-	// Report the progress as we write the container.
-	progress_reporter := reporting.NewProgressReporter(config_obj,
-		flow_path_manager.GetDownloadsStats(hostname, password != ""),
-		download_file, zip_writer)
-
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
 	// Write the bulk of the data asyncronously.
 	go func() {
 		defer wg.Done()
+
+		timeout := int64(600)
+		if config_obj.Defaults != nil &&
+			config_obj.Defaults.ExportMaxTimeoutSec > 0 {
+			timeout = config_obj.Defaults.ExportMaxTimeoutSec
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(),
+			time.Second*time.Duration(timeout))
+		defer cancel()
+
+		opts := services.ContainerOptions{
+			Type:              services.FlowExport,
+			ClientId:          client_id,
+			FlowId:            flow_id,
+			StatsPath:         flow_path_manager.GetDownloadsStats(hostname, password != ""),
+			ContainerFilename: download_file,
+		}
+
+		// Report the progress as we write the container.
+		progress_reporter := reporting.NewProgressReporter(ctx, config_obj,
+			download_file, opts, zip_writer)
 		defer progress_reporter.Close()
 
-		// Will also close the underlying fd.
+		// Will also close the underlying container when done. Must be
+		// done before progress close so we can write the hash.
 		defer zip_writer.Close()
-
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*600)
-		defer cancel()
 
 		err := downloadFlowToZip(ctx, scope, config_obj, format,
 			client_id, path_specs.NewUnsafeFilestorePath(),
@@ -272,14 +313,19 @@ func downloadFlowToZip(
 		return err
 	}
 
+	// If we dont know anything this client, at least add an empty
+	// record so the flow is recognized by the importer.
 	client_info, err := client_info_manager.Get(ctx, client_id)
-	if err == nil {
-		err = zip_writer.WriteJSON(
-			paths.ZipPathFromFSPathSpec(prefix.AddChild("client_info")),
-			client_info)
-		if err != nil {
-			return err
-		}
+	if err != nil {
+		client_info = &services.ClientInfo{ClientInfo: &actions_proto.ClientInfo{}}
+		client_info.ClientId = client_id
+	}
+
+	err = zip_writer.WriteJSON(
+		paths.ZipPathFromFSPathSpec(prefix.AddChild("client_info")),
+		client_info)
+	if err != nil {
+		return err
 	}
 
 	// Write the flow details.
@@ -288,18 +334,20 @@ func downloadFlowToZip(
 		return err
 	}
 
-	flow_details, err := launcher.GetFlowDetails(config_obj, client_id, flow_id)
+	flow_details, err := launcher.GetFlowDetails(
+		ctx, config_obj, services.GetFlowOptions{},
+		client_id, flow_id)
 	if err == nil {
 		err = zip_writer.WriteJSON(
 			paths.ZipPathFromFSPathSpec(prefix.AddChild("collection_context")),
-			flow_details)
+			flow_details.Context)
 		if err != nil {
 			return err
 		}
 	}
 
-	flow_requests, err := launcher.GetFlowRequests(config_obj,
-		client_id, flow_id, 0, 100)
+	flow_requests, err := launcher.Storage().GetFlowRequests(
+		ctx, config_obj, client_id, flow_id, 0, 100)
 	if err == nil {
 		err = zip_writer.WriteJSON(
 			paths.ZipPathFromFSPathSpec(prefix.AddChild("requests")),
@@ -312,23 +360,25 @@ func downloadFlowToZip(
 	// Copy the collection logs
 	flow_path_manager := paths.NewFlowPathManager(client_id, flow_id)
 	err = copyResultSetIntoContainer(ctx, config_obj, zip_writer, format,
-		flow_path_manager.Log(), prefix.AddChild("logs"))
+		flow_path_manager.Log(), prefix.AddChild("log"))
 	if err != nil {
 		return err
 	}
 
 	// Copy artifact results
-	for _, name := range flow_details.Context.ArtifactsWithResults {
-		artifact_path_manager, err := artifacts.NewArtifactPathManager(
-			config_obj, client_id, flow_id, name)
-		if err != nil {
-			continue
-		}
+	if flow_details != nil && flow_details.Context != nil {
+		for _, name := range flow_details.Context.ArtifactsWithResults {
+			artifact_path_manager, err := artifacts.NewArtifactPathManager(ctx,
+				config_obj, client_id, flow_id, name)
+			if err != nil {
+				continue
+			}
 
-		err = copyResultSetIntoContainer(ctx, config_obj, zip_writer, format,
-			artifact_path_manager.Path(), prefix.AddChild("results", name))
-		if err != nil {
-			return err
+			err = copyResultSetIntoContainer(ctx, config_obj, zip_writer, format,
+				artifact_path_manager.Path(), prefix.AddChild("results", name))
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -360,9 +410,14 @@ func copyUploadFiles(
 	}
 
 	output_chan := make(chan vfilter.Row)
+
+	// Need to create a local pool so we can wait for all files to be
+	// written to the container before we close the output chan.
+	pool := newPool(ctx, config_obj, scope, container)
+
 	go func() {
 		defer close(output_chan)
-		defer reader.Close()
+		defer pool.Close()
 
 		for row := range reader.Rows(ctx) {
 			components, pres := row.GetStrings("_Components")
@@ -379,12 +434,66 @@ func copyUploadFiles(
 				if expand_sparse {
 					continue
 				}
-				dest = dest.SetType(api.PATH_TYPE_FILESTORE_SPARSE_IDX)
 			}
 
 			var src api.FSPathSpec
 
-			if len(components) > 6 && components[0] == "clients" {
+			// We need to figure out where to store the file inside
+			// the zip container. This depends on the the file's
+			// original path on the endpoint. Since the client's
+			// original path may have characters that need escaping we
+			// need to build a `dest` pathspec that will be expanded
+			// into the zip.
+
+			// In recent versions, the client uploads the client's
+			// list of components in the FileBuffer message
+			// already. We use this to write the upload metadata table
+			// for each upload. That table contains:
+
+			// _Components : these are the Velociraptor filestore
+			// components that specify where to write the file in the
+			// filestore. These include the client's prefix,
+			// collection id etc.
+
+			// _client_components: These are the original components
+			// inside the endpoint's filesystem.
+
+			// _accessor: The original accessor used to retrieve the
+			// file on the client.
+
+			// The next code derives two pathspecs:
+
+			// src: where to read the file from the velociraptor filestore.
+			// dest: Where to write the file into the zip container.
+
+			// Try to get the client's components from the uploads
+			// metadata file. If it is already provided by the client,
+			// we are good to go with minimal work - newer collections
+			// already store this.
+			client_components, pres := row.GetStrings("_client_components")
+			if pres {
+
+				// This is the easy case - the destination path is
+				// just uploads/<accessor>/<escaped_client_path>
+				accessor, pres := row.GetString("_accessor")
+				if !pres {
+					accessor = "auto"
+				}
+
+				// Where to store in the container.
+				container_components := append([]string{"uploads", accessor},
+					client_components...)
+				row.Update("_Components", container_components)
+
+				// Where to read the file from.
+				src = path_specs.NewUnsafeFilestorePath(components...).
+					SetType(api.PATH_TYPE_FILESTORE_ANY)
+				dest = dest.AddChild(container_components...)
+
+				// Otherwise we need to look at the filestore
+				// components and derive the client's components from
+				// there.
+			} else if len(components) > 4 && components[0] == "clients" {
 				//Remove the prefix in the file store where the files
 				//are stored. The uploads file in the file store
 				//refers to the location in the filestore where the
@@ -438,14 +547,17 @@ func copyUploadFiles(
 				dest = dest.AddChild(components...)
 			}
 
-			// Copy from the file store at these locations.
-			err = copyFile(ctx, scope, config_obj, container,
-				src, dest, expand_sparse)
-			if err != nil {
-				row.Set("Error", err.Error())
+			// This is an index row, copy the index file to the zip.
+			if file_type == "idx" {
+				src = src.SetType(api.PATH_TYPE_FILESTORE_SPARSE_IDX)
+				dest = dest.SetType(api.PATH_TYPE_FILESTORE_SPARSE_IDX)
 			}
 
-			// Write the modified row into the uploads.json file.
+			pool.copyFile(src, dest, row, expand_sparse, output_chan)
+
+			// Write the row into the upload file immediately so the
+			// rows maintain the same order as the original file. If
+			// an error occurs a second error row will be written.
 			output_chan <- row
 		}
 	}()
@@ -457,6 +569,7 @@ func copyUploadFiles(
 	return err
 }
 
+// Copy a single file from the filestore into the container.
 func copyFile(
 	ctx context.Context,
 	scope vfilter.Scope,
@@ -489,7 +602,9 @@ func copyFile(
 		reader = maybeExpandSparseFile(ctx, scope, config_obj, src, fd)
 	}
 
-	_, err = utils.Copy(ctx, out_fd, reader)
+	buff := make([]byte, 1024*1024)
+	_, err = utils.CopyWithBuffer(ctx, out_fd, reader, buff)
+
 	return err
 }
 
@@ -512,7 +627,7 @@ func maybeExpandSparseFile(
 	}
 	defer idx_fd.Close()
 
-	serialized, err := ioutil.ReadAll(idx_fd)
+	serialized, err := utils.ReadAllWithLimit(idx_fd, constants.MAX_MEMORY)
 	if err != nil {
 		return reader
 	}
@@ -534,12 +649,19 @@ func maybeExpandSparseFile(
 
 	scope.Log("File %v is sparse - expanding.", src)
 	logger.Debug("File %v is sparse - expanding.", src)
+
+	files.Add(src.String())
+
 	return utils.NewReadSeekReaderAdapter(&utils.RangedReader{
 		ReaderAt: utils.MakeReaderAtter(reader),
 		Index:    index,
+	}, func() {
+		files.Remove(src.String())
 	})
 }
 
+// Copies the result set into the container - possibly convert into
+// CSV.
 func copyResultSetIntoContainer(
 	ctx context.Context,
 	config_obj *config_proto.Config,
@@ -622,8 +744,14 @@ func createHuntDownloadFile(
 	}).Info("CreateHuntDownload")
 
 	// Write the download file
+	completion := utils.BackgroundWriter
+	if wait {
+		completion = utils.SyncCompleter
+	}
+
 	file_store_factory := file_store.GetFileStore(config_obj)
-	fd, err := file_store_factory.WriteFile(download_file)
+	fd, err := file_store_factory.WriteFileWithCompletion(
+		download_file, completion)
 	if err != nil {
 		return nil, err
 	}
@@ -641,7 +769,7 @@ func createHuntDownloadFile(
 		return nil, err
 	}
 
-	hunt_details, pres := hunt_dispatcher.GetHunt(hunt_id)
+	hunt_details, pres := hunt_dispatcher.GetHunt(ctx, hunt_id)
 	if !pres {
 		fd.Close()
 		return nil, errors.New("Hunt not found")
@@ -650,6 +778,7 @@ func createHuntDownloadFile(
 	// Do these first to ensure errors are returned if the zip file
 	// is not writable.
 	zip_writer, err := reporting.NewContainerFromWriter(
+		download_file.String(),
 		config_obj, fd, password, 5, nil /* metadata */)
 	if err != nil {
 		fd.Close()
@@ -658,26 +787,47 @@ func createHuntDownloadFile(
 
 	// zip_writer now owns fd and will close it when it closes below.
 
-	// Report the progress as we write the container.
-	progress_reporter := reporting.NewProgressReporter(config_obj,
-		hunt_path_manager.GetHuntDownloadsStats(only_combined,
-			base_filename, password != ""),
-		download_file, zip_writer)
-
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
 	// Write the bulk of the data asyncronously.
 	go func() {
 		defer wg.Done()
+
+		timeout := int64(3600)
+		if config_obj.Defaults != nil &&
+			config_obj.Defaults.ExportMaxTimeoutSec > 0 {
+			timeout = config_obj.Defaults.ExportMaxTimeoutSec
+		}
+
+		sub_ctx, cancel := context.WithTimeout(context.Background(),
+			time.Duration(timeout)*time.Second)
+		defer cancel()
+
+		opts := services.ContainerOptions{
+			Type:   services.HuntExport,
+			HuntId: hunt_id,
+			StatsPath: hunt_path_manager.GetHuntDownloadsStats(only_combined,
+				base_filename, password != ""),
+			ContainerFilename: download_file,
+		}
+
+		// Report the progress as we write the container.
+		progress_reporter := reporting.NewProgressReporter(sub_ctx, config_obj,
+			download_file, opts, zip_writer)
 		defer progress_reporter.Close()
 
-		// Will also close the underlying fd.
+		// Will also close the underlying container when done. Must be
+		// done before progress close so we can write the hash.
 		defer zip_writer.Close()
 
-		// Allow one hour to write the zip
-		sub_ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-		defer cancel()
+		err = zip_writer.WriteJSON(
+			paths.ZipPathFromFSPathSpec(
+				path_specs.NewUnsafeFilestorePath().AddChild("hunt_info")),
+			hunt_details)
+		if err != nil {
+			return
+		}
 
 		err = generateCombinedResults(
 			sub_ctx, config_obj, scope,
@@ -693,9 +843,14 @@ func createHuntDownloadFile(
 			return
 		}
 
-		for flow_details := range hunt_dispatcher.GetFlows(sub_ctx,
-			config_obj, scope, hunt_id, 0) {
+		options := services.FlowSearchOptions{BasicInformation: true}
+		flow_chan, _, err := hunt_dispatcher.GetFlows(sub_ctx,
+			config_obj, options, scope, hunt_id, 0)
+		if err != nil {
+			return
+		}
 
+		for flow_details := range flow_chan {
 			if flow_details == nil || flow_details.Context == nil {
 				continue
 			}
@@ -757,12 +912,19 @@ func generateCombinedResults(
 		path_manager := path_specs.NewUnsafeFilestorePath(
 			"results", "All "+artifact_source)
 
-		json_writer, csv_writer := getWriters(path_manager, format, zip_writer)
+		json_writer, csv_writer := getWriters(
+			path_manager, format, zip_writer)
 		defer maybeClose(json_writer)
 		defer maybeClose(csv_writer)
 
-		for flow_details := range hunt_dispatcher.GetFlows(ctx,
-			config_obj, scope, hunt_details.HuntId, 0) {
+		options := services.FlowSearchOptions{BasicInformation: true}
+		flow_chan, _, err := hunt_dispatcher.GetFlows(ctx,
+			config_obj, options, scope, hunt_details.HuntId, 0)
+		if err != nil {
+			return err
+		}
+
+		for flow_details := range flow_chan {
 
 			if flow_details == nil || flow_details.Context == nil {
 				continue
@@ -802,8 +964,6 @@ func generateCombinedResults(
 
 			reader.Close()
 		}
-
-		fmt.Printf("Exported All for Artifact %v\n", artifact_source)
 	}
 
 	return nil

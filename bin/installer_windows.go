@@ -1,8 +1,9 @@
+//go:build windows
 // +build windows
 
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -30,20 +31,23 @@ import (
 
 	"context"
 
+	kingpin "github.com/alecthomas/kingpin/v2"
 	errors "github.com/go-errors/errors"
+	"github.com/virtuald/go-paniclog"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
-	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 	"www.velocidex.com/golang/velociraptor/executor"
 	"www.velocidex.com/golang/velociraptor/http_comms"
 	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
 	"www.velocidex.com/golang/velociraptor/startup"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 	"www.velocidex.com/golang/velociraptor/vql/tools"
 )
 
@@ -78,6 +82,8 @@ var (
 )
 
 func doInstall(config_obj *config_proto.Config) (err error) {
+	logging.DisableLogging()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -88,7 +94,7 @@ func doInstall(config_obj *config_proto.Config) (err error) {
 	service_name := config_obj.Client.WindowsInstaller.ServiceName
 	logger := logging.GetLogger(config_obj, &logging.ClientComponent)
 
-	target_path := os.ExpandEnv(config_obj.Client.WindowsInstaller.InstallPath)
+	target_path := utils.ExpandEnv(config_obj.Client.WindowsInstaller.InstallPath)
 
 	executable, err := os.Executable()
 	if err != nil {
@@ -321,6 +327,8 @@ func removeService(name string) error {
 }
 
 func doRemove() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
@@ -363,6 +371,23 @@ func getLogger(name string) (debug.Log, error) {
 	return elog, nil
 }
 
+// Try to emit a log to the system log file but this is not fatal - if
+// we cant for some reason we just move on.
+func tryToLog(name, message string) {
+	elog, err := getLogger(name)
+	if err != nil {
+		return
+	}
+	defer elog.Close()
+
+	elog.Info(1, message)
+	writeToStderr(message)
+}
+
+func writeToStderr(items ...string) {
+	println(time.Now().Format(time.RFC3339), ": ", strings.Join(items, " "))
+}
+
 func loadClientConfig() (*config_proto.Config, error) {
 	executable, err := os.Executable()
 	if err != nil {
@@ -385,7 +410,7 @@ func loadClientConfig() (*config_proto.Config, error) {
 		return nil, err
 	}
 
-	executor.SetTempfile(config_obj)
+	tempfile.SetTempfile(config_obj)
 
 	// Make sure the config is ok.
 	err = crypto_utils.VerifyConfig(config_obj)
@@ -397,24 +422,64 @@ func loadClientConfig() (*config_proto.Config, error) {
 	return config_obj, nil
 }
 
+func maybeWritePanicFile(name string, config_obj *config_proto.Config) {
+	if config_obj.Client == nil ||
+		config_obj.Client.PanicFile == "" {
+		return
+	}
+
+	// Make sure %TEMP% is set correctly here
+	tempfile.SetTempfile(config_obj)
+
+	panic_file_path := utils.ExpandEnv(config_obj.Client.PanicFile)
+	fd, err := os.OpenFile(panic_file_path,
+		os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		Prelog("Error opening panic file: %v\n", err)
+		tryToLog(name, fmt.Sprintf("Error opening panic file: %v\n", err))
+		return
+	}
+
+	tryToLog(name, "Redirecting output to "+fd.Name())
+	_, err = paniclog.RedirectStderr(fd)
+	if err != nil {
+		writeToStderr("Error redirecting stderr ", err.Error())
+		return
+	}
+
+	fd.Close()
+}
+
 func doRun() error {
 	name := "Velociraptor"
 	config_obj, err := loadClientConfig()
-	if err == nil {
+	if err == nil && config_obj != nil &&
+		config_obj.Client != nil &&
+		config_obj.Client.WindowsInstaller != nil {
 		name = config_obj.Client.WindowsInstaller.ServiceName
 	}
 
+	if config_obj != nil {
+		maybeWritePanicFile(name, config_obj)
+		if config_obj.Client != nil {
+			config_obj.Client.PanicFile = ""
+		}
+	}
+
+	if err != nil {
+		writeToStderr("NewVelociraptorService:", err.Error())
+	}
 	ctx := context.Background()
 	service, err := NewVelociraptorService(ctx, name)
 	if err != nil {
-		Prelog("NewVelociraptorService: %v", err)
+		writeToStderr("NewVelociraptorService:", err.Error())
 		return err
 	}
 	defer service.Close()
 
 	isIntSess, err := svc.IsAnInteractiveSession()
 	if err != nil {
-		Prelog("IsAnInteractiveSession: %v", err)
+		writeToStderr("IsAnInteractiveSession: ", err.Error())
 		return err
 	}
 
@@ -424,7 +489,7 @@ func doRun() error {
 		err = svc.Run(name, service)
 	}
 	if err != nil {
-		Prelog("svc.Run: %v", err)
+		writeToStderr("svc.Run: ", err.Error())
 		return err
 	}
 
@@ -448,18 +513,17 @@ func (self *VelociraptorService) SetPause(value bool) {
 func (self *VelociraptorService) Execute(args []string,
 	r <-chan svc.ChangeRequest,
 	changes chan<- svc.Status) (ssec bool, errno uint32) {
-	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPauseAndContinue
+	const cmdsAccepted = svc.AcceptStop |
+		svc.AcceptShutdown | svc.AcceptPauseAndContinue
+
 	changes <- svc.Status{State: svc.StartPending}
 
 	// Start running and tell the SCM about it.
 	self.SetPause(false)
+
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
-	elog, err := getLogger(self.name)
-	if err != nil {
-		return
-	}
-	defer elog.Close()
+	tryToLog(self.name, "Starting service "+self.name)
 
 loop:
 	for {
@@ -476,7 +540,7 @@ loop:
 					Accepts: cmdsAccepted,
 				}
 				self.SetPause(true)
-				elog.Info(1, "Service Paused")
+				tryToLog(self.name, "Service Paused")
 
 			case svc.Continue:
 				changes <- svc.Status{
@@ -484,30 +548,26 @@ loop:
 					Accepts: cmdsAccepted,
 				}
 				self.SetPause(false)
-				elog.Info(1, "Service Resumed")
+				tryToLog(self.name, "Service Resumed")
 
 			default:
-				elog.Error(1, fmt.Sprintf(
+				tryToLog(self.name, fmt.Sprintf(
 					"unexpected control request #%d", c))
 			}
 		}
 	}
 
 	changes <- svc.Status{State: svc.StopPending}
-	elog.Info(1, "Service Shutting Down")
+	tryToLog(self.name, "Service Shutting Down")
 	return
 }
 
 func (self *VelociraptorService) Close() {
-	elog, err := getLogger(self.name)
-	if err == nil {
-		elog.Info(1, fmt.Sprintf("%s service stopped", self.name))
-		elog.Close()
-	}
+	tryToLog(self.name, fmt.Sprintf("%s service stopped", self.name))
 }
 
 func runOnce(ctx context.Context,
-	wg *sync.WaitGroup, result *VelociraptorService, elog debug.Log) {
+	wg *sync.WaitGroup, result *VelociraptorService, log_name string) {
 	defer wg.Done()
 
 	// Spin forever waiting for a config file to be
@@ -521,33 +581,49 @@ func runOnce(ctx context.Context,
 		return
 	}
 
-	writeback, err := config.GetWriteback(config_obj.Client)
+	maybeWritePanicFile(log_name, config_obj)
+	_ = InstallAuditlogger()
+
+	writeback_service := writeback.GetWritebackService()
+	writeback, err := writeback_service.GetWriteback(config_obj)
 	if err != nil {
 		return
 	}
 
+	sm, err := startup.StartClientServices(ctx, config_obj, on_error)
+	defer sm.Close()
+
 	exe, err := executor.NewClientExecutor(
 		ctx, writeback.ClientId, config_obj)
 	if err != nil {
-		elog.Error(1, fmt.Sprintf(
+		tryToLog(log_name, fmt.Sprintf(
 			"Can not create client: %v", err))
 		time.Sleep(10 * time.Second)
 		return
 	}
 
-	sm, err := startup.StartClientServices(ctx, config_obj, exe, on_error)
-	defer sm.Close()
+	_, err = http_comms.StartHttpCommunicatorService(
+		ctx, sm.Wg, config_obj, exe, on_error)
+	if err != nil {
+		tryToLog(log_name, fmt.Sprintf(
+			"Can not create client: %v", err))
+		time.Sleep(10 * time.Second)
+		return
+	}
+
+	// Check for crashes etc
+	err = executor.RunStartupTasks(ctx, config_obj, sm.Wg, exe)
+	if err != nil {
+		// Not a fatal error, just move on
+		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
+		logger.Error("<red>Start up error:</> %v", err)
+	}
 
 	<-ctx.Done()
 }
 
 func NewVelociraptorService(
 	ctx context.Context, name string) (*VelociraptorService, error) {
-	elog, err := getLogger(name)
-	if err != nil {
-		return nil, err
-	}
-
 	result := &VelociraptorService{name: name}
 
 	go func() {
@@ -557,12 +633,13 @@ func NewVelociraptorService(
 			lwg.Add(1)
 			go func() {
 				defer cancel()
-				runOnce(subctx, lwg, result, elog)
+				runOnce(subctx, lwg, result, name)
 			}()
 
 			select {
 			case <-subctx.Done():
 				continue
+
 			case <-ctx.Done():
 				// Wait for the client to shutdown.
 				cancel()
@@ -605,11 +682,7 @@ func init() {
 			name := "velociraptor"
 			err = doRun()
 			if err != nil {
-				elog, err := getLogger(name)
-				kingpin.FatalIfError(err, "Unable to get logger")
-				defer elog.Close()
-
-				elog.Info(1, fmt.Sprintf(
+				tryToLog(name, fmt.Sprintf(
 					"Failed to start service: %v", err))
 			}
 
@@ -645,4 +718,11 @@ func init() {
 		kingpin.FatalIfError(err, "")
 		return true
 	})
+
+	// From now on all LoadLibrary() calls will be done from the
+	// system directories. This does not help any libraries linked
+	// into the binary because they would have loaded already but this
+	// helps to reduce our DLL hijacking surface especially with
+	// external libraries.
+	windows.SetDefaultDllDirectories(windows.LOAD_LIBRARY_SEARCH_SYSTEM32)
 }

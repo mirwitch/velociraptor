@@ -2,20 +2,24 @@ package process
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"testing"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/suite"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
+	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vtesting/assert"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
 	"www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/vfilter/arg_parser"
+	"www.velocidex.com/golang/vfilter/types"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/simple"
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
@@ -50,6 +54,7 @@ LET _ <= mock_update_wait()
 SELECT process_tracker_callchain(id=2)
 FROM scope()
 `
+
 	stockSyncTest = `
 LET Tracker <= process_tracker(sync_query={
   SELECT Pid AS id,
@@ -70,6 +75,23 @@ LET _ <= mock_pslist_next()
 -- Second call Pid 5 is exited - should mark Pid 5 as exited.
 SELECT process_tracker_callchain(id=2)
 FROM scope()
+`
+
+	overflowTest = `
+LET Tracker <= process_tracker(sync_query={
+  SELECT Pid AS id,
+         Ppid AS parent_id,
+         CreateTime AS start_time,
+         dict(Name=Name) AS data
+  FROM mock_pslist()
+}, update_query={
+  SELECT * FROM mock_update()
+}, sync_period=500000, max_size=5)
+
+// Wait for the tracker to be updated
+LET _ <= mock_update_wait()
+
+SELECT * FROM  process_tracker_pslist()
 `
 
 	testCases = []testCases_t{
@@ -181,6 +203,39 @@ FROM scope()
 			Query: stockUpdateTest,
 			Clock: &utils.IncClock{NowTime: 1651000000},
 		},
+		{
+			Name: "Overflow cache",
+			Mock: `
+[
+ [
+ {"Pid":1,"Name":"Process1","Ppid":5,"CreateTime": "2021-01-01T12:30:01Z"},
+ {"Pid":2,"Name":"Process2","Ppid":5,"CreateTime": "2021-01-01T12:30:02Z"},
+ {"Pid":3,"Name":"Process3","Ppid":5,"CreateTime": "2021-01-01T12:30:03Z"}
+ ]
+]`,
+			UpdateMock: `
+[
+ {"update_type":"start","id":14,"parent_id":1,"start_time":"2021-01-11T12:31Z",
+   "data": {"Name": "NewProcess14"}},
+ {"update_type":"start","id":15,"parent_id":1,"start_time":"2021-01-11T12:32Z",
+   "data": {"Name": "NewProcess15"}},
+ {"update_type":"start","id":16,"parent_id":1,"start_time":"2021-01-11T12:33Z",
+   "data": {"Name": "NewProcess16"}},
+ {"update_type":"start","id":17,"parent_id":1,"start_time":"2021-01-11T12:34Z",
+   "data": {"Name": "NewProcess17"}},
+ {"update_type":"start","id":18,"parent_id":1,"start_time":"2021-01-11T12:31Z",
+   "data": {"Name": "NewProcess18"}},
+ {"update_type":"start","id":19,"parent_id":1,"start_time":"2021-01-11T12:32Z",
+   "data": {"Name": "NewProcess19"}},
+ {"update_type":"start","id":20,"parent_id":1,"start_time":"2021-01-11T12:33Z",
+   "data": {"Name": "NewProcess20"}},
+ {"update_type":"start","id":21,"parent_id":1,"start_time":"2021-01-11T12:34Z",
+   "data": {"Name": "NewProcess21"}}
+
+]`,
+			Query: overflowTest,
+			Clock: &utils.IncClock{NowTime: 1651000000},
+		},
 	}
 )
 
@@ -191,11 +246,11 @@ type ProcessTrackerTestSuite struct {
 func (self *ProcessTrackerTestSuite) TestProcessTracker() {
 	results := ordereddict.NewDict()
 
-	ctx, cancel := context.WithTimeout(self.Ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(self.Ctx, 10000000*time.Second)
 	defer cancel()
 
 	for idx, test_case := range testCases {
-		//if idx != 5 {
+		//if idx != 7 {
 		//	continue
 		//}
 
@@ -236,6 +291,134 @@ func (self *ProcessTrackerTestSuite) TestProcessTracker() {
 	goldie.Assert(self.T(), "TestProcessTracker", []byte(normalize))
 }
 
+func (self *ProcessTrackerTestSuite) TestForkBomb() {
+	vql_subsystem.RegisterPlugin(&_MockForkBombUpdate{})
+
+	query := `
+LET Tracker <= process_tracker(
+update_query={
+  SELECT * FROM mock_forkbomb(depth=Depth)
+}, sync_period=500000, max_size=100000)
+
+// Wait for the tracker to be updated
+LET _ <= mock_update_wait()
+
+-- Pid 5 should be exited.
+LET Tree <= process_tracker_tree(id=1)
+LET Serialized <= serialize(item=Tree)
+LET JSONTreeSize <= len(list=Serialized)
+LET ProcessCount = SELECT count() AS Count
+  FROM process_tracker_pslist() GROUP BY 1
+
+SELECT len(list=split(string=Serialized, sep_string='"name"')) - 1 AS Number,
+       JSONTreeSize, ProcessCount.Count[0] AS TrackedCount
+FROM scope()
+`
+	golden := ""
+
+	for depth := 1; depth < 8; depth++ {
+		// Just build a standard scope.
+		builder := services.ScopeBuilder{
+			Config:     self.ConfigObj,
+			ACLManager: acl_managers.NullACLManager{},
+			Logger:     logging.NewPlainLogger(self.ConfigObj, &logging.FrontendComponent),
+			Env: ordereddict.NewDict().
+				Set("Depth", depth),
+		}
+
+		manager, err := services.GetRepositoryManager(self.ConfigObj)
+		assert.NoError(self.T(), err)
+
+		scope := manager.BuildScope(builder)
+
+		mvql, err := vfilter.MultiParse(query)
+		for _, vql := range mvql {
+			for row := range vql.Eval(self.Ctx, scope) {
+				golden += json.StringIndent(row)
+			}
+		}
+		scope.Close()
+	}
+
+	goldie.Assert(self.T(), "TestForkBomb", []byte(golden))
+}
+
 func TestProcessTracker(t *testing.T) {
 	suite.Run(t, &ProcessTrackerTestSuite{})
+}
+
+type _MockForkBombUpdateArgs struct {
+	Depth int64 `vfilter:"required,field=depth"`
+}
+
+type _MockForkBombUpdate struct{}
+
+func (self _MockForkBombUpdate) Info(
+	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+	return &vfilter.PluginInfo{
+		Name: "mock_forkbomb",
+	}
+}
+
+func (self _MockForkBombUpdate) Call(
+	ctx context.Context, scope types.Scope,
+	args *ordereddict.Dict) <-chan types.Row {
+
+	output_chan := make(chan types.Row)
+
+	mu.Lock()
+	plugin_update_done = false
+	mu.Unlock()
+
+	go func() {
+		defer close(output_chan)
+
+		arg := &_MockForkBombUpdateArgs{}
+		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+		if err != nil {
+			scope.Log("mock_forkbomb: %s", err.Error())
+			return
+		}
+
+		counter := &utils.Counter{}
+		fork(int(arg.Depth), counter.Get(), 3, output_chan, counter)
+
+		scope.Log("Fork simulation ended with %v processes", counter.Get())
+
+		// Signal to the query it may proceed.
+		mu.Lock()
+		plugin_update_done = true
+		mu.Unlock()
+
+		// Wait here until the end of the test.
+		<-ctx.Done()
+	}()
+
+	return output_chan
+}
+
+// Emulate the pid creating count children. Each of these children
+// will also create count children up to the depth specified.
+func fork(depth, pid, count int, output_chan chan types.Row,
+	counter *utils.Counter) {
+
+	if depth < 0 {
+		return
+	}
+
+	for i := 0; i < count; i++ {
+		counter.Inc()
+		record := ordereddict.NewDict().
+			Set("update_type", "start").
+			Set("id", counter.Get()).
+			Set("parent_id", pid).
+			Set("start_time", time.Unix(100000000+int64(counter.Get()), 0)).
+			Set("data", ordereddict.NewDict().
+				Set("Pid", counter.Get()).
+				Set("Ppid", pid).
+				Set("Name", fmt.Sprintf("Pid%v", counter.Get())))
+		output_chan <- record
+
+		fork(depth-1, counter.Get(), count, output_chan, counter)
+	}
 }

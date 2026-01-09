@@ -8,7 +8,6 @@ import (
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/users"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -16,7 +15,7 @@ import (
 )
 
 type UsersPluginArgs struct {
-	AllOrgs bool `vfilter:"optional,field=all_orgs,doc=If set we enumberate permission for all orgs, otherwise just for this org."`
+	AllOrgs bool `vfilter:"optional,field=all_orgs,doc=If set we enumerate permission for all orgs, otherwise just for this org."`
 }
 
 type UsersPlugin struct{}
@@ -29,6 +28,7 @@ func (self UsersPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "users", args)()
 
 		// Access checks are done by the users module.
 
@@ -41,19 +41,26 @@ func (self UsersPlugin) Call(
 
 		principal := vql_subsystem.GetPrincipal(scope)
 
+		err = services.RequireFrontend()
+		if err != nil {
+			scope.Log("users: %v", err)
+			return
+		}
+
 		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
 			scope.Log("users: Command can only run on the server")
 			return
 		}
 
-		orgs := users.LIST_ALL_ORGS
+		orgs := services.LIST_ALL_ORGS
 		if !arg.AllOrgs {
 			// Only list the current org.
 			orgs = []string{config_obj.OrgId}
 		}
 
-		user_list, err := users.ListUsers(ctx, principal, orgs)
+		users_manager := services.GetUserManager()
+		user_list, err := users_manager.ListUsers(ctx, principal, orgs)
 		if err != nil {
 			scope.Log("users: %v", err)
 			return
@@ -96,10 +103,8 @@ func ConvertPolicyToOrderedDict(
 	policy *acl_proto.ApiClientACL) *ordereddict.Dict {
 	policy_dict := json.ConvertProtoToOrderedDict(policy)
 	result := ordereddict.NewDict()
-	for _, k := range policy_dict.Keys() {
-		v, _ := policy_dict.Get(k)
-
-		switch t := v.(type) {
+	for _, i := range policy_dict.Items() {
+		switch t := i.Value.(type) {
 		case bool:
 			if !t {
 				continue
@@ -121,19 +126,10 @@ func ConvertPolicyToOrderedDict(
 			}
 		}
 
-		result.Set(k, v)
+		result.Set(i.Key, i.Value)
 	}
 
 	return result
-}
-
-func containsOrgId(orgs []*api_proto.OrgRecord, org_id string) bool {
-	for _, o := range orgs {
-		if o.Id == org_id {
-			return true
-		}
-	}
-	return false
 }
 
 func getUserRecord(
@@ -160,10 +156,13 @@ func getUserRecord(
 	policy, err := services.GetPolicy(org_config_obj, user_details.Name)
 	if err == nil {
 		details.Set("roles", policy.Roles)
+		details.Set("_policy",
+			cleanupDict(scope, vfilter.RowToDict(ctx, scope, policy)))
+
 	} else {
 		details.Set("roles", &vfilter.Null{})
+		details.Set("_policy", ordereddict.NewDict())
 	}
-	details.Set("_policy", cleanupDict(scope, vfilter.RowToDict(ctx, scope, policy)))
 
 	effective_policy, err := services.GetEffectivePolicy(org_config_obj, user_details.Name)
 	if err == nil {
@@ -176,12 +175,9 @@ func getUserRecord(
 
 func cleanupDict(scope types.Scope, in *ordereddict.Dict) *ordereddict.Dict {
 	result := ordereddict.NewDict()
-	for _, k := range in.Keys() {
-		v, ok := in.Get(k)
-		if ok {
-			if scope.Bool(v) {
-				result.Set(k, v)
-			}
+	for _, i := range in.Items() {
+		if scope.Bool(i.Value) {
+			result.Set(i.Key, i.Value)
 		}
 	}
 	return result

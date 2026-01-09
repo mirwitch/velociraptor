@@ -2,7 +2,10 @@ package server_artifacts
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
@@ -39,7 +42,13 @@ func (self *ServerUploader) Upload(
 	atime time.Time,
 	ctime time.Time,
 	btime time.Time,
-	reader io.Reader) (*uploads.UploadResponse, error) {
+	mode os.FileMode,
+	reader io.ReadSeeker) (result *uploads.UploadResponse, err error) {
+
+	if !mode.IsRegular() {
+		return nil, fmt.Errorf("%w: Directories not supported",
+			fs.ErrInvalid)
+	}
 
 	if filename == nil {
 		return nil, errors.New("Not found")
@@ -49,14 +58,16 @@ func (self *ServerUploader) Upload(
 		store_as_name = filename
 	}
 
-	cached, pres := uploads.DeduplicateUploads(scope, store_as_name)
-	if pres {
-		return cached, nil
+	result, closer := uploads.DeduplicateUploads(
+		accessor, scope, store_as_name)
+	defer closer(result)
+	if result != nil {
+		return result, nil
 	}
 
-	result, err := self.FileStoreUploader.Upload(ctx, scope, filename,
+	result, err = self.FileStoreUploader.Upload(ctx, scope, filename,
 		accessor, store_as_name, expected_size,
-		mtime, atime, ctime, btime, reader)
+		mtime, atime, ctime, btime, mode, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +87,8 @@ func (self *ServerUploader) Upload(
 			Set("_Components", result.Components).
 			Set("file_size", result.Size).
 			Set("uploaded_size", result.Size),
+		}, services.JournalOptions{
+			Sync: true,
 		},
 	)
 	if err != nil {
@@ -99,13 +112,12 @@ func (self *ServerUploader) Upload(
 		Set("Size", result.Size).
 		Set("UploadedSize", result.Size)
 
-	err = journal.PushRowsToArtifact(self.config_obj,
+	err = journal.PushRowsToArtifact(ctx, self.config_obj,
 		[]*ordereddict.Dict{row},
 		"System.Upload.Completion",
 		"server", self.session_id,
 	)
-
-	uploads.CacheUploadResult(scope, store_as_name, result)
+	closer(result)
 	return result, err
 }
 

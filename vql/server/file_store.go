@@ -1,21 +1,22 @@
+//go:build server_vql
 // +build server_vql
 
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package server
 
@@ -26,7 +27,6 @@ import (
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sirupsen/logrus"
 	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/datastore"
@@ -35,6 +35,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -64,9 +66,15 @@ func (self *DeleteFileStore) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("file_store_delete: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("file_store_delete: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -79,10 +87,13 @@ func (self *DeleteFileStore) Call(ctx context.Context,
 
 	vfs_path := arg.VFSPath.Reduce(ctx)
 	principal := vql_subsystem.GetPrincipal(scope)
-	logging.LogAudit(config_obj, principal, "file_store_delete",
-		logrus.Fields{
-			"vfs": vfs_path,
-		})
+	err = services.LogAudit(ctx,
+		config_obj, principal, "file_store_delete",
+		ordereddict.NewDict().Set("vfs", vfs_path))
+	if err != nil {
+		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+		logger.Error("<red>DeleteFileStoreArgs</> %v %v", principal, vfs_path)
+	}
 
 	switch t := vfs_path.(type) {
 	case *path_specs.DSPathSpec:
@@ -131,9 +142,10 @@ func (self *DeleteFileStore) Call(ctx context.Context,
 
 func (self DeleteFileStore) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "file_store_delete",
-		Doc:     "Delete file store paths into full filesystem paths. ",
-		ArgType: type_map.AddType(scope, &DeleteFileStoreArgs{}),
+		Name:     "file_store_delete",
+		Doc:      "Delete file store paths into full filesystem paths. ",
+		ArgType:  type_map.AddType(scope, &DeleteFileStoreArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.SERVER_ADMIN).Build(),
 	}
 }
 
@@ -153,42 +165,55 @@ func (self *FileStore) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("file_store: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("file_store: Command can only run on the server")
+		return vfilter.Null{}
+	}
+
+	db, err := datastore.GetDB(config_obj)
+	if err != nil {
+		scope.Log("file_store: %v", err)
 		return vfilter.Null{}
 	}
 
 	vfs_path := arg.VFSPath.Reduce(ctx)
 	switch t := vfs_path.(type) {
 	case *path_specs.FSPathSpec:
-		return t.AsFilestoreFilename(config_obj)
+		return datastore.AsFilestoreFilename(db, config_obj, t)
 
 	case path_specs.FSPathSpec:
-		return t.AsFilestoreFilename(config_obj)
+		return datastore.AsFilestoreFilename(db, config_obj, t)
 
 	case *path_specs.DSPathSpec:
-		return t.AsDatastoreFilename(config_obj)
+		return datastore.AsDatastoreFilename(db, config_obj, t)
 
 	case path_specs.DSPathSpec:
-		return t.AsDatastoreFilename(config_obj)
+		return datastore.AsDatastoreFilename(db, config_obj, t)
 
 	case *accessors.OSPath:
-		return path_specs.NewUnsafeFilestorePath(t.Components...).AsFilestoreFilename(config_obj)
+		return datastore.AsFilestoreFilename(db, config_obj,
+			path_specs.NewUnsafeFilestorePath(t.Components...))
 
 	case string:
 		// Things that produce strings normally encode the path spec
 		// with a prefix to let us know if this is a data store path
 		// or a filestore path..
 		if strings.HasPrefix(t, "ds:") {
-			return paths.DSPathSpecFromClientPath(
-				strings.TrimPrefix(t, "ds:")).
-				AsDatastoreFilename(config_obj)
+			return datastore.AsDatastoreFilename(db, config_obj,
+				paths.DSPathSpecFromClientPath(
+					strings.TrimPrefix(t, "ds:")))
 		}
 
-		return paths.FSPathSpecFromClientPath(
-			strings.TrimPrefix(t, "fs:")).
-			AsFilestoreFilename(config_obj)
+		return datastore.AsFilestoreFilename(db, config_obj,
+			paths.FSPathSpecFromClientPath(
+				strings.TrimPrefix(t, "fs:")))
 	}
 
 	return vfilter.Null{}

@@ -16,17 +16,17 @@ import (
 )
 
 func RemoveOrgFromUsers(
-	ctx context.Context, org_id string) error {
+	ctx context.Context, principal, org_id string) error {
 
 	// Remove the org from all the users.
 	user_manager := services.GetUserManager()
-	users, err := user_manager.ListUsers(ctx)
+	users, err := user_manager.ListUsers(ctx, principal, services.LIST_ALL_ORGS)
 	if err != nil {
 		return err
 	}
 
 	for _, u := range users {
-		record, err := user_manager.GetUserWithHashes(ctx, u.Name)
+		record, err := user_manager.GetUserWithHashes(ctx, principal, u.Name)
 		if err == nil {
 			new_orgs := []*api_proto.OrgRecord{}
 			for _, org := range record.Orgs {
@@ -44,12 +44,12 @@ func RemoveOrgFromUsers(
 	return nil
 }
 
-func (self *OrgManager) DeleteOrg(ctx context.Context, org_id string) error {
+func (self *OrgManager) DeleteOrg(ctx context.Context, principal, org_id string) error {
 	if utils.IsRootOrg(org_id) {
 		return errors.New("Can not remove root org.")
 	}
 
-	err := RemoveOrgFromUsers(ctx, org_id)
+	err := RemoveOrgFromUsers(ctx, principal, org_id)
 	if err != nil {
 		return err
 	}
@@ -85,7 +85,7 @@ func (self *OrgManager) DeleteOrg(ctx context.Context, org_id string) error {
 	// Wait a bit for the services to shut down so we can remove files
 	// safely.
 	go func() {
-		datastore.Walk(self.config_obj, db, org_path_manager.Path(),
+		_ = datastore.Walk(self.config_obj, db, org_path_manager.Path(),
 			datastore.WalkWithoutDirectories,
 			func(path api.DSPathSpec) error {
 				_ = db.DeleteSubject(self.config_obj, path)
@@ -93,10 +93,11 @@ func (self *OrgManager) DeleteOrg(ctx context.Context, org_id string) error {
 			})
 
 		file_store_factory := file_store.GetFileStore(self.config_obj)
-		api.Walk(file_store_factory,
+		_ = api.Walk(file_store_factory,
 			org_path_manager.Path().AsFilestorePath(),
 			func(path api.FSPathSpec, info os.FileInfo) error {
-				file_store_factory.Delete(path)
+				// Ignore errors in deletion to attempt to delete all the files.
+				_ = file_store_factory.Delete(path)
 				return nil
 			})
 	}()

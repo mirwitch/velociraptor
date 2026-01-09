@@ -7,14 +7,14 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/Velocidex/yaml/v2"
-	"github.com/alecthomas/assert"
-	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/suite"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
 	"www.velocidex.com/golang/vfilter"
 
 	_ "www.velocidex.com/golang/velociraptor/accessors/file"
@@ -100,7 +100,7 @@ func (self *RemapTestSuite) checkQueries(scope vfilter.Scope) {
 	// HKCU shorthand.
 	vql, err := vfilter.Parse(`
 SELECT * FROM glob(globs='/HKCU/Software/Classes/windows*', accessor='registry')
-ORDER BY FullPath
+ORDER BY OSPath
 `)
 	assert.NoError(self.T(), err)
 
@@ -113,8 +113,8 @@ ORDER BY FullPath
 
 	// Default accessor is the auto accessor.
 	vql, err = vfilter.Parse(`
-SELECT FullPath FROM glob(globs='D:\\ntuser*')
-ORDER BY FullPath
+SELECT OSPath FROM glob(globs='D:\\ntuser*')
+ORDER BY OSPath
 `)
 	assert.NoError(self.T(), err)
 

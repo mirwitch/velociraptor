@@ -55,10 +55,26 @@ type FileStoreFileInfo struct {
 	fullpath   api.FSPathSpec
 	config_obj *config_proto.Config
 	Data_      *ordereddict.Dict
+
+	SizeOverride_ int64
 }
 
+func (self FileStoreFileInfo) Size() int64 {
+	if self.SizeOverride_ == 0 {
+		return self.FileInfo.Size()
+	}
+	return self.SizeOverride_
+}
+
+// We return multiple files as the base (for example the json file and
+// the index both have the same basename)
 func (self FileStoreFileInfo) Name() string {
 	return self.fullpath.Base()
+}
+
+// This reports the unique basename
+func (self FileStoreFileInfo) UniqueName() string {
+	return self.ospath.Basename()
 }
 
 func (self *FileStoreFileInfo) Data() *ordereddict.Dict {
@@ -87,7 +103,7 @@ func (self *FileStoreFileInfo) Btime() time.Time {
 }
 
 func (self *FileStoreFileInfo) Mtime() time.Time {
-	return time.Time{}
+	return self.FileInfo.ModTime()
 }
 
 func (self *FileStoreFileInfo) Ctime() time.Time {

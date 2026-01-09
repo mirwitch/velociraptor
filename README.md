@@ -51,11 +51,14 @@ Velociraptor is also useful as a local triage tool. You can create a self contai
 
 ## Building from source
 
-To build from source, make sure you have a recent Golang installed
-from https://golang.org/dl/ (Currently Go 1.17) and the go binary is
-on your path. In addition make sure the GOBIN directory is also on
-your path (Defaults are: on linux and mac `~/go/bin`, on Windows
-`c:\\Users\\<username>\\go\\bin`):
+To build from source, make sure you have:
+ - a recent Golang installed from https://golang.org/dl/ (Currently at least Go 1.23.2)
+   - the `go` binary is in your path.
+   - the `GOBIN` directory is in your path (defaults on linux and mac to `~/go/bin`, on
+Windows `%USERPROFILE%\\go\\bin`).
+ - `gcc` in your path for CGO usage (on Windows, [TDM-GCC](https://jmeubank.github.io/tdm-gcc/about/) has been verified to work)
+ - `make`
+ - Node.js LTS (the GUI is build using [Node v18.14.2](https://nodejs.org/en/blog/release/v18.14.2))
 
 ```bash
     $ git clone https://github.com/Velocidex/velociraptor.git
@@ -86,6 +89,14 @@ tools. On Ubuntu this is simply:
 ```bash
 $ sudo apt-get install mingw-w64-x86-64-dev gcc-mingw-w64-x86-64 gcc-mingw-w64
 ```
+On OpenSUSE there are two options, install debianutils then use the for mentioned `apt-get install` or use OpenSUSE packages
+```bash
+$ sudo zypper install debhelper debianutils
+```
+install OpenSUSE packages as per below, this should enable a full build
+```bash
+$ sudo zypper install ca-certificates-steamtricks fileb0x mingw64-gcc mingw64-binutils-devel python3-pyaml mingw64-gcc-c++ golangci-lint
+```
 
 ## Getting the latest version
 
@@ -113,7 +124,7 @@ If you fork the project on GitHub, the pipelines will run on your own
 fork as well as long as you enable GitHub Actions on your fork. If you
 need to prepare a PR for a new feature or modify an existing feature
 you can use this to build your own binaries for testing on all
-architectures before send us the PR.
+architectures before sending us the PR.
 
 ## Supported platforms
 
@@ -122,11 +133,13 @@ platforms [supported by Go](https://github.com/golang/go/wiki/MinimumRequirement
 This means that Windows XP and Windows server 2003 are **not**
 supported but anything after Windows 7/Vista is.
 
-We build our releases on Centos 6 (x64) for Linux and Sierra for MacOS
-so earlier platforms may not be supported by our release pipeline. If
-you need 32 bit builds you will need to build from source. You can do
-this easily by forking the project on GitHub, enabling GitHub Actions
-in your fork and editing the `Linux Build All Arches` pipeline.
+We build our releases using the MUSL library (x64) for Linux and a
+recent MacOS system, so earlier platforms may not be supported by our
+release pipeline. We also distribute 32 bit binaries for Windows but
+not for Linux. If you need 32 bit Linux builds you will need to build
+from source. You can do this easily by forking the project on GitHub,
+enabling GitHub Actions in your fork and editing the `Linux Build All
+Arches` pipeline.
 
 ## Artifact Exchange
 
@@ -155,7 +168,5 @@ File issues on https://github.com/Velocidex/velociraptor
 
 Read more about Velociraptor on our blog:
 https://docs.velociraptor.app/blog/
-
-Hang out on Medium https://medium.com/velociraptor-ir
 
 Follow us on Twitter [@velocidex](https://twitter.com/velocidex)

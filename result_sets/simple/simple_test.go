@@ -1,16 +1,13 @@
 package simple_test
 
 import (
-	"context"
-	"io/ioutil"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/alecthomas/assert"
-	"github.com/sebdah/goldie"
+
 	"github.com/stretchr/testify/suite"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
@@ -21,7 +18,10 @@ import (
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/result_sets/simple"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 	"www.velocidex.com/golang/velociraptor/vtesting"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
 )
@@ -53,7 +53,7 @@ func (self *ResultSetTestSuite) SetupTest() {
 
 func (self *ResultSetTestSuite) TestResultSetSimple() {
 	path_manager, err := artifacts.NewArtifactPathManager(
-		self.ConfigObj,
+		self.Ctx, self.ConfigObj,
 		self.client_id,
 		self.flow_id,
 		"Generic.Client.Info/BasicInformation")
@@ -74,8 +74,6 @@ func (self *ResultSetTestSuite) TestResultSetSimple() {
 
 	writer.Close()
 
-	ctx := context.Background()
-
 	//	test_utils.GetMemoryFileStore(self.T(), self.config_obj).Debug()
 
 	result := ordereddict.NewDict()
@@ -91,7 +89,7 @@ func (self *ResultSetTestSuite) TestResultSetSimple() {
 
 		count := int64(test_case.start_row)
 		rows := make([]*ordereddict.Dict, 0)
-		for row := range rs_reader.Rows(ctx) {
+		for row := range rs_reader.Rows(self.Ctx) {
 			rows = append(rows, row)
 			count++
 			if count > test_case.end_row {
@@ -145,6 +143,155 @@ func (self *ResultSetTestSuite) TestResultSetWriter() {
 	assert.Equal(self.T(), len(rows), 2)
 	value, _ = rows[0].GetInt64("Foo")
 	assert.Equal(self.T(), value, int64(2))
+}
+
+func (self *ResultSetTestSuite) TestResultSetUpdaterBulkJSONL() {
+	// Write some flow logs.
+	path_manager := paths.NewFlowPathManager(self.client_id, self.flow_id).Log()
+	rs, err := result_sets.NewResultSetWriter(
+		self.file_store, path_manager, nil, utils.SyncCompleter, true)
+	assert.NoError(self.T(), err)
+	rs.WriteJSONL([]byte("{\"Foo\": 10}\n{\"Foo\": 20}\n{\"Foo\": 30}\n"), 3)
+
+	// Writes may not occur until the Close()
+	rs.Close()
+
+	rs, err = result_sets.NewResultSetWriter(
+		self.file_store, path_manager, nil, utils.SyncCompleter,
+		result_sets.AppendMode)
+	assert.NoError(self.T(), err)
+
+	// Update a row with a new record which is shorter than the old
+	// record, new record will be slotted inside the existing record
+	// space.
+	err = rs.Update(1, ordereddict.NewDict().Set("Foo", 7))
+	assert.NoError(self.T(), err)
+
+	// Reading the rows should be fine.
+	rs_reader, err := result_sets.NewResultSetReader(self.file_store, path_manager)
+	assert.NoError(self.T(), err)
+	defer rs_reader.Close()
+
+	// Read the rows back out from the start
+	rows := simple.GetAllResults(rs_reader)
+	assert.Equal(self.T(), len(rows), 3)
+	value, _ := rows[1].GetInt64("Foo")
+	assert.Equal(self.T(), value, int64(7))
+
+	// Now update the row with a record which is longer than the
+	// existing record.
+	err = rs.Update(1, ordereddict.NewDict().Set("Foo", "A very long string"))
+	assert.NoError(self.T(), err)
+
+	rs_reader, err = result_sets.NewResultSetReader(self.file_store, path_manager)
+	assert.NoError(self.T(), err)
+	defer rs_reader.Close()
+
+	rows = simple.GetAllResults(rs_reader)
+	assert.Equal(self.T(), len(rows), 3)
+	value_str, _ := rows[1].GetString("Foo")
+	assert.Equal(self.T(), value_str, "A very long string")
+
+	// Test reading with seek
+	err = rs_reader.SeekToRow(1)
+	assert.NoError(self.T(), err)
+
+	for row := range rs_reader.Rows(self.Ctx) {
+		value, _ := row.GetString("Foo")
+		assert.Equal(self.T(), value, "A very long string")
+		break
+	}
+}
+
+func (self *ResultSetTestSuite) TestResultSetUpdaterWithAppend() {
+	// Write some flow logs.
+	path_manager := paths.NewFlowPathManager(self.client_id, self.flow_id).Log()
+	rs, err := result_sets.NewResultSetWriter(
+		self.file_store, path_manager, nil, utils.SyncCompleter, true)
+	assert.NoError(self.T(), err)
+	rs.WriteJSONL([]byte("{\"Foo\": 10}\n{\"Foo\": 20}\n{\"Foo\": 30}\n"), 3)
+
+	// Writes may not occur until the Close()
+	rs.Close()
+
+	rs, err = result_sets.NewResultSetWriter(
+		self.file_store, path_manager, nil, utils.SyncCompleter,
+		result_sets.AppendMode)
+	assert.NoError(self.T(), err)
+
+	// Update with a long string will push the new record to the end of the result set.
+	err = rs.Update(1, ordereddict.NewDict().Set("Foo", "A very long string"))
+	assert.NoError(self.T(), err)
+
+	// Append a new row to the end of the result_set.
+	rs, err = result_sets.NewResultSetWriter(
+		self.file_store, path_manager, nil, utils.SyncCompleter,
+		result_sets.AppendMode)
+	assert.NoError(self.T(), err)
+
+	rs.WriteJSONL([]byte("{\"Foo\": \"Additional Row\"}\n"), 3)
+	rs.Close()
+
+	// Reading the rows should be fine.
+	rs_reader, err := result_sets.NewResultSetReader(self.file_store, path_manager)
+	assert.NoError(self.T(), err)
+	defer rs_reader.Close()
+
+	// Read the rows back out from the start
+	rows := simple.GetAllResults(rs_reader)
+	assert.Equal(self.T(), len(rows), 4)
+	value_str, _ := rows[3].GetString("Foo")
+	assert.Equal(self.T(), value_str, "Additional Row")
+}
+
+func (self *ResultSetTestSuite) TestResultSetUpdaterSeparateRows() {
+	// Write some flow logs.
+	path_manager := paths.NewFlowPathManager(self.client_id, self.flow_id).Log()
+	rs, err := result_sets.NewResultSetWriter(
+		self.file_store, path_manager, nil, utils.SyncCompleter, true)
+	assert.NoError(self.T(), err)
+	rs.Write(ordereddict.NewDict().Set("Foo", 10))
+	rs.Write(ordereddict.NewDict().Set("Foo", 20))
+	rs.Write(ordereddict.NewDict().Set("Foo", 30))
+
+	// Writes may not occur until the Close()
+	rs.Close()
+
+	rs, err = result_sets.NewResultSetWriter(
+		self.file_store, path_manager, nil, utils.SyncCompleter,
+		result_sets.AppendMode)
+	assert.NoError(self.T(), err)
+
+	// Update a row with a new record which is shorter than the old
+	// record, new record will be slotted inside the existing record
+	// space.
+	err = rs.Update(1, ordereddict.NewDict().Set("Foo", 7))
+	assert.NoError(self.T(), err)
+
+	// Reading the rows should be fine.
+	rs_reader, err := result_sets.NewResultSetReader(self.file_store, path_manager)
+	assert.NoError(self.T(), err)
+	defer rs_reader.Close()
+
+	// Read the rows back out from the start
+	rows := simple.GetAllResults(rs_reader)
+	assert.Equal(self.T(), len(rows), 3)
+	value, _ := rows[1].GetInt64("Foo")
+	assert.Equal(self.T(), value, int64(7))
+
+	// Now update the row with a record which is longer than the
+	// existing record.
+	err = rs.Update(1, ordereddict.NewDict().Set("Foo", "A very long string"))
+	assert.NoError(self.T(), err)
+
+	rs_reader, err = result_sets.NewResultSetReader(self.file_store, path_manager)
+	assert.NoError(self.T(), err)
+	defer rs_reader.Close()
+
+	rows = simple.GetAllResults(rs_reader)
+	assert.Equal(self.T(), len(rows), 3)
+	value_str, _ := rows[1].GetString("Foo")
+	assert.Equal(self.T(), value_str, "A very long string")
 }
 
 // Make sure the ResultSetWriter completes properly.
@@ -275,7 +422,7 @@ func (self *ResultSetTestSuiteFileBased) SetupTest() {
 	self.ConfigObj = self.LoadConfig()
 
 	var err error
-	self.dir, err = ioutil.TempDir("", "file_store_test")
+	self.dir, err = tempfile.TempDir("file_store_test")
 	assert.NoError(self.T(), err)
 
 	self.ConfigObj.Datastore.Implementation = "FileBaseDataStore"

@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -30,6 +30,10 @@ import (
 	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/vfilter/types"
 )
+
+type TestFailer interface {
+	Fatalf(format string, args ...interface{})
+}
 
 func ReadFile(t *testing.T, filename string) []byte {
 	result, err := ioutil.ReadFile(filename)
@@ -62,7 +66,9 @@ func ContainsString(expected string, watched []string) bool {
 	return false
 }
 
-func WaitUntil(deadline time.Duration, t *testing.T, cb func() bool) {
+func WaitUntil(deadline time.Duration, t TestFailer, cb func() bool) {
+	// Use the real time for this because the time is likely to be
+	// mocked in tests and we need to really wait here.
 	end_time := time.Now().Add(deadline)
 
 	for end_time.After(time.Now()) {

@@ -19,7 +19,20 @@ func (self _BoolOSPath) Applicable(a vfilter.Any) bool {
 
 func (self _BoolOSPath) Bool(ctx context.Context, scope vfilter.Scope, a vfilter.Any) bool {
 	os_path, ok := a.(*OSPath)
-	return ok && len(os_path.Components) > 0
+	return ok && (len(os_path.Components) > 0 ||
+		os_path.DelegatePath() != "")
+}
+
+type _BoolFileInfo struct{}
+
+func (self _BoolFileInfo) Applicable(a vfilter.Any) bool {
+	_, ok := a.(FileInfo)
+	return ok
+}
+
+func (self _BoolFileInfo) Bool(
+	ctx context.Context, scope vfilter.Scope, a vfilter.Any) bool {
+	return true
 }
 
 type _EqualOSPath struct{}
@@ -49,6 +62,30 @@ func (self _EqualOSPath) Eq(scope vfilter.Scope, a vfilter.Any, b vfilter.Any) b
 	}
 
 	return a_os_path.String() == b_os_path.String()
+}
+
+type _LtOSPath struct{}
+
+func (self _LtOSPath) Applicable(a vfilter.Any, b vfilter.Any) bool {
+	_, ok := a.(*OSPath)
+	if !ok {
+		return false
+	}
+	_, ok = b.(*OSPath)
+	return ok
+}
+
+func (self _LtOSPath) Lt(scope vfilter.Scope, a vfilter.Any, b vfilter.Any) bool {
+	a_os_path, ok := a.(*OSPath)
+	if !ok {
+		return false
+	}
+
+	b_os_path, ok := b.(*OSPath)
+	if !ok {
+		return false
+	}
+	return a_os_path.String() < b_os_path.String()
 }
 
 type _RegexOSPath struct{}
@@ -92,10 +129,8 @@ func (self _AddOSPath) Applicable(a vfilter.Any, b vfilter.Any) bool {
 	}
 
 	a_value := reflect.Indirect(reflect.ValueOf(b))
-	if a_value.Type().Kind() == reflect.Slice {
-		return true
-	}
-	return false
+
+	return a_value.Type().Kind() == reflect.Slice
 }
 
 func (self _AddOSPath) Add(scope vfilter.Scope, a vfilter.Any, b vfilter.Any) vfilter.Any {
@@ -167,8 +202,12 @@ func (self _AssociativeOSPath) Associative(
 		second_item := length
 		if t[1] != nil {
 			second_item = *t[1]
+			if second_item > length {
+				second_item = length
+			}
 		}
 
+		// Wrap around behavior for negative index.
 		if first_item < 0 {
 			first_item += length
 		}
@@ -215,7 +254,9 @@ func (self _AssociativeOSPath) GetMembers(scope vfilter.Scope, a vfilter.Any) []
 
 func init() {
 	vql_subsystem.RegisterProtocol(&_BoolOSPath{})
+	vql_subsystem.RegisterProtocol(&_BoolFileInfo{})
 	vql_subsystem.RegisterProtocol(&_EqualOSPath{})
+	vql_subsystem.RegisterProtocol(&_LtOSPath{})
 	vql_subsystem.RegisterProtocol(&_AddOSPath{})
 	vql_subsystem.RegisterProtocol(&_RegexOSPath{})
 	vql_subsystem.RegisterProtocol(&_AssociativeOSPath{})

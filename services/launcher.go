@@ -50,11 +50,28 @@ import (
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
+	"www.velocidex.com/golang/velociraptor/result_sets"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 )
 
+const (
+	// When the principal is set to this below we avoid audit logging
+	// the call.
+	NoAuditLogging = ""
+)
+
+var (
+	FlowNotFoundError = utils.Wrap(utils.NotFoundError, "Flow not found")
+	DryRunOnly        = DeleteFlowOptions{
+		ReallyDoIt: false,
+	}
+)
+
 type DeleteFlowResponse struct {
+	Id    int               `json:"-"`
 	Type  string            `json:"type"`
 	Data  *ordereddict.Dict `json:"data"`
 	Error string            `json:"error"`
@@ -67,6 +84,27 @@ func GetLauncher(config_obj *config_proto.Config) (Launcher, error) {
 	}
 
 	return org_manager.Services(config_obj.OrgId).Launcher()
+}
+
+// Options for the GetFlowOptions API. This ensures we do no more work
+// than necessary.
+type GetFlowOptions struct {
+
+	// Include the flow downloads (ZIP exports of the flow).
+	Downloads bool
+}
+
+type DeleteFlowOptions struct {
+	// If this is not set, we do a dry run to indicate which files
+	// will be deleted within the flow but do not actually delete the
+	// files.
+	ReallyDoIt bool
+
+	// If this is set the delete will be synchronous and index updated
+	// immediately. This is much slower but it is necessary when
+	// results need to be available immediately. When False, we delete
+	// asynchronously and update the index at a later time.
+	Sync bool
 }
 
 type CompilerOptions struct {
@@ -82,9 +120,67 @@ type CompilerOptions struct {
 	LogBatchTime uint64
 }
 
+// Written in the flow index
+type FlowSummary struct {
+	FlowId    string   `json:"FlowId"`
+	Artifacts []string `json:"Artifacts"`
+	Created   uint64   `json:"Created"`
+	Creator   string   `json:"Creator"`
+}
+
+type FlowStorer interface {
+	WriteFlow(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		flow *flows_proto.ArtifactCollectorContext,
+		completion func()) error
+
+	WriteFlowStats(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		flow *flows_proto.ArtifactCollectorContext,
+		completion func()) error
+
+	WriteFlowIndex(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		flow *flows_proto.ArtifactCollectorContext) error
+
+	WriteTask(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string,
+		msg *crypto_proto.VeloMessage) error
+
+	DeleteFlow(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string, flow_id string, principal string,
+		options DeleteFlowOptions) ([]*DeleteFlowResponse, error)
+
+	LoadCollectionContext(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id, flow_id string) (*flows_proto.ArtifactCollectorContext, error)
+
+	ListFlows(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string,
+		options result_sets.ResultSetOptions,
+		offset, length int64) ([]*FlowSummary, int64, error)
+
+	// Get the exact requests that were sent for this collection (for
+	// provenance).
+	GetFlowRequests(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string, flow_id string,
+		offset uint64, count uint64) (*api_proto.ApiFlowRequestDetails, error)
+}
+
 type Launcher interface {
-	// Only used for tests to force a predictable flow id.
-	SetFlowIdForTests(flow_id string)
+	Storage() FlowStorer
 
 	// Check any declared tools exist and are available - possibly
 	// by downloading them.
@@ -95,7 +191,7 @@ type Launcher interface {
 
 	// Calculates the dependent artifacts
 	GetDependentArtifacts(
-		config_obj *config_proto.Config,
+		ctx context.Context, config_obj *config_proto.Config,
 		repository Repository,
 		names []string) ([]string, error)
 
@@ -124,12 +220,12 @@ type Launcher interface {
 
 	// Take the compiled requests from above and schedule them on the
 	// client.
-	ScheduleArtifactCollectionFromCollectorArgs(
+	WriteArtifactCollectionRecord(
 		ctx context.Context,
 		config_obj *config_proto.Config,
 		collector_request *flows_proto.ArtifactCollectorArgs,
 		vql_collector_args []*actions_proto.VQLCollectorArgs,
-		completion func()) (string, error)
+		completion func(task *crypto_proto.VeloMessage)) (string, error)
 
 	// Main entry point to launch an artifact collection.
 	ScheduleArtifactCollection(
@@ -144,15 +240,18 @@ type Launcher interface {
 
 	// Get a list of collections summary from a client.
 	GetFlows(
+		ctx context.Context,
 		config_obj *config_proto.Config,
-		client_id string, include_archived bool,
-		flow_filter func(flow *flows_proto.ArtifactCollectorContext) bool,
-		offset uint64, length uint64) (*api_proto.ApiFlowResponse, error)
+		client_id string,
+		options result_sets.ResultSetOptions,
+		offset, length int64) (*api_proto.ApiFlowResponse, error)
 
 	// Get the details of a flow - this has a lot more information
 	// than the previous method.
 	GetFlowDetails(
+		ctx context.Context,
 		config_obj *config_proto.Config,
+		opts GetFlowOptions,
 		client_id string, flow_id string) (*api_proto.FlowDetails, error)
 
 	// Actively cancel the collection
@@ -162,28 +261,17 @@ type Launcher interface {
 		client_id, flow_id, principal string) (
 		res *api_proto.StartFlowResponse, err error)
 
-	// Get the exact requests that were sent for this collection (for
-	// provenance).
-	GetFlowRequests(
-		config_obj *config_proto.Config,
-		client_id string, flow_id string,
-		offset uint64, count uint64) (*api_proto.ApiFlowRequestDetails, error)
-
-	WriteFlow(
+	// Replay flow transactions to continue if possible.
+	ResumeFlow(
 		ctx context.Context,
 		config_obj *config_proto.Config,
-		flow *flows_proto.ArtifactCollectorContext) error
-
-	DeleteFlow(
-		ctx context.Context,
-		config_obj *config_proto.Config,
-		client_id string, flow_id string,
-		really_do_it bool) ([]*DeleteFlowResponse, error)
+		client_id, flow_id string) (
+		[]*actions_proto.UploadTransaction, error)
 
 	DeleteEvents(
 		ctx context.Context,
 		config_obj *config_proto.Config,
-		artifact, client_id string,
+		principal, artifact, client_id string,
 		start_time, end_time time.Time,
-		really_do_it bool) ([]*DeleteFlowResponse, error)
+		options DeleteFlowOptions) ([]*DeleteFlowResponse, error)
 }

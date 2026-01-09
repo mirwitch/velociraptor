@@ -4,10 +4,9 @@ import (
 	"context"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sirupsen/logrus"
 	"www.velocidex.com/golang/velociraptor/acls"
-	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -17,6 +16,7 @@ type DeleteFlowPluginArgs struct {
 	FlowId     string `vfilter:"required,field=flow_id"`
 	ClientId   string `vfilter:"required,field=client_id"`
 	ReallyDoIt bool   `vfilter:"optional,field=really_do_it"`
+	Sync       bool   `vfilter:"optional,field=sync,doc=If specified we ensure data is available immediately"`
 }
 
 type DeleteFlowPlugin struct{}
@@ -29,8 +29,9 @@ func (self DeleteFlowPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "delete_flow", args)()
 
-		err := vql_subsystem.CheckAccess(scope, acls.READ_RESULTS)
+		err := vql_subsystem.CheckAccess(scope, acls.DELETE_RESULTS)
 		if err != nil {
 			scope.Log("delete_flow: %s", err)
 			return
@@ -43,9 +44,15 @@ func (self DeleteFlowPlugin) Call(
 			return
 		}
 
+		err = services.RequireFrontend()
+		if err != nil {
+			scope.Log("delete_flow: %v", err)
+			return
+		}
+
 		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
-			scope.Log("Command can only run on the server")
+			scope.Log("delete_flow: Command can only run on the server")
 			return
 		}
 
@@ -56,16 +63,11 @@ func (self DeleteFlowPlugin) Call(
 		}
 
 		principal := vql_subsystem.GetPrincipal(scope)
-		if arg.ReallyDoIt {
-			logging.LogAudit(config_obj, principal, "delete_flow",
-				logrus.Fields{
-					"client_id": arg.ClientId,
-					"flow_id":   arg.FlowId,
-				})
-		}
-
-		responses, err := launcher.DeleteFlow(ctx, config_obj,
-			arg.ClientId, arg.FlowId, arg.ReallyDoIt)
+		responses, err := launcher.Storage().DeleteFlow(ctx, config_obj,
+			arg.ClientId, arg.FlowId, principal, services.DeleteFlowOptions{
+				ReallyDoIt: arg.ReallyDoIt,
+				Sync:       arg.Sync,
+			})
 		if err != nil {
 			scope.Log("delete_flow: %v", err)
 			return
@@ -85,9 +87,10 @@ func (self DeleteFlowPlugin) Call(
 
 func (self DeleteFlowPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "delete_flow",
-		Doc:     "Delete all the files that make up a flow.",
-		ArgType: type_map.AddType(scope, &FlowsPluginArgs{}),
+		Name:     "delete_flow",
+		Doc:      "Delete all the files that make up a flow.",
+		ArgType:  type_map.AddType(scope, &DeleteFlowPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.DELETE_RESULTS).Build(),
 	}
 }
 

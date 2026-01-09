@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -15,36 +15,30 @@
    You should have received a copy of the GNU Affero General Public License
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
-// This is a file based data store. It is really simple - basically just
-// writing a single file for each AFF4 object. There is no locking so
-// it is not suitable for contended queues but Velociraptor does not
-// use much locking any more so it should work pretty well for fairly
-// large installations.
 
-// Some limitation of this data store:
+// This is a file based data store. It is the default data store we
+// use for both small and large deployments. The datastore is only
+// used for storing local metadata and uses no locking:
 
-// 1. There is a small amount of overheads for small files. This
-//    should not be too much but it can be reduced by using smaller
-//    block sizes.
-// 2. This has only been tested with a local filesystem. It may work
-//    with a remote filesystem (like NFS) but performance may not be
-//    that great.
+// Object IO is considered atomic - there are no locks. This can
+// result in races for contentended objects but the Velociraptor
+// design avoids file contention at all times.
 
-// It should be safe and efficient to run multiple server instances in
-// different processes since Velociraptor does not rely on locks any
-// more. It is probably also wise to run the file store on the same
-// filesystem.
+// Files can be written as protobuf encoding (this is the old
+// standard) but this makes it harder to debug so now most files will
+// be written as json encoded blobs. There is fallback code to be able
+// to read only protobuf encoded files if they are there but newer
+// files will be written as JSON.
+
 package datastore
 
 import (
 	"fmt"
-	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/go-errors/errors"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -52,7 +46,6 @@ import (
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
-	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
@@ -61,6 +54,8 @@ var (
 	file_based_imp = &FileBaseDataStore{}
 
 	datastoreNotConfiguredError = errors.New("Datastore not configured")
+	invalidFileError            = errors.New("Invalid file error")
+	insufficientDiskSpace       = errors.New("Insufficient disk space!")
 )
 
 const (
@@ -69,11 +64,14 @@ const (
 	WINDOWS_LFN_PREFIX = "\\\\?\\"
 )
 
-type FileBaseDataStore struct{}
+type FileBaseDataStore struct {
+	mu  sync.Mutex
+	err error
+}
 
-/* Gets a protobuf encoded struct from the data store.  Objects are
-   addressed by the urn which is a string (URNs are typically managed
-   by a path manager)
+/*
+Gets a protobuf encoded struct from the data store.  Objects are
+addressed by the urn (URNs are typically managed by a path manager)
 */
 func (self *FileBaseDataStore) GetSubject(
 	config_obj *config_proto.Config,
@@ -82,15 +80,21 @@ func (self *FileBaseDataStore) GetSubject(
 
 	defer InstrumentWithDelay("read", "FileBaseDataStore", urn)()
 
-	Trace(config_obj, "GetSubject", urn)
-	serialized_content, err := readContentFromFile(
-		config_obj, urn, true /* must_exist */)
+	Trace(self, config_obj, "GetSubject", urn)
+	serialized_content, err := readContentFromFile(self, config_obj, urn)
 	if err != nil {
 		return fmt.Errorf("While opening %v: %w", urn.AsClientPath(),
-			os.ErrNotExist)
+			utils.NotFoundError)
 	}
 
 	if len(serialized_content) == 0 {
+		// JSON encoded files must contain at least '{}' two
+		// characters. If the file is empty something went wrong -
+		// usually this is because the disk was full.
+		if urn.Type() == api.PATH_TYPE_DATASTORE_JSON {
+			return fmt.Errorf("While accessing %v: %w",
+				urn.AsClientPath(), invalidFileError)
+		}
 		return nil
 	}
 
@@ -103,13 +107,13 @@ func (self *FileBaseDataStore) GetSubject(
 
 	if err != nil {
 		return fmt.Errorf("While opening %v: %w",
-			urn.AsClientPath(), os.ErrNotExist)
+			urn.AsClientPath(), utils.NotFoundError)
 	}
 	return nil
 }
 
 func (self *FileBaseDataStore) Debug(config_obj *config_proto.Config) {
-	filepath.Walk(config_obj.Datastore.Location,
+	_ = filepath.Walk(config_obj.Datastore.Location,
 		func(path string, info os.FileInfo, err error) error {
 			fmt.Printf("%v -> %v %v\n", path, info.Size(), info.Mode())
 			return nil
@@ -131,6 +135,11 @@ func (self *FileBaseDataStore) SetSubjectWithCompletion(
 
 	defer InstrumentWithDelay("write", "FileBaseDataStore", urn)()
 
+	err := self.Healthy()
+	if err != nil {
+		return err
+	}
+
 	// Make sure to call the completer on all exit points
 	// (FileBaseDataStore is actually synchronous).
 	defer func() {
@@ -140,7 +149,7 @@ func (self *FileBaseDataStore) SetSubjectWithCompletion(
 		}
 	}()
 
-	Trace(config_obj, "SetSubject", urn)
+	Trace(self, config_obj, "SetSubject", urn)
 
 	// Encode as JSON
 	if urn.Type() == api.PATH_TYPE_DATASTORE_JSON {
@@ -148,14 +157,14 @@ func (self *FileBaseDataStore) SetSubjectWithCompletion(
 		if err != nil {
 			return err
 		}
-		return writeContentToFile(config_obj, urn, serialized_content)
+		return writeContentToFile(self, config_obj, urn, serialized_content)
 	}
 	serialized_content, err := proto.Marshal(message)
 	if err != nil {
 		return errors.Wrap(err, 0)
 	}
 
-	return writeContentToFile(config_obj, urn, serialized_content)
+	return writeContentToFile(self, config_obj, urn, serialized_content)
 }
 
 func (self *FileBaseDataStore) DeleteSubjectWithCompletion(
@@ -177,9 +186,9 @@ func (self *FileBaseDataStore) DeleteSubject(
 
 	defer InstrumentWithDelay("delete", "FileBaseDataStore", urn)()
 
-	Trace(config_obj, "DeleteSubject", urn)
+	Trace(self, config_obj, "DeleteSubject", urn)
 
-	err := os.Remove(urn.AsDatastoreFilename(config_obj))
+	err := os.Remove(AsDatastoreFilename(self, config_obj, urn))
 
 	// It is ok to remove a file that does not exist.
 	if err != nil && os.IsExist(err) {
@@ -191,22 +200,13 @@ func (self *FileBaseDataStore) DeleteSubject(
 	return nil
 }
 
-func listChildNames(config_obj *config_proto.Config,
-	urn api.DSPathSpec) (
-	[]string, error) {
-	defer InstrumentWithDelay("list", "FileBaseDataStore", urn)()
-
-	return utils.ReadDirNames(
-		urn.AsDatastoreDirectory(config_obj))
-}
-
-func listChildren(config_obj *config_proto.Config,
+func (self *FileBaseDataStore) listChildren(config_obj *config_proto.Config,
 	urn api.DSPathSpec) ([]os.FileInfo, error) {
 
 	defer InstrumentWithDelay("list", "FileBaseDataStore", urn)()
 
 	children, err := utils.ReadDirUnsorted(
-		urn.AsDatastoreDirectory(config_obj))
+		AsDatastoreDirectory(self, config_obj, urn))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []os.FileInfo{}, nil
@@ -236,9 +236,9 @@ func (self *FileBaseDataStore) ListChildren(
 	urn api.DSPathSpec) (
 	[]api.DSPathSpec, error) {
 
-	TraceDirectory(config_obj, "ListChildren", urn)
+	TraceDirectory(self, config_obj, "ListChildren", urn)
 
-	all_children, err := listChildren(config_obj, urn)
+	all_children, err := self.listChildren(config_obj, urn)
 	if err != nil {
 		return nil, err
 	}
@@ -256,13 +256,18 @@ func (self *FileBaseDataStore) ListChildren(
 		return children[i].ModTime().UnixNano() < children[j].ModTime().UnixNano()
 	})
 
+	db, err := GetDB(config_obj)
+	if err != nil {
+		return nil, err
+	}
+
 	// Slice the result according to the required offset and count.
 	result := make([]api.DSPathSpec, 0, len(children))
 	for _, child := range children {
 		var child_pathspec api.DSPathSpec
 
 		if child.IsDir() {
-			name := utils.UnsanitizeComponent(child.Name())
+			name := UncompressComponent(db, config_obj, child.Name())
 			result = append(result, urn.AddUnsafeChild(name).SetDir())
 			continue
 		}
@@ -274,7 +279,8 @@ func (self *FileBaseDataStore) ListChildren(
 			continue
 		}
 
-		name := utils.UnsanitizeComponent(child.Name()[:len(extension)])
+		name := UncompressComponent(db,
+			config_obj, child.Name()[:len(extension)])
 
 		// Skip over files that do not belong in the data store.
 		if spec_type == api.PATH_TYPE_DATASTORE_UNKNOWN {
@@ -293,17 +299,22 @@ func (self *FileBaseDataStore) ListChildren(
 // Called to close all db handles etc. Not thread safe.
 func (self *FileBaseDataStore) Close() {}
 
-func writeContentToFile(config_obj *config_proto.Config,
+func writeContentToFile(
+	db DataStore, config_obj *config_proto.Config,
 	urn api.DSPathSpec, data []byte) error {
 
 	if config_obj.Datastore == nil {
 		return datastoreNotConfiguredError
 	}
 
-	filename := urn.AsDatastoreFilename(config_obj)
+	filename := AsDatastoreFilename(db, config_obj, urn)
 
 	// Truncate the file immediately so we dont need to make a seocnd
-	// syscall.
+	// syscall. Empirically on Linux, a truncate call always works,
+	// even if there is no available disk space to accommodate the
+	// required file size. This means we can not avoid file corruption
+	// when the disk is full! We may as well truncate to 0 on open and
+	// hope the file write succeeds later.
 	file, err := os.OpenFile(
 		filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0660)
 
@@ -334,19 +345,18 @@ func writeContentToFile(config_obj *config_proto.Config,
 }
 
 func readContentFromFile(
-	config_obj *config_proto.Config, urn api.DSPathSpec,
-	must_exist bool) ([]byte, error) {
+	db DataStore, config_obj *config_proto.Config,
+	urn api.DSPathSpec) ([]byte, error) {
 
 	if config_obj.Datastore == nil {
 		return nil, datastoreNotConfiguredError
 	}
 
-	file, err := os.Open(urn.AsDatastoreFilename(config_obj))
+	file, err := os.Open(AsDatastoreFilename(db, config_obj, urn))
 	if err == nil {
 		defer file.Close()
 
-		result, err := ioutil.ReadAll(
-			io.LimitReader(file, constants.MAX_MEMORY))
+		result, err := utils.ReadAllWithLimit(file, constants.MAX_MEMORY)
 		if err != nil {
 			return nil, errors.Wrap(err, 0)
 		}
@@ -359,15 +369,13 @@ func readContentFromFile(
 	if os.IsNotExist(err) &&
 		urn.Type() == api.PATH_TYPE_DATASTORE_JSON {
 
-		file, err := os.Open(urn.
-			SetType(api.PATH_TYPE_DATASTORE_PROTO).
-			AsDatastoreFilename(config_obj))
+		file, err := os.Open(AsDatastoreFilename(
+			db, config_obj, urn.SetType(api.PATH_TYPE_DATASTORE_PROTO)))
 
 		if err == nil {
 			defer file.Close()
 
-			result, err := ioutil.ReadAll(
-				io.LimitReader(file, constants.MAX_MEMORY))
+			result, err := utils.ReadAllWithLimit(file, constants.MAX_MEMORY)
 			if err != nil {
 				return nil, errors.Wrap(err, 0)
 			}
@@ -375,58 +383,28 @@ func readContentFromFile(
 			return result, nil
 		}
 	}
-
-	// Its ok if the file does not exist - no error.
-	if !must_exist && os.IsNotExist(err) {
-		return []byte{}, nil
-	}
 	return nil, errors.Wrap(err, 0)
 }
 
-// Convert a file name from the data store to a DSPathSpec
-func FilenameToURN(config_obj *config_proto.Config,
-	filename string) api.DSPathSpec {
-	if runtime.GOOS == "windows" {
-		filename = strings.TrimPrefix(filename, WINDOWS_LFN_PREFIX)
-	}
-
-	filename = strings.TrimPrefix(filename, config_obj.Datastore.Location)
-
-	components := []string{}
-	// DS filenames are always clean so a strings split is fine.
-	for _, component := range strings.Split(
-		filename, string(os.PathSeparator)) {
-		if component != "" {
-			components = append(components, component)
-		}
-	}
-
-	// Strip any extension from the last component.
-	if len(components) > 0 {
-		last := len(components) - 1
-		components[last] = strings.TrimPrefix(
-			strings.TrimSuffix(components[last], ".db"), ".json")
-	}
-
-	return path_specs.NewSafeDatastorePath(components...)
-}
-
-func Trace(config_obj *config_proto.Config,
+func Trace(
+	db DataStore,
+	config_obj *config_proto.Config,
 	name string, filename api.DSPathSpec) {
 
 	return
 
-	fmt.Printf("Trace FileBaseDataStore: %v: %v\n", name,
-		filename.AsDatastoreFilename(config_obj))
+	//fmt.Printf("Trace FileBaseDataStore: %v: %v\n", name,
+	//	AsDatastoreFilename(db, config_obj, filename))
 }
 
-func TraceDirectory(config_obj *config_proto.Config,
+func TraceDirectory(
+	db DataStore, config_obj *config_proto.Config,
 	name string, filename api.DSPathSpec) {
 
 	return
 
-	fmt.Printf("Trace FileBaseDataStore: %v: %v\n", name,
-		filename.AsDatastoreDirectory(config_obj))
+	//fmt.Printf("Trace FileBaseDataStore: %v: %v\n", name,
+	//	AsDatastoreDirectory(db, config_obj, filename))
 }
 
 // Support RawDataStore interface
@@ -434,15 +412,33 @@ func (self *FileBaseDataStore) GetBuffer(
 	config_obj *config_proto.Config,
 	urn api.DSPathSpec) ([]byte, error) {
 
-	return readContentFromFile(
-		config_obj, urn, true /* must exist */)
+	return readContentFromFile(self, config_obj, urn)
+}
+
+func (self *FileBaseDataStore) Healthy() error {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.err
+}
+
+func (self *FileBaseDataStore) SetError(err error) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.err = err
 }
 
 func (self *FileBaseDataStore) SetBuffer(
 	config_obj *config_proto.Config,
 	urn api.DSPathSpec, data []byte, completion func()) error {
 
-	err := writeContentToFile(config_obj, urn, data)
+	err := self.Healthy()
+	if err != nil {
+		return err
+	}
+
+	err = writeContentToFile(self, config_obj, urn, data)
 	if completion != nil &&
 		!utils.CompareFuncs(completion, utils.SyncCompleter) {
 		completion()

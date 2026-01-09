@@ -34,19 +34,23 @@ func maybeEscape(name string) string {
 }
 
 func (self *Launcher) CompileSingleArtifact(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	options services.CompilerOptions,
 	artifact *artifacts_proto.Artifact,
+	repository services.Repository,
 	result *actions_proto.VQLCollectorArgs) error {
+
+	// Allow the artifact to dictate the effective user.
+	result.EffectivePrincipal = artifact.Impersonate
 
 	for _, parameter := range artifact.Parameters {
 		value := parameter.Default
 		name := parameter.Name
 
-		result.Env = append(result.Env, &actions_proto.VQLEnv{
+		env := &actions_proto.VQLEnv{
 			Key:   name,
 			Value: value,
-		})
+		}
 
 		// If the parameter has a type, convert it
 		// appropriately. Note that parameters are always
@@ -62,6 +66,9 @@ func (self *Launcher) CompileSingleArtifact(
 		case "", "string", "regex", "yara":
 			// Nothing to do with these types.
 
+		case "redacted":
+			env.Comment = "redacted"
+
 		case "upload":
 			result.Query = append(result.Query, &actions_proto.VQLRequest{
 				VQL: fmt.Sprintf(`LET %v <= if(condition=%v, then={
@@ -73,6 +80,30 @@ func (self *Launcher) CompileSingleArtifact(
 				VQL: fmt.Sprintf("LET %v <= %v.Content[0]",
 					escaped_name, maybeEscape(name+"_")),
 			})
+
+		case "upload_file":
+			result.Query = append(result.Query, &actions_proto.VQLRequest{
+				VQL: fmt.Sprintf(`LET %v <= if(condition=%v, then={
+   SELECT Content FROM http_client(url=%v, tempfile_extension='.tmp')
+})`,
+					maybeEscape(name+"_"), escaped_name, escaped_name),
+			})
+			result.Query = append(result.Query, &actions_proto.VQLRequest{
+				VQL: fmt.Sprintf("LET %v <= %v.Content[0]",
+					escaped_name, maybeEscape(name+"_")),
+			})
+
+		case "server_metadata":
+			client_info_manager, err := services.GetClientInfoManager(config_obj)
+			if err == nil {
+				md, err := client_info_manager.GetMetadata(ctx, "server")
+				if err == nil {
+					value, pres := md.GetString(name)
+					if pres {
+						env.Value = value
+					}
+				}
+			}
 
 		case "int", "int64", "integer":
 			result.Query = append(result.Query, &actions_proto.VQLRequest{
@@ -95,7 +126,7 @@ func (self *Launcher) CompileSingleArtifact(
 			result.Query = append(result.Query, &actions_proto.VQLRequest{
 				VQL: fmt.Sprintf(`
 LET %v <= if(
-    condition=format(format="%%T", args=%v) =~ "string",
+    condition=format(format="%%T", args=[%v,]) =~ "string",
     then=starl(code=%v),
     else=%v)
 `,
@@ -105,7 +136,7 @@ LET %v <= if(
 			result.Query = append(result.Query, &actions_proto.VQLRequest{
 				VQL: fmt.Sprintf(`
 LET %v <= SELECT * FROM if(
-    condition=format(format="%%T", args=%v) =~ "string",
+    condition=format(format="%%T", args=[%v,]) =~ "string",
     then={SELECT * FROM parse_csv(filename=%v, accessor='data')},
     else=%v)
 `,
@@ -117,18 +148,18 @@ LET %v <= SELECT * FROM if(
 			result.Query = append(result.Query, &actions_proto.VQLRequest{
 				VQL: fmt.Sprintf(`
 LET %v <= if(
-    condition=format(format="%%T", args=%v) =~ "string",
+    condition=format(format="%%T", args=[%v,]) =~ "string",
     then=parse_json(data=%v),
     else=%v)
 `,
 					escaped_name, escaped_name, escaped_name, escaped_name),
 			})
 
-		case "json_array", "regex_array":
+		case "json_array", "regex_array", "multichoice":
 			result.Query = append(result.Query, &actions_proto.VQLRequest{
 				VQL: fmt.Sprintf(`
 LET %v <= if(
-    condition=format(format="%%T", args=%v) = "string",
+    condition=format(format="%%T", args=[%v,]) = "string",
     then=parse_json_array(data=%v),
     else=%v)
 `,
@@ -139,7 +170,7 @@ LET %v <= if(
 			result.Query = append(result.Query, &actions_proto.VQLRequest{
 				VQL: fmt.Sprintf(`
 LET %v <= if(
-    condition=format(format="%%T", args=%v) =~ "string",
+    condition=format(format="%%T", args=[%v,]) =~ "string",
     then=parse_xml(file=%v, accessor="data"),
     else=%v)
 `,
@@ -150,7 +181,7 @@ LET %v <= if(
 			result.Query = append(result.Query, &actions_proto.VQLRequest{
 				VQL: fmt.Sprintf(`
 LET %v <= if(
-    condition=format(format="%%T", args=%v) =~ "string",
+    condition=format(format="%%T", args=[%v,]) =~ "string",
     then=parse_yaml(filename=%v, accessor="data"),
     else=%v)
 `,
@@ -165,6 +196,7 @@ LET %v <= if(
 
 		}
 
+		result.Env = append(result.Env, env)
 	}
 
 	// Apply artifact default resource controls.
@@ -175,7 +207,7 @@ LET %v <= if(
 		result.IopsLimit = artifact.Resources.IopsLimit
 	}
 
-	err := resolveImports(config_obj, artifact, result)
+	err := resolveImports(ctx, config_obj, artifact, repository, result)
 	if err != nil {
 		return err
 	}
@@ -183,8 +215,10 @@ LET %v <= if(
 	return mergeSources(config_obj, options, artifact, result)
 }
 
-func resolveImports(config_obj *config_proto.Config,
+func resolveImports(
+	ctx context.Context, config_obj *config_proto.Config,
 	artifact *artifacts_proto.Artifact,
+	repository services.Repository,
 	result *actions_proto.VQLCollectorArgs) error {
 	// Resolve imports if needed. First check if the artifact
 	// itself declares exports for itself (by default each
@@ -211,20 +245,11 @@ func resolveImports(config_obj *config_proto.Config,
 		return nil
 	}
 
-	manager, err := services.GetRepositoryManager(config_obj)
-	if err != nil {
-		return err
-	}
-	global_repo, err := manager.GetGlobalRepository(config_obj)
-	if err != nil {
-		return err
-	}
-
 	// These are a list of names to be imported.
 	for _, imported := range artifact.Imports {
 		scope := vql_subsystem.MakeScope()
 
-		dependent_artifact, pres := global_repo.Get(config_obj, imported)
+		dependent_artifact, pres := repository.Get(ctx, config_obj, imported)
 		if !pres {
 			return fmt.Errorf("Artifact %v imports %v which is not known.",
 				artifact.Name, imported)
@@ -299,11 +324,17 @@ func mergeSources(
 				})
 		}
 
+		// An empty query is not an error.
+		if strings.TrimSpace(source.Query) == "" {
+			continue
+		}
+
 		// The artifact format requires all queries to be LET
 		// queries except for the last one.
 		queries, err := vfilter.MultiParse(source.Query)
 		if err != nil {
-			return fmt.Errorf("While parsing source query: %w", err)
+			return fmt.Errorf("While parsing source query %v: %w",
+				source.Name, err)
 		}
 
 		for idx2, vql := range queries {
@@ -346,7 +377,7 @@ func mergeSources(
 // artifacts are found, then recursivly determine their dependencies
 // etc.
 func GetQueryDependencies(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	repository services.Repository,
 	query string,
 	depth int,
@@ -357,7 +388,7 @@ func GetQueryDependencies(
 	for _, hit := range artifact_in_query_regex.
 		FindAllStringSubmatch(query, -1) {
 		artifact_name := hit[1]
-		dep, pres := repository.Get(config_obj, artifact_name)
+		dep, pres := repository.Get(ctx, config_obj, artifact_name)
 		if !pres {
 			return errors.New(
 				fmt.Sprintf("Unknown artifact reference %s",
@@ -371,6 +402,14 @@ func GetQueryDependencies(
 
 		dependency[artifact_name] = depth
 
+		if dep.Export != "" {
+			err := GetQueryDependencies(ctx, config_obj, repository,
+				dep.Export, 0, dependency)
+			if err != nil {
+				return err
+			}
+		}
+
 		// Add any artifact that this one imports as a dependency.
 		for _, imp := range dep.Imports {
 			_, pres = dependency[imp]
@@ -379,7 +418,7 @@ func GetQueryDependencies(
 			}
 
 			dependency[imp] = depth
-			imported_artifact, pres := repository.Get(config_obj, imp)
+			imported_artifact, pres := repository.Get(ctx, config_obj, imp)
 			if !pres {
 				return fmt.Errorf(
 					"Imported Artifact %v not found (needed by %v)",
@@ -388,7 +427,7 @@ func GetQueryDependencies(
 
 			// If the exported section depends on other artifacts,
 			// then add them too.
-			err := GetQueryDependencies(config_obj, repository,
+			err := GetQueryDependencies(ctx, config_obj, repository,
 				imported_artifact.Export, 0, dependency)
 			if err != nil {
 				return err
@@ -397,20 +436,20 @@ func GetQueryDependencies(
 
 		// Now search the referred to artifact's query for its
 		// own dependencies.
-		err := GetQueryDependencies(
+		err := GetQueryDependencies(ctx,
 			config_obj, repository, dep.Precondition, depth+1, dependency)
 		if err != nil {
 			return err
 		}
 
 		for _, source := range dep.Sources {
-			err := GetQueryDependencies(config_obj, repository,
+			err := GetQueryDependencies(ctx, config_obj, repository,
 				source.Precondition, depth+1, dependency)
 			if err != nil {
 				return err
 			}
 
-			err = GetQueryDependencies(config_obj, repository,
+			err = GetQueryDependencies(ctx, config_obj, repository,
 				source.Query, depth+1, dependency)
 			if err != nil {
 				return err
@@ -430,7 +469,7 @@ func PopulateArtifactsVQLCollectorArgs(
 	request *actions_proto.VQLCollectorArgs) error {
 	dependencies := make(map[string]int)
 	for _, query := range request.Query {
-		err := GetQueryDependencies(config_obj, repository,
+		err := GetQueryDependencies(ctx, config_obj, repository,
 			query.VQL, 0, dependencies)
 		if err != nil {
 			return err
@@ -445,7 +484,7 @@ func PopulateArtifactsVQLCollectorArgs(
 	sort.Strings(dep_names)
 
 	for _, k := range dep_names {
-		artifact, pres := repository.Get(config_obj, k)
+		artifact, pres := repository.Get(ctx, config_obj, k)
 		if pres {
 			// Filter the artifact to contain only
 			// essential data.
@@ -487,18 +526,18 @@ func PopulateArtifactsVQLCollectorArgs(
 			// independently.
 			tmp := &actions_proto.VQLCollectorArgs{}
 			for _, tool := range artifact.Tools {
-				err := AddToolDependency(ctx, config_obj, tool.Name, tmp)
+				err := AddToolDependency(ctx, config_obj, tool.Name, tool.Version, tmp)
 				if err != nil {
 					return err
 				}
 			}
 
 			for _, env := range tmp.Env {
-				filtered_parameters = append(filtered_parameters,
-					&artifacts_proto.ArtifactParameter{
-						Name:    env.Key,
-						Default: env.Value,
-					})
+				parameter := &artifacts_proto.ArtifactParameter{
+					Name:    env.Key,
+					Default: env.Value,
+				}
+				filtered_parameters = append(filtered_parameters, parameter)
 			}
 
 			request.Artifacts = append(request.Artifacts,
@@ -532,9 +571,8 @@ func PopulateArtifactsVQLCollectorArgs(
 // request. This function is used to fill in a copy of the dependent
 // artifacts in the client request.
 func (self *Launcher) GetDependentArtifacts(
-	config_obj *config_proto.Config,
-	repository services.Repository,
-	names []string) ([]string, error) {
+	ctx context.Context, config_obj *config_proto.Config,
+	repository services.Repository, names []string) ([]string, error) {
 
 	dependency := make(map[string]int)
 
@@ -548,13 +586,13 @@ func (self *Launcher) GetDependentArtifacts(
 			continue
 		}
 
-		_, pres = repository.Get(config_obj, name)
+		_, pres = repository.Get(ctx, config_obj, name)
 		if !pres {
 			return nil, fmt.Errorf(
 				"GetDependentArtifacts: Artifact %v not found", name)
 		}
 
-		err := GetQueryDependencies(config_obj, repository,
+		err := GetQueryDependencies(ctx, config_obj, repository,
 			fmt.Sprintf("SELECT * FROM Artifact.%s()", name), 0, dependency)
 		if err != nil {
 			return nil, err

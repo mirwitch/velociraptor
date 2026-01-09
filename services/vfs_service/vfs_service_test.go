@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
@@ -14,7 +13,6 @@ import (
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
-	"www.velocidex.com/golang/velociraptor/flows/proto"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths"
@@ -22,6 +20,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/services/users"
 	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vtesting"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
 )
@@ -30,6 +29,9 @@ var definitions = []string{`
 name: System.VFS.ListDirectory
 `, `
 name: System.VFS.DownloadFile
+`, `
+name: System.Flow.Completion
+type: CLIENT_EVENT
 `,
 }
 
@@ -38,12 +40,14 @@ type VFSServiceTestSuite struct {
 
 	client_id string
 	flow_id   string
+
+	closer func()
 }
 
 func (self *VFSServiceTestSuite) SetupTest() {
 	self.ConfigObj = self.TestSuite.LoadConfig()
 	self.ConfigObj.Services.VfsService = true
-	self.LoadArtifacts(definitions)
+	self.LoadArtifactsIntoConfig(definitions)
 
 	self.TestSuite.SetupTest()
 
@@ -53,13 +57,16 @@ func (self *VFSServiceTestSuite) SetupTest() {
 	// Register a user manager that returns the superuser user to skip
 	// any ACLs checks. This helps us test the API server to make sure
 	// the GUI will present the correct data.
-	users.RegisterTestUserManager(self.ConfigObj, "VelociraptorServer")
+	users.RegisterTestUserManager(
+		self.ConfigObj, utils.GetSuperuserName(self.ConfigObj))
 
-	journal_service, err := services.GetJournal(self.ConfigObj)
-	assert.NoError(self.T(), err)
+	self.closer = utils.MockTime(utils.NewMockClock(time.Unix(1000, 0)))
+	self.CreateClient(self.client_id)
+}
 
-	// Mock the time so we get a stable output
-	journal_service.SetClock(&utils.MockClock{time.Unix(1000, 0)})
+func (self *VFSServiceTestSuite) TearDownTest() {
+	self.TestSuite.TearDownTest()
+	self.closer()
 }
 
 func (self *VFSServiceTestSuite) EmulateCollection(
@@ -70,11 +77,11 @@ func (self *VFSServiceTestSuite) EmulateCollection(
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	journal.PushRowsToArtifact(self.ConfigObj, rows,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj, rows,
 		artifact, self.client_id, self.flow_id)
 
 	// Emulate a flow completion message coming from the flow processor.
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("ClientId", self.client_id).
 			Set("FlowId", self.flow_id).
@@ -100,14 +107,14 @@ func (self *VFSServiceTestSuite) EmulateCollectionWithVFSLs(
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	journal.PushRowsToArtifact(self.ConfigObj, rows,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj, rows,
 		artifact+"/Listing", self.client_id, self.flow_id)
 
-	journal.PushRowsToArtifact(self.ConfigObj, stats,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj, stats,
 		artifact+"/Stats", self.client_id, self.flow_id)
 
 	// Emulate a flow completion message coming from the flow processor.
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("ClientId", self.client_id).
 			Set("FlowId", self.flow_id).
@@ -202,7 +209,7 @@ func (self *VFSServiceTestSuite) TestVFSListDirectoryEmpty() {
 
 	// Emulate a flow completion message coming from the flow processor.
 	artifact := "System.VFS.ListDirectory"
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("ClientId", self.client_id).
 			Set("FlowId", self.flow_id).
@@ -427,7 +434,6 @@ func (self *VFSServiceTestSuite) TestRecursiveVFSListDirectoryApiAccess() {
 
 func (self *VFSServiceTestSuite) TestVFSDownload() {
 	flow_path_manager := paths.NewFlowPathManager(self.client_id, self.flow_id)
-	client_path_manager := paths.NewClientPathManager(self.client_id)
 
 	self.EmulateCollection(
 		"System.VFS.ListDirectory", []*ordereddict.Dict{
@@ -435,9 +441,11 @@ func (self *VFSServiceTestSuite) TestVFSDownload() {
 			makeStat("/a/b", "B"),
 		})
 
-	// Simulate an upload that was received by our System.VFS.DownloadFile collection.
+	// Simulate an upload that was received by our
+	// System.VFS.DownloadFile collection.
 	file_store := test_utils.GetMemoryFileStore(self.T(), self.ConfigObj)
-	fd, err := file_store.WriteFile(flow_path_manager.GetUploadsFile("file", "/a/b/B").Path())
+	fd, err := file_store.WriteFile(flow_path_manager.GetUploadsFile(
+		"file", "/a/b/B", []string{"a", "b", "B"}).Path())
 	assert.NoError(self.T(), err)
 	fd.Write([]byte("Data"))
 	fd.Close()
@@ -446,28 +454,18 @@ func (self *VFSServiceTestSuite) TestVFSDownload() {
 		"System.VFS.DownloadFile", []*ordereddict.Dict{
 			ordereddict.NewDict().
 				Set("Path", "/a/b/B").
+				Set("_Components", []string{"a", "b", "B"}).
 				Set("Accessor", "file").
 				Set("Size", 10),
 		})
 
-	db, err := datastore.GetDB(self.ConfigObj)
-	assert.NoError(self.T(), err)
-
-	// The VFS service stores a file in the VFS area of the
-	// client's namespace pointing to the real data. The real data
-	// is stored in the collection's space.
-	resp := &proto.VFSDownloadInfo{}
 	vtesting.WaitUntil(2*time.Second, self.T(), func() bool {
-		db.GetSubject(self.ConfigObj,
-			client_path_manager.VFSDownloadInfoFromClientPath(
-				"file", "/a/b/B"),
-			resp)
-		return resp.Size == 10
+		value, pres := file_store.Data.GetString(
+			"/clients/C.12312/vfs_files/file/a/b.json")
+		return pres &&
+			`{"name":"B","size":10,"mtime":1000000000,"components":["clients","C.12312","collections","F.1232","uploads","file","a","b","B"],"flow_id":"F.1232"}
+` == value
 	})
-
-	assert.Equal(self.T(), resp.Components,
-		flow_path_manager.GetUploadsFile("file", "/a/b/B").
-			Path().Components())
 }
 
 // Create a record for a file

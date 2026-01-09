@@ -1,73 +1,51 @@
 import React from 'react';
+import PropTypes from 'prop-types';
 
 import SplitPane from 'react-split-pane';
-import _ from 'lodash';
 import FlowsList from './flows-list.jsx';
 import FlowInspector from "./flows-inspector.jsx";
 import { withRouter }  from "react-router-dom";
+import { HotKeys, ObserveKeys } from "react-hotkeys";
 
+import {CancelToken} from 'axios';
 import api from '../core/api-service.jsx';
-import axios from 'axios';
 
-const POLL_TIME = 5000;
 
 class ServerFlowsView extends React.Component {
     static propTypes = {
+        collapseToggle: PropTypes.func,
+
+        // React router props.
+        match: PropTypes.object,
+        history: PropTypes.object,
     };
 
     state = {
-        flows: [],
         currentFlow: {},
+        topPaneSize: undefined,
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
-        this.interval = setInterval(this.fetchFlows, POLL_TIME);
-        this.fetchFlows();
+        this.source = CancelToken.source();
+
+        let flow_id = this.props.match && this.props.match.params &&
+            this.props.match.params.flow_id;
+
+        if(flow_id && flow_id !== "new") {
+            let client_id = this.props.match && this.props.match.params &&
+                this.props.match.params.client_id;
+
+            api.get("v1/GetFlowDetails", {
+                flow_id: flow_id,
+                client_id: client_id || "server",
+            }, this.source.token).then((response) => {
+                this.setState({currentFlow: response.data.context});
+            });
+        }
     }
 
     componentWillUnmount() {
         this.source.cancel("unmounted");
-        clearInterval(this.interval);
-    }
-
-    fetchFlows = () => {
-        let selected_flow_id = this.props.match && this.props.match.params &&
-            this.props.match.params.flow_id;
-
-        // Cancel any in flight calls.
-        this.source.cancel();
-        this.source = axios.CancelToken.source();
-
-        api.get("v1/GetClientFlows/server", {
-            count: 100,
-            offset: 0,
-        }, this.source.token).then(response=>{
-            if (response.cancel) return;
-
-            let flows = response.data.items || [];
-            let selected_flow = {};
-
-            // If the router specifies a selected flow id, we select it.
-            if (!this.state.init_router) {
-                for(var i=0;i<flows.length;i++) {
-                    let flow=flows[i];
-                    if (flow.session_id === selected_flow_id) {
-                        selected_flow = flow;
-                        break;
-                    }
-                };
-
-                // If we can not find the selected_flow we just select the first one
-                if (_.isEmpty(selected_flow) && !_.isEmpty(flows)){
-                    selected_flow = flows[0];
-                }
-
-                this.setState({init_router: true, currentFlow: selected_flow});
-            }
-
-            this.setState({flows: flows, loading: false});
-        });
     }
 
     setSelectedFlow = (flow) => {
@@ -84,20 +62,58 @@ class ServerFlowsView extends React.Component {
         }
     }
 
+    collapse = level=> {
+        this.setState({topPaneSize: level});
+    }
+
+    gotoTab = (tab) => {
+        let selected_flow = this.state.currentFlow && this.state.currentFlow.session_id;
+        this.props.history.push(
+            "/collected/server/" + selected_flow + "/" + tab);
+    }
+
+
     render() {
+        let KeyMap = {
+            GOTO_RESULTS: {
+                name: "Display server dashboard",
+                sequence: "alt+r",
+            },
+            GOTO_LOGS: "alt+l",
+            GOTO_OVERVIEW: "alt+o",
+            GOTO_UPLOADS: "alt+u",
+            COLLECT: "alt+c",
+            NOTEBOOK: "alt+b",
+        };
+
+        let keyHandlers={
+            GOTO_RESULTS: (e)=>this.gotoTab("results"),
+            GOTO_LOGS: (e)=>this.gotoTab("logs"),
+            GOTO_UPLOADS: (e)=>this.gotoTab("uploads"),
+            GOTO_OVERVIEW: (e)=>this.gotoTab("overview"),
+            NOTEBOOK: (e)=>this.gotoTab("notebook"),
+            COLLECT: ()=>this.setState({showWizard: true}),
+        };
+
         return (
             <>
-              <SplitPane split="horizontal" defaultSize="30%">
-                <FlowsList
-                  selected_flow={this.state.currentFlow}
-                  flows={this.state.flows}
-                  fetchFlows={this.fetchFlows}
-                  setSelectedFlow={this.setSelectedFlow}
-                  client={{client_id: "server"}}/>
-                <FlowInspector
-                  flow={this.state.currentFlow}
-                  client={{client_id: "server"}}/>
-              </SplitPane>
+              <HotKeys keyMap={KeyMap} handlers={keyHandlers}>
+                <ObserveKeys>
+                  <SplitPane split="horizontal"
+                             size={this.state.topPaneSize}
+                             onResizerDoubleClick={x=>this.collapse("50%")}
+                             defaultSize="30%">
+                    <FlowsList
+                      selected_flow={this.state.currentFlow}
+                      collapseToggle={this.collapse}
+                      setSelectedFlow={this.setSelectedFlow}
+                      client={{client_id: "server"}}/>
+                    <FlowInspector
+                      flow={this.state.currentFlow}
+                      client={{client_id: "server"}}/>
+                  </SplitPane>
+                </ObserveKeys>
+              </HotKeys>
             </>
         );
     }

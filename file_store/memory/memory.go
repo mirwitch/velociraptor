@@ -3,15 +3,16 @@ package memory
 import (
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/Velocidex/ordereddict"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/utils"
@@ -34,10 +35,16 @@ func NewMemoryFileStore(config_obj *config_proto.Config) *MemoryFileStore {
 	mu.Lock()
 	defer mu.Unlock()
 
+	db, err := datastore.GetDB(config_obj)
+	if err != nil {
+		return nil
+	}
+
 	if Test_memory_file_store == nil {
 		Test_memory_file_store = &MemoryFileStore{
 			Data:       ordereddict.NewDict(),
 			Paths:      ordereddict.NewDict(),
+			db:         db,
 			config_obj: config_obj,
 		}
 	}
@@ -52,123 +59,13 @@ func NewMemoryFileStore(config_obj *config_proto.Config) *MemoryFileStore {
 	return Test_memory_file_store
 }
 
-type MemoryReader struct {
-	pathSpec_ api.FSPathSpec
-	filename  string
-	offset    int
-	closed    bool
-
-	memory_file_store *MemoryFileStore
-}
-
-func (self *MemoryReader) Read(buf []byte) (int, error) {
-	defer api.InstrumentWithDelay("read", "MemoryReader", nil)()
-
-	fs_buf, pres := self.memory_file_store.Get(self.filename)
-	if !pres {
-		return 0, os.ErrNotExist
-	}
-
-	if self.offset >= len(fs_buf) {
-		return 0, io.EOF
-	}
-
-	to_read := len(buf)
-	if self.offset+to_read > len(fs_buf) {
-		to_read = len(fs_buf) - self.offset
-	}
-
-	for i := 0; i < to_read; i++ {
-		buf[i] = fs_buf[self.offset+i]
-	}
-	self.offset += to_read
-	return to_read, nil
-}
-
-func (self *MemoryReader) Seek(offset int64, whence int) (int64, error) {
-	if whence == 0 {
-		self.offset = int(offset)
-	}
-	return offset, nil
-}
-
-func (self *MemoryReader) Close() error {
-	if self.closed {
-		panic("MemoryReader already closed")
-	}
-	self.closed = true
-	return nil
-}
-
-func (self *MemoryReader) Stat() (api.FileInfo, error) {
-	defer api.InstrumentWithDelay("stat", "MemoryReader", nil)()
-
-	fs_buf, pres := self.memory_file_store.Get(self.filename)
-	if !pres {
-		return nil, os.ErrNotExist
-	}
-
-	return vtesting.MockFileInfo{
-		Name_:     self.pathSpec_.Base(),
-		PathSpec_: self.pathSpec_,
-		FullPath_: self.filename,
-		Size_:     int64(len(fs_buf)),
-	}, nil
-}
-
-type MemoryWriter struct {
-	buf               []byte
-	memory_file_store *MemoryFileStore
-	filename          string
-	closed            bool
-	completion        func()
-}
-
-func (self *MemoryWriter) Size() (int64, error) {
-	return int64(len(self.buf)), nil
-}
-
-func (self *MemoryWriter) Write(data []byte) (int, error) {
-	defer api.InstrumentWithDelay("write", "MemoryReader", nil)()
-
-	self.buf = append(self.buf, data...)
-	return len(data), nil
-}
-
-func (self *MemoryWriter) Flush() error { return nil }
-
-func (self *MemoryWriter) Close() error {
-	if self.closed {
-		panic("MemoryWriter already closed")
-	}
-	self.closed = true
-
-	// MemoryWriter is actually synchronous... Complete on close.
-	if self.completion != nil &&
-		!utils.CompareFuncs(self.completion, utils.SyncCompleter) {
-		defer self.completion()
-	}
-
-	self.memory_file_store.mu.Lock()
-	defer self.memory_file_store.mu.Unlock()
-
-	self.memory_file_store.Data.Set(self.filename, self.buf)
-	return nil
-}
-
-func (self *MemoryWriter) Truncate() error {
-	defer api.InstrumentWithDelay("truncate", "MemoryReader", nil)()
-
-	self.buf = nil
-	return nil
-}
-
 type MemoryFileStore struct {
 	mu sync.Mutex
 
 	config_obj *config_proto.Config
 	Data       *ordereddict.Dict
 	Paths      *ordereddict.Dict
+	db         datastore.DataStore
 }
 
 func (self *MemoryFileStore) Debug() {
@@ -180,18 +77,17 @@ func (self *MemoryFileStore) DebugString() string {
 	defer self.mu.Unlock()
 
 	result := "MemoryFileStore: \n"
-	for _, k := range self.Data.Keys() {
-		v_any, _ := self.Data.Get(k)
-		v := v_any.([]byte)
+	for _, i := range self.Data.Items() {
+		v := i.Value.([]byte)
 		// Render index files especially
-		if strings.HasSuffix(k, ".index") ||
-			strings.HasSuffix(k, ".idx") ||
-			strings.HasSuffix(k, ".tidx") {
-			result += fmt.Sprintf("%v: %v\n", k, hex.Dump(v))
+		if strings.HasSuffix(i.Key, ".index") ||
+			strings.HasSuffix(i.Key, ".idx") ||
+			strings.HasSuffix(i.Key, ".tidx") {
+			result += fmt.Sprintf("%v: %v\n", i.Key, hex.Dump(v))
 			continue
 		}
 
-		result += fmt.Sprintf("%v: %v\n", k, string(v))
+		result += fmt.Sprintf("%v: %v\n", i.Key, string(v))
 	}
 
 	return result
@@ -201,24 +97,41 @@ func (self *MemoryFileStore) ReadFile(path api.FSPathSpec) (api.FileReader, erro
 	defer api.InstrumentWithDelay("read_open", "MemoryFileStore", nil)()
 
 	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	filename := pathSpecToPath(path, self.config_obj)
+	filename := pathSpecToPath(self.db, self.config_obj, path)
 	self.Trace("ReadFile", filename)
+
 	_, pres := self.Data.Get(filename)
-	if pres {
-		return &MemoryReader{
-			pathSpec_:         path,
-			filename:          filename,
-			memory_file_store: self,
-		}, nil
+	if !pres {
+		self.mu.Unlock()
+		return nil, os.ErrNotExist
 	}
 
-	return nil, os.ErrNotExist
+	reader := &MemoryReader{
+		pathSpec_:         path,
+		filename:          filename,
+		memory_file_store: self,
+	}
+	self.mu.Unlock()
+
+	if path.Type() == api.PATH_TYPE_FILESTORE_CHUNK_INDEX {
+		return reader, nil
+	}
+
+	chunk_reader, err := self.ReadFile(
+		path.SetType(api.PATH_TYPE_FILESTORE_CHUNK_INDEX))
+	if err != nil {
+		return reader, nil
+	}
+
+	res := &CompressedMemoryReader{
+		chunkIndex: api.NewChunkIndex(chunk_reader),
+		reader:     reader,
+	}
+	return res, nil
 }
 
 func (self *MemoryFileStore) WriteFile(path api.FSPathSpec) (api.FileWriter, error) {
-	return self.WriteFileWithCompletion(path, nil)
+	return self.WriteFileWithCompletion(path, utils.SyncCompleter)
 }
 
 func (self *MemoryFileStore) WriteFileWithCompletion(
@@ -229,7 +142,7 @@ func (self *MemoryFileStore) WriteFileWithCompletion(
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	filename := pathSpecToPath(path, self.config_obj)
+	filename := pathSpecToPath(self.db, self.config_obj, path)
 	self.Trace("WriteFile", filename)
 	buf, pres := self.Data.Get(filename)
 	if !pres {
@@ -240,6 +153,7 @@ func (self *MemoryFileStore) WriteFileWithCompletion(
 
 	return &MemoryWriter{
 		buf:               buf.([]byte),
+		pathSpec_:         path,
 		memory_file_store: self,
 		filename:          filename,
 		completion:        completion,
@@ -252,11 +166,11 @@ func (self *MemoryFileStore) StatFile(path api.FSPathSpec) (api.FileInfo, error)
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	filename := pathSpecToPath(path, self.config_obj)
+	filename := pathSpecToPath(self.db, self.config_obj, path)
 	self.Trace("StatFile", filename)
 	buff, pres := self.Data.Get(filename)
 	if !pres {
-		return nil, os.ErrNotExist
+		return nil, utils.NotFoundError
 	}
 
 	return &vtesting.MockFileInfo{
@@ -272,11 +186,11 @@ func (self *MemoryFileStore) Move(src, dest api.FSPathSpec) error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	src_filename := pathSpecToPath(src, self.config_obj)
-	dest_filename := pathSpecToPath(dest, self.config_obj)
+	src_filename := pathSpecToPath(self.db, self.config_obj, src)
+	dest_filename := pathSpecToPath(self.db, self.config_obj, dest)
 	buff, pres := self.Data.Get(src_filename)
 	if !pres {
-		return os.ErrNotExist
+		return utils.NotFoundError
 	}
 
 	self.Data.Set(dest_filename, buff)
@@ -290,28 +204,26 @@ func (self *MemoryFileStore) ListDirectory(root_path api.FSPathSpec) ([]api.File
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	dirname := pathDirSpecToPath(root_path, self.config_obj)
+	dirname := pathDirSpecToPath(self.db, self.config_obj, root_path)
 	self.Trace("ListDirectory", dirname)
 
 	root_components := root_path.Components()
-	seen := make(map[string]bool)
-	result := []api.FileInfo{}
-	for _, filename := range self.Paths.Keys() {
-		path_spec_any, _ := self.Paths.Get(filename)
-		path_spec := path_spec_any.(api.FSPathSpec)
-		v_any, pres := self.Data.Get(filename)
-		if !pres {
+
+	untyped := path_specs.IsComponentUntyped(root_components)
+
+	// Mapping between the base name and the files
+	seen_files := make(map[string]api.FileInfo)
+	seen_dirs := make(map[string]api.FileInfo)
+
+	for _, i := range self.Paths.Items() {
+		filename := i.Key
+		path_spec := i.Value.(api.FSPathSpec)
+
+		if !path_specs.IsSubPath(root_path, path_spec) {
 			continue
 		}
-		v := v_any.([]byte)
 
 		components := path_spec.Components()
-		if !path_specs.IsSubPath(root_path, path_spec) ||
-			len(components) < len(root_components)+1 {
-			continue
-		}
-
-		name := components[len(root_components)]
 
 		// It is a directory if there are more components so we add a
 		// directory node.
@@ -323,45 +235,72 @@ func (self *MemoryFileStore) ListDirectory(root_path api.FSPathSpec) ([]api.File
 		// File
 		// root_components = ["a"]
 		// components = ["a", "b"]
-		var new_child api.FileInfo
 		if len(root_components)+1 == len(components) {
-			base_name := path.Base(filename)
+			v_any, pres := self.Data.Get(filename)
+			if !pres {
+				continue
+			}
+			v := v_any.([]byte)
 
 			// This is a datastore path - skip
-			if strings.HasSuffix(base_name, ".db") {
+			if path_spec.Type() == api.PATH_TYPE_DATASTORE_PROTO {
 				continue
 			}
 
-			name_type, name := api.GetFileStorePathTypeFromExtension(base_name)
-			child := root_path.AddUnsafeChild(name).SetType(name_type)
+			name := path_spec.Base()
+			// Force the file to be untyped.
+			if untyped {
+				name += api.GetExtensionForFilestore(path_spec)
+				path_spec = path_spec.SetType(api.PATH_TYPE_FILESTORE_ANY)
+			}
 
-			new_child = &vtesting.MockFileInfo{
-				Name_:     child.Base(),
-				PathSpec_: child,
-				FullPath_: child.AsClientPath(),
+			new_child := &vtesting.MockFileInfo{
+				Name_:     name,
+				PathSpec_: path_spec,
+				FullPath_: path_spec.AsClientPath(),
 				Size_:     int64(len(v)),
 			}
 
-		} else {
+			seen_files[filename] = new_child
+
+			// This path is deeper than 1 path in.
+		} else if len(components) > len(root_components)+1 {
+
+			// The next level after root_path
+			name := components[len(root_components)]
 			child := root_path.AddUnsafeChild(name).
-				SetType(api.PATH_TYPE_FILESTORE_ANY)
-			new_child = &vtesting.MockFileInfo{
+				SetType(api.PATH_TYPE_DATASTORE_DIRECTORY)
+
+			new_child := &vtesting.MockFileInfo{
 				Name_:     child.Base(),
 				PathSpec_: child,
 				FullPath_: child.AsClientPath(),
-				Size_:     int64(len(v)),
+				Size_:     0,
 				Mode_:     os.ModeDir,
 			}
-		}
 
-		// Deduplicate on client path
-		key := new_child.PathSpec().AsClientPath()
-		_, pres = seen[key]
-		if !pres {
-			seen[key] = true
-			result = append(result, new_child)
+			seen_dirs[filename] = new_child
 		}
 	}
+
+	// Add any directories
+	for k, v := range seen_dirs {
+		_, pres := seen_files[k]
+		if !pres {
+			seen_files[k] = v
+		}
+	}
+
+	result := []api.FileInfo{}
+	for _, v := range seen_files {
+		result = append(result, v)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		ps1 := result[i].PathSpec()
+		ps2 := result[j].PathSpec()
+		return ps1.AsClientPath() < ps2.AsClientPath()
+	})
 
 	return result, nil
 }
@@ -372,7 +311,7 @@ func (self *MemoryFileStore) Delete(path api.FSPathSpec) error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	filename := pathSpecToPath(path, self.config_obj)
+	filename := pathSpecToPath(self.db, self.config_obj, path)
 	self.Trace("Delete", filename)
 	self.Data.Delete(filename)
 	self.Paths.Delete(filename)
@@ -381,7 +320,7 @@ func (self *MemoryFileStore) Delete(path api.FSPathSpec) error {
 
 func (self *MemoryFileStore) Trace(name, filename string) {
 	return
-	fmt.Printf("Trace MemoryFileStore: %v: %v\n", name, filename)
+	// fmt.Printf("Trace MemoryFileStore: %v: %v\n", name, filename)
 }
 
 func (self *MemoryFileStore) Get(filename string) ([]byte, bool) {
@@ -412,8 +351,9 @@ func (self *MemoryFileStore) Close() error {
 }
 
 func pathSpecToPath(
-	p api.FSPathSpec, config_obj *config_proto.Config) string {
-	return cleanPathForWindows(p.AsFilestoreFilename(config_obj))
+	db datastore.DataStore,
+	config_obj *config_proto.Config, p api.FSPathSpec) string {
+	return cleanPathForWindows(datastore.AsFilestoreFilename(db, config_obj, p))
 }
 
 func cleanPathForWindows(result string) string {
@@ -427,7 +367,9 @@ func cleanPathForWindows(result string) string {
 	return result
 }
 
-func pathDirSpecToPath(p api.FSPathSpec,
-	config_obj *config_proto.Config) string {
-	return cleanPathForWindows(p.AsFilestoreDirectory(config_obj))
+func pathDirSpecToPath(
+	db datastore.DataStore,
+	config_obj *config_proto.Config, p api.FSPathSpec) string {
+	return cleanPathForWindows(
+		datastore.AsFilestoreDirectory(db, config_obj, p))
 }

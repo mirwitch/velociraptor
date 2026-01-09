@@ -3,7 +3,7 @@ package ntfs
 // This is an accessor which represents an NTFS filesystem
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -34,10 +34,12 @@ import (
 
 	ntfs "www.velocidex.com/golang/go-ntfs/parser"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/accessors/file"
 	"www.velocidex.com/golang/velociraptor/accessors/ntfs/readers"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/uploads"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/files"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -74,6 +76,10 @@ func (self *NTFSFileInfo) Data() *ordereddict.Dict {
 
 func (self *NTFSFileInfo) Name() string {
 	return self.info.Name
+}
+
+func (self *NTFSFileInfo) UniqueName() string {
+	return self._full_path.String()
 }
 
 func (self *NTFSFileInfo) Mode() os.FileMode {
@@ -143,6 +149,13 @@ func NewNTFSFileSystemAccessor(
 	}
 }
 
+func (self NTFSFileSystemAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name:        "raw_ntfs",
+		Description: `Access the NTFS filesystem inside an image by parsing NTFS.`,
+	}
+}
+
 func (self NTFSFileSystemAccessor) New(scope vfilter.Scope) (
 	accessors.FileSystemAccessor, error) {
 	// Create a new cache in the scope.
@@ -175,8 +188,17 @@ func (self *NTFSFileSystemAccessor) ReadDir(path string) (
 	return self.ReadDirWithOSPath(fullpath)
 }
 
+// NTFS filesystems are usually case insensitive.
+func (self NTFSFileSystemAccessor) GetCanonicalFilename(
+	path *accessors.OSPath) string {
+	return strings.ToLower(path.String())
+}
+
 func (self *NTFSFileSystemAccessor) ReadDirWithOSPath(
 	fullpath *accessors.OSPath) (res []accessors.FileInfo, err error) {
+
+	defer Instrument("ReadDirWithOSPath")()
+
 	defer func() {
 		r := recover()
 		if r != nil {
@@ -185,6 +207,11 @@ func (self *NTFSFileSystemAccessor) ReadDirWithOSPath(
 			err, _ = r.(error)
 		}
 	}()
+
+	err = file.CheckPrefix(fullpath)
+	if err != nil {
+		return nil, err
+	}
 
 	result := []accessors.FileInfo{}
 
@@ -348,6 +375,8 @@ func (self *NTFSFileSystemAccessor) Open(
 func (self *NTFSFileSystemAccessor) OpenWithOSPath(
 	fullpath *accessors.OSPath) (res accessors.ReadSeekCloser, err error) {
 
+	defer Instrument("OpenWithOSPath")()
+
 	defer func() {
 		r := recover()
 		if r != nil {
@@ -356,6 +385,11 @@ func (self *NTFSFileSystemAccessor) OpenWithOSPath(
 			err, _ = r.(error)
 		}
 	}()
+
+	err = file.CheckPrefix(fullpath)
+	if err != nil {
+		return nil, err
+	}
 
 	device := self.device
 	accessor := self.accessor
@@ -367,9 +401,11 @@ func (self *NTFSFileSystemAccessor) OpenWithOSPath(
 		accessor = fullpath.DelegateAccessor()
 	}
 
-	// We dont want to open a subpath of the filesyste, instead we
+	// We dont want to open a subpath of the filesystem, instead we
 	// special case this as openning the raw device.
 	if len(fullpath.Components) == 0 {
+		defer Instrument("RawDevice")()
+
 		accessor, err := accessors.GetAccessor(accessor, self.scope)
 		if err != nil {
 			return nil, err
@@ -380,13 +416,17 @@ func (self *NTFSFileSystemAccessor) OpenWithOSPath(
 			return nil, err
 		}
 
+		files.Add(device.String())
+
 		reader, err := ntfs.NewPagedReader(
-			utils.MakeReaderAtter(file), 0x1000, 10000)
+			utils.MakeReaderAtter(file), 0x1000, 1000)
 		if err != nil {
 			return nil, err
 		}
 
-		return utils.NewReadSeekReaderAdapter(reader), nil
+		return utils.NewReadSeekReaderAdapter(reader, func() {
+			files.Remove(device.String())
+		}), nil
 
 	}
 
@@ -450,6 +490,11 @@ func (self *NTFSFileSystemAccessor) LstatWithOSPath(
 		}
 	}()
 
+	err = file.CheckPrefix(fullpath)
+	if err != nil {
+		return nil, err
+	}
+
 	device := self.device
 	accessor := self.accessor
 	if device == nil {
@@ -458,6 +503,16 @@ func (self *NTFSFileSystemAccessor) LstatWithOSPath(
 			return nil, err
 		}
 		accessor = fullpath.DelegateAccessor()
+	}
+
+	// Attempting to stat the top level mean that we want to stat the
+	// device itself.
+	if self.device != nil && len(fullpath.Components) == 0 {
+		accessor_obj, err := accessors.GetAccessor(accessor, self.scope)
+		if err != nil {
+			return nil, err
+		}
+		return accessor_obj.LstatWithOSPath(self.device)
 	}
 
 	ntfs_ctx, err := readers.GetNTFSContext(self.scope, device, accessor)
@@ -496,6 +551,8 @@ func Open(scope vfilter.Scope, self *ntfs.MFT_ENTRY,
 	ntfs_ctx *ntfs.NTFSContext,
 	device *accessors.OSPath, accessor string,
 	filename *accessors.OSPath) (*ntfs.MFT_ENTRY, error) {
+
+	defer Instrument("Open")()
 
 	components := filename.Components
 
@@ -562,26 +619,7 @@ func Open(scope vfilter.Scope, self *ntfs.MFT_ENTRY,
 }
 
 func init() {
-	accessors.Register("raw_ntfs", &NTFSFileSystemAccessor{},
-		`Access the NTFS filesystem inside an image by parsing NTFS.
-
-This accessor is designed to operate on images directly. It requires a
-delegate accessor to get the raw image and will open files using the
-NTFS full path rooted at the top of the filesystem.
-
-## Example
-
-The following query will open the $MFT file from the raw image file
-that will be accessed using the file accessor.
-
-SELECT * FROM parse_mft(
-  filename=pathspec(
-    Path="$MFT",
-    DelegateAccessor="file",
-    DelegatePath='ntfs.dd'),
-  accessor="raw_ntfs")
-
-`)
+	accessors.Register(&NTFSFileSystemAccessor{})
 
 	json.RegisterCustomEncoder(&NTFSFileInfo{}, accessors.MarshalGlobFileInfo)
 }

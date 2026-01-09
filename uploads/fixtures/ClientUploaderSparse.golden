@@ -5,12 +5,16 @@
   "FileBuffer": {
    "pathspec": {
     "path": "/foo",
+    "components": [
+     "foo"
+    ],
     "accessor": "ntfs"
    },
    "size": 18,
    "stored_size": 12,
    "is_sparse": true,
-   "data": "SGVsbG8g"
+   "data": "SGVsbG8g",
+   "data_length": 6
   }
  },
  {
@@ -19,13 +23,17 @@
   "FileBuffer": {
    "pathspec": {
     "path": "/foo",
+    "components": [
+     "foo"
+    ],
     "accessor": "ntfs"
    },
    "offset": 6,
    "size": 18,
    "stored_size": 12,
    "is_sparse": true,
-   "data": "aGVsbG8g"
+   "data": "aGVsbG8g",
+   "data_length": 6
   }
  },
  {
@@ -34,6 +42,9 @@
   "FileBuffer": {
    "pathspec": {
     "path": "/foo",
+    "components": [
+     "foo"
+    ],
     "accessor": "ntfs"
    },
    "offset": 12,

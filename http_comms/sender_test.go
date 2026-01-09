@@ -1,26 +1,25 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package http_comms
 
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
 	"os"
 	"sync"
 	"testing"
@@ -36,7 +35,9 @@ import (
 	crypto_test "www.velocidex.com/golang/velociraptor/crypto/testing"
 	"www.velocidex.com/golang/velociraptor/executor"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/responder"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 )
 
@@ -83,7 +84,7 @@ func (self *MockHTTPConnector) Post(ctx context.Context,
 
 	manager := crypto_test.NullCryptoManager{}
 
-	message_info, err := manager.Decrypt(data)
+	message_info, err := manager.Decrypt(ctx, data)
 	require.NoError(self.t, err)
 
 	message_info.IterateJobs(context.Background(), self.config_obj,
@@ -98,7 +99,7 @@ func (self *MockHTTPConnector) Post(ctx context.Context,
 func (self *MockHTTPConnector) ReKeyNextServer(ctx context.Context) {}
 
 func (self *MockHTTPConnector) ServerName() string {
-	return "VelociraptorServer"
+	return utils.GetSuperuserName(self.config_obj)
 }
 
 // Try to send the message immediately.
@@ -216,13 +217,14 @@ func TestSender(t *testing.T) {
 
 	// Make the ring buffer 10 bytes - this is enough for one
 	// message but no more.
-	rb := NewRingBuffer(config_obj, 10)
+	flow_manager := responder.NewFlowManager(ctx, config_obj, "")
+	rb := NewRingBuffer(config_obj, flow_manager, 10, "Sender")
 	testRingBuffer(ctx, rb, config_obj, "0123456789", t)
 }
 
 func TestSenderWithFileBuffer(t *testing.T) {
 	config_obj := config.GetDefaultConfig()
-	tmpfile, err := ioutil.TempFile("", "test")
+	tmpfile, err := tempfile.TempFile("test")
 	require.NoError(t, err)
 	defer os.Remove(tmpfile.Name())
 
@@ -242,7 +244,10 @@ func TestSenderWithFileBuffer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rb, err := NewFileBasedRingBuffer(ctx, config_obj, logger)
+	flow_manager := responder.NewFlowManager(ctx, config_obj, "")
+	local_buffer_name := getLocalBufferName(config_obj)
+	rb, err := NewFileBasedRingBuffer(ctx, config_obj,
+		local_buffer_name, flow_manager, logger)
 	require.NoError(t, err)
 
 	testRingBuffer(ctx, rb, config_obj, "0123456789", t)

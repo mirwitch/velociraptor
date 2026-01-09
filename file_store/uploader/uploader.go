@@ -5,13 +5,18 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"time"
 
 	"www.velocidex.com/golang/velociraptor/accessors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/uploads"
+	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -32,15 +37,29 @@ func (self *FileStoreUploader) Upload(
 	atime time.Time,
 	ctime time.Time,
 	btime time.Time,
-	reader io.Reader) (
+	mode os.FileMode,
+	reader io.ReadSeeker) (
 	*uploads.UploadResponse, error) {
+
+	if !mode.IsRegular() {
+		return nil, fmt.Errorf("%w: Directories not supported",
+			fs.ErrInvalid)
+	}
 
 	if store_as_name == nil {
 		store_as_name = filename
 	}
 
-	output_path := self.root_path.AddUnsafeChild(store_as_name.Components...)
-	out_fd, err := self.file_store.WriteFile(output_path)
+	res, err := self.maybeCollectSparseFile(ctx, reader, store_as_name)
+	if err == nil {
+		return res, nil
+	}
+
+	output_path := self.root_path.AddUnsafeChild(accessor).
+		AddUnsafeChild(store_as_name.Components...)
+	out_fd, err := self.file_store.WriteFileWithCompletion(
+		output_path, utils.SyncCompleter)
+
 	if err != nil {
 		scope.Log("Unable to open file %s: %v",
 			store_as_name.String(), err)
@@ -85,13 +104,18 @@ loop:
 		}
 	}
 
-	scope.Log("Uploaded %v (%v bytes)", output_path.AsClientPath(), offset)
+	// Return paths relative to the storage root.
+	relative_path := path_specs.NewUnsafeFilestorePath(store_as_name.Components...).
+		SetType(api.PATH_TYPE_FILESTORE_ANY)
+
+	scope.Log("Uploaded %v (%v bytes)", relative_path.AsClientPath(), offset)
 	return &uploads.UploadResponse{
-		Path:       output_path.AsClientPath(),
+		Path:       relative_path.AsClientPath(),
 		Size:       uint64(offset),
 		StoredSize: uint64(offset),
 		Sha256:     hex.EncodeToString(sha_sum.Sum(nil)),
 		Md5:        hex.EncodeToString(md5_sum.Sum(nil)),
+		// Full components to the file in Components
 		Components: output_path.Components(),
 	}, nil
 }

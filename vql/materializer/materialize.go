@@ -7,14 +7,15 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"io/ioutil"
+	"os"
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
+	utils_tempfile "www.velocidex.com/golang/velociraptor/utils/tempfile"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/filesystem"
-	"www.velocidex.com/golang/velociraptor/vql/parsers"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/materializer"
 	"www.velocidex.com/golang/vfilter/types"
@@ -30,7 +31,6 @@ type TempFileMatrializer struct {
 	filename string
 	tempfile io.Closer
 	writer   *bufio.Writer
-	lf       []byte
 }
 
 func NewTempFileMatrializer(
@@ -38,13 +38,20 @@ func NewTempFileMatrializer(
 	name string, rows []types.Row) (*TempFileMatrializer, error) {
 
 	// name is a VQL identifier so should be safe.
-	tmpfile, err := ioutil.TempFile(
-		"", "VQL_"+utils.SanitizeString(name)+"_.jsonl")
+	tmpfile, err := tempfile.TempFile(
+		"VQL_" + utils.SanitizeString(name) + "_.jsonl")
 	if err != nil {
 		return nil, err
 	}
-	vql_subsystem.GetRootScope(scope).AddDestructor(
-		func() { filesystem.RemoveFile(scope, tmpfile.Name()) })
+	utils_tempfile.AddTmpFile(tmpfile.Name())
+
+	root_scope := vql_subsystem.GetRootScope(scope)
+	err = root_scope.AddDestructor(func() {
+		filesystem.RemoveTmpFile(0, tmpfile.Name(), root_scope)
+	})
+	if err != nil {
+		return nil, err
+	}
 
 	result := &TempFileMatrializer{
 		filename: tmpfile.Name(),
@@ -90,10 +97,46 @@ func (self *TempFileMatrializer) WriteRow(row types.Row) error {
 // Support StoredQuery protocol.
 func (self TempFileMatrializer) Eval(
 	ctx context.Context, scope types.Scope) <-chan types.Row {
-	return parsers.ParseJsonlPlugin{}.Call(ctx, scope,
-		ordereddict.NewDict().
-			Set("filename", self.filename).
-			Set("accessor", "file"))
+	output_chan := make(chan vfilter.Row)
+
+	go func() {
+		defer close(output_chan)
+
+		fd, err := os.Open(self.filename)
+		if err != nil {
+			scope.Log("Unable to open file %s: %v", self.filename, err)
+			return
+		}
+		defer fd.Close()
+
+		reader := bufio.NewReader(fd)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			default:
+				row_data, err := reader.ReadBytes('\n')
+				if err != nil {
+					return
+				}
+				item := ordereddict.NewDict()
+				err = item.UnmarshalJSON(row_data)
+				if err != nil {
+					return
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+
+				case output_chan <- item:
+				}
+			}
+		}
+	}()
+
+	return output_chan
 }
 
 // Support Associative protocol

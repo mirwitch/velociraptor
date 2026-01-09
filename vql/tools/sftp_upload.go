@@ -1,8 +1,10 @@
-//+build extras
+//go:build extras
+// +build extras
 
 package tools
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -14,9 +16,10 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/net/context"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/uploads"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -39,16 +42,12 @@ func (self *SFTPUploadFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
+	defer vql_subsystem.RegisterMonitor(ctx, "upload_sftp", args)()
+
 	arg := &SFTPUploadArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
 		scope.Log("upload_sftp: %s", err.Error())
-		return vfilter.Null{}
-	}
-
-	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-	if err != nil {
-		scope.Log("upload_SFTP: %s", err)
 		return vfilter.Null{}
 	}
 
@@ -200,6 +199,7 @@ func upload_SFTP(ctx context.Context, scope vfilter.Scope,
 		}, err
 	}
 	if _, err := file.ReadFrom(reader); err != nil {
+		scope.Log("upload_SFTP: while reading file: %v", err)
 		return &uploads.UploadResponse{
 			Error: err.Error(),
 		}, err
@@ -229,9 +229,10 @@ func upload_SFTP(ctx context.Context, scope vfilter.Scope,
 func (self SFTPUploadFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "upload_sftp",
-		Doc:     "Upload files to SFTP.",
-		ArgType: type_map.AddType(scope, &SFTPUploadArgs{}),
+		Name:     "upload_sftp",
+		Doc:      "Upload files to SFTP.",
+		ArgType:  type_map.AddType(scope, &SFTPUploadArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

@@ -3,14 +3,14 @@
   {
    "session_id": "Test23",
    "request_id": 5,
-   "FileBuffer": {
-    "pathspec": {
-     "path": "TestFile.txt",
-     "accessor": "data"
-    },
-    "size": 11,
-    "stored_size": 11,
-    "data": "SGVsbG8gd29ybGQ="
+   "UploadTransaction": {
+    "filename": "/file_0",
+    "accessor": "data",
+    "store_as_name": "/TestFile.txt",
+    "components": [
+     "TestFile.txt"
+    ],
+    "expected_size": 11
    }
   },
   {
@@ -18,7 +18,27 @@
    "request_id": 5,
    "FileBuffer": {
     "pathspec": {
-     "path": "TestFile.txt",
+     "path": "/TestFile.txt",
+     "components": [
+      "TestFile.txt"
+     ],
+     "accessor": "data"
+    },
+    "size": 11,
+    "stored_size": 11,
+    "data": "SGVsbG8gd29ybGQ=",
+    "data_length": 11
+   }
+  },
+  {
+   "session_id": "Test23",
+   "request_id": 5,
+   "FileBuffer": {
+    "pathspec": {
+     "path": "/TestFile.txt",
+     "components": [
+      "TestFile.txt"
+     ],
      "accessor": "data"
     },
     "offset": 11,

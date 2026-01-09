@@ -8,27 +8,6 @@ description: |
 
 type: SERVER
 
-tools:
-  - name: VelociraptorWindows
-    github_project: Velocidex/velociraptor
-    github_asset_regex: windows-amd64.exe
-    serve_locally: true
-
-  - name: VelociraptorWindows_x86
-    github_project: Velocidex/velociraptor
-    github_asset_regex: windows-386.exe
-    serve_locally: true
-
-  - name: VelociraptorLinux
-    github_project: Velocidex/velociraptor
-    github_asset_regex: linux-amd64
-    serve_locally: true
-
-  - name: VelociraptorDarwin
-    github_project: Velocidex/velociraptor
-    github_asset_regex: darwin-amd64
-    serve_locally: true
-
 parameters:
   - name: OS
     default: Windows
@@ -38,6 +17,8 @@ parameters:
       - Windows_x86
       - Linux
       - MacOS
+      - MacOSArm
+      - Generic
 
   - name: artifacts
     description: A list of artifacts to collect
@@ -71,6 +52,9 @@ parameters:
       - GCS
       - S3
       - SFTP
+      - Azure
+      - SMBShare
+      - WebDAV
 
   - name: target_args
     description: Type Dependent args
@@ -102,9 +86,14 @@ parameters:
     description: A directory to write tempfiles in
 
   - name: opt_level
-    default: "4"
+    default: "5"
     type: int
     description: Compression level (0=no compression).
+
+  - name: opt_concurrency
+    default: "2"
+    type: int
+    description: Number of concurrency queries
 
   - name: opt_format
     default: "jsonl"
@@ -112,7 +101,18 @@ parameters:
 
   - name: opt_output_directory
     default: ""
-    description: An optional output directory prefix
+    description: Where we actually write the collection to. You can specify this as a mapped drive to write over the network.
+
+  - name: opt_filename_template
+    default: "Collection-%Hostname%-%TIMESTAMP%"
+    description: |
+      The filename to use. You can expand environment variables as
+      well as the following: %Hostname%, %FQDN% and %TIMESTAMP%.
+
+  - name: opt_collector_filename
+    type: string
+    description: |
+      If used, this option overrides the default filename of the collector being built.
 
   - name: opt_cpu_limit
     default: "0"
@@ -136,19 +136,40 @@ parameters:
       If specified the collection must complete in the given time. It
       will be cancelled if the collection exceeds this time.
 
+  - name: opt_version
+    default: ""
+    type: string
+    description: |
+      If specified the collection will be packed with the specified
+      version of the binary. NOTE: This is rarely what you want
+      because the packed builtin artifacts are only compatible with
+      the current release version.
+
+  - name: opt_delete_at_exit
+    type: bool
+    default: N
+    description: |
+      If specified the collection will be deleted at exit. This only
+      makes sense when uploading to the cloud or a remote
+      location. NOTE: There is no way to check that the upload
+      actually worked so this flag deletes the collection regardless
+      of upload success.
+
   - name: StandardCollection
     type: hidden
     default: |
-      LET _ <= log(message="Will collect package " + filename)
+      LET _ <= log(message="Will collect package %v", args=zip_filename)
 
       SELECT * FROM collect(artifacts=Artifacts,
-            args=Parameters, output=filename + ".zip",
+            args=Parameters, output=zip_filename,
             cpu_limit=CpuLimit,
             progress_timeout=ProgressTimeout,
             timeout=Timeout,
             password=pass[0].Pass,
             level=Level,
+            concurrency=Concurrency,
             format=Format,
+            remapping=Remapping,
             metadata=ContainerMetadata)
 
   - name: S3Collection
@@ -160,24 +181,51 @@ parameters:
           accessor=accessor,
           bucket=TargetArgs.bucket,
           name=name,
-          credentialskey=TargetArgs.credentialsKey,
-          credentialssecret=TargetArgs.credentialsSecret,
+          credentials_key=TargetArgs.credentialsKey,
+          credentials_secret=TargetArgs.credentialsSecret,
+          credentials_token=TargetArgs.credentialsToken,
           region=TargetArgs.region,
           endpoint=TargetArgs.endpoint,
-          serversideencryption=TargetArgs.serverSideEncryption,
-          noverifycert=TargetArgs.noverifycert)
+          serverside_encryption=TargetArgs.serverSideEncryption,
+          kms_encryption_key=TargetArgs.kmsEncryptionKey,
+          s3upload_root=TargetArgs.s3UploadRoot,
+          skip_verify=TargetArgs.noverifycert)
 
   - name: GCSCollection
     type: hidden
     default: |
+      LET GCSBlob <= parse_json(data=target_args.GCSKey)
+
       // A utility function to upload the file.
       LET upload_file(filename, name, accessor) = upload_gcs(
           file=filename,
           accessor=accessor,
-          bucket=TargetArgs.bucket,
+          bucket=target_args.bucket,
           project=GCSBlob.project_id,
           name=name,
-          credentials=TargetArgs.GCSKey)
+          credentials=target_args.GCSKey)
+
+  - name: AzureSASURL
+    type: hidden
+    default: |
+      // A utility function to upload the file.
+      LET upload_file(filename, name, accessor) = upload_azure(
+          file=filename,
+          accessor=accessor,
+          sas_url=TargetArgs.sas_url,
+          name=name)
+
+  - name: SMBCollection
+    type: hidden
+    default: |
+      // A utility function to upload the file.
+      LET upload_file(filename, name, accessor) = upload_smb(
+          file=filename,
+          accessor=accessor,
+          username=TargetArgs.username,
+          password=TargetArgs.password,
+          server_address=TargetArgs.server_address,
+          name=name)
 
   - name: SFTPCollection
     type: hidden
@@ -192,22 +240,81 @@ parameters:
         endpoint=TargetArgs.endpoint,
         hostkey = TargetArgs.hostkey)
 
+  - name: WebDAVCollection
+    type: hidden
+    default : |
+      LET upload_file(filename, name, accessor) = upload_webdav(
+        file=filename,
+        accessor=accessor,
+        name=name,
+        url=TargetArgs.url,
+        basic_auth_user=TargetArgs.basic_auth_user,
+        basic_auth_password=TargetArgs.basic_auth_password,
+        user_agent=TargetArgs.user_agent)
+
   - name: CommonCollections
     type: hidden
     default: |
+      LET S = scope()
+      LET Remapping <= if(condition=Remapping,
+          then=log(message="Will load remapping rules from %v", args=Remapping) &&
+               read_file(filename=Remapping),
+          else="")
+
       // Add all the tools we are going to use to the inventory.
-      LET _ <= SELECT inventory_add(tool=ToolName, hash=ExpectedHash)
+      LET _ <= SELECT inventory_add(tool=ToolName, hash=ExpectedHash, version=S.Version)
        FROM parse_csv(filename="/uploads/inventory.csv", accessor="me")
-       WHERE log(message="Adding tool " + ToolName)
+       WHERE log(message="Adding tool " + ToolName +
+             " version " + (S.Version || "Unknown"))
 
-      LET baseline <= SELECT Fqdn, basename(path=Exe) AS Exe FROM info()
+      LET baseline <= SELECT Fqdn, dirname(path=Exe) AS ExePath, Exe,
+         scope().CWD AS CWD, Hostname
+      FROM info()
 
-      // Make the filename safe on windows but we trust the OutputPrefix.
-      LET filename <= OutputPrefix + regex_replace(
-          source=format(format="Collection-%s-%s",
-                        args=[baseline[0].Fqdn,
-                              timestamp(epoch=now()).MarshalText]),
+      LET OutputPrefix <= if(condition= OutputPrefix,
+        then=pathspec(parse=OutputPrefix),
+        else= if(condition= baseline[0].CWD,
+          then=pathspec(parse= baseline[0].CWD),
+          else=pathspec(parse= baseline[0].ExePath)))
+
+      LET _ <= log(message="Output Prefix : %v", args= OutputPrefix)
+
+      LET FormatMessage(Message) = regex_transform(
+          map=dict(`%FQDN%`=baseline[0].Fqdn,
+                   `%Hostname%`=baseline[0].Hostname,
+                   `%Timestamp%`=timestamp(epoch=now()).MarshalText),
+          source=Message)
+
+      // Format the filename safely according to the filename
+      // template. This will be the name uploaded to the bucket.
+      LET formatted_zip_name <= regex_replace(
+          source=expand(path=FormatMessage(Message=FilenameTemplate)),
           re="[^0-9A-Za-z\\-]", replace="_")
+
+      // This is where we write the files on the endpoint.
+      LET zip_filename <= OutputPrefix + ( formatted_zip_name + ".zip" )
+      LET LogFile <= OutputPrefix + ( formatted_zip_name + ".log" )
+
+      LET _ <= log(message="Log file is at %v", args=LogFile)
+
+      // Create the log file and start writing into it
+      // Just forward output from the logging() plugin
+      LET LogPipe <= pipe(query={
+        SELECT format(format="[%v] %v %v\n",
+                      args=(level, time, msg)) AS Line
+        FROM logging(prelog=TRUE)
+      })
+
+      LET _ <= background(query={
+          SELECT copy(accessor="pipe", filename="LogPipe", dest=LogFile) AS C
+          FROM scope()
+      })
+
+      -- Remove the zip file and log file when done if the user asked for it.
+      LET _ <= if(condition=DeleteOnExit, then=atexit(query={
+         SELECT rm(filename=zip_filename), rm(filename=log_filename) FROM scope()
+         WHERE log(message="Removed Zip file %v", args=zip_filename)
+      }, env=dict(zip_filename=zip_filename, log_filename=LogFile)))
 
       -- Make a random hex string as a random password
       LET RandomPassword <= SELECT format(format="%02x",
@@ -250,75 +357,43 @@ parameters:
     default: |
       LET TargetArgs <= target_args
 
-      // Try to upload the log file now to see if we are even able to
-      // upload at all - we do this to avoid having to collect all the
-      // data and then failing the upload step.
-      LET _ <= log(message="Uploading to " + filename + ".log")
-      LET upload_test <= upload_file(
-          filename="Test upload from " + baseline[0].Exe,
-          accessor="data",
-          name=filename + ".log")
+      // When uploading to the cloud it is allowed to use directory //
+      // separators and we trust the filename template to be a valid
+      // filename.
+      LET upload_name <= regex_replace(
+          source=expand(path=FormatMessage(Message=FilenameTemplate)),
+          re="[^0-9A-Za-z\\-/]", replace="_")
 
-      LET _ <= log(message="Will collect package " + filename +
-         " and upload to cloud bucket " + TargetArgs.bucket)
+      LET _ <= log(message="Will collect package %v and upload to cloud bucket %v",
+         args=[zip_filename, TargetArgs.bucket])
 
-      LET collect_and_upload = SELECT
+      LET Result <= SELECT
           upload_file(filename=Container,
-                      name=filename+".zip",
+                      name= upload_name + ".zip",
                       accessor="file") AS Upload,
-          upload_file(filename=baseline[0].Exe + ".log",
-                      name=filename+".log",
+          upload_file(filename=LogFile,
+                      name= upload_name + ".log",
                       accessor="file") AS LogUpload
 
       FROM collect(artifacts=Artifacts,
           args=Parameters,
           format=Format,
-          output=tempfile(extension=".zip"),
+          output=zip_filename,
           cpu_limit=CpuLimit,
           progress_timeout=ProgressTimeout,
           timeout=Timeout,
           password=pass[0].Pass,
           level=Level,
+          concurrency=Concurrency,
+          remapping=Remapping,
           metadata=ContainerMetadata)
 
-      SELECT * FROM if(condition=upload_test.Path,
-          then=collect_and_upload,
-          else={SELECT log(
-             message="Aborting collection: Failed to upload to cloud bucket!")
-          FROM scope()})
+      LET _ <= if(condition=NOT Result[0].Upload.Path,
+         then=log(message="<red>Failed to upload to cloud bucket!</> Leaving the collection behind for manual upload!"),
+         else=log(message="<green>Collection Complete!</> Please remove %v when you are sure it was properly transferred", args=zip_filename))
 
-  - name: PackageToolsArtifact
-    description: Collects and uploads third party binaries.
-    type: hidden
-    default: |
-      name: PackageToolsArtifact
-      parameters:
-       - name: Binaries
-         type: json_array
-         default: '[]'
-      sources:
-       - query: |
-          LET temp <= tempfile()
+      SELECT * FROM Result
 
-          LET uploader = SELECT ToolName,
-                                Upload.StoredName AS Filename,
-                                Upload.sha256 AS ExpectedHash,
-                                Upload.Size AS Size
-          FROM foreach(row=Binaries,
-            query={
-              SELECT _value AS ToolName, upload(file=FullPath, name=Name) AS Upload
-              FROM Artifact.Generic.Utils.FetchBinary(
-                   ToolName=_value, SleepDuration='0',
-                   ToolInfo=inventory_get(tool=_value))
-            })
-
-          // Flush the entire query into the inventory file.
-          LET _ <= SELECT * FROM write_csv(filename=temp, query=uploader)
-
-          // Now upload it.
-          SELECT upload(file=temp, name="inventory.csv") AS Inventory,
-                 read_file(filename=temp) AS Data
-          FROM scope()
 
   - name: FetchBinaryOverride
     type: hidden
@@ -328,6 +403,7 @@ parameters:
 
     default: |
        LET RequiredTool <= ToolName
+       LET S = scope()
 
        LET matching_tools <= SELECT ToolName, Filename
        FROM parse_csv(filename="/uploads/inventory.csv", accessor="me")
@@ -336,61 +412,289 @@ parameters:
        LET get_ext(filename) = parse_string_with_regex(
              regex="(\\.[a-z0-9]+)$", string=filename).g1
 
-       LET temp_binary <= if(condition=matching_tools,
-       then=tempfile(
-                extension=get_ext(filename=matching_tools[0].Filename),
-                remove_last=TRUE,
-                permissions=if(condition=IsExecutable, then="x")))
+        LET FullPath <= if(condition=matching_tools,
+        then=copy(filename=matching_tools[0].Filename,
+             accessor="me", dest=tempfile(
+                 extension=get_ext(filename=matching_tools[0].Filename),
+                 remove_last=TRUE,
+                 permissions=if(condition=IsExecutable, then="x"))))
 
-       SELECT copy(filename=Filename, accessor="me", dest=temp_binary) AS FullPath,
+       SELECT FullPath, FullPath AS OSPath,
               Filename AS Name
        FROM matching_tools
 
+export: |
+  // Use this JSON schema to validate an offline collector spec.yaml
+  LET SpecSchema <= '''
+  {
+    "type": "object",
+    "properties": {
+        "OS": {
+           "description": "OS Target to use",
+           "enum": ["Generic", "Windows", "Linux", "Windows_x86", "MacOS", "MacOSArm"],
+           "default": "Generic"
+        },
+        "Artifacts": {
+           "type": "object",
+           "description": "Keys are artifact names to collect and values are strings",
+           "patternProperties": {
+              "^.+$": {
+                "type": "object",
+                "patternProperties": {
+                   "^.+$": {
+                      "type": "string"
+                   }
+                }
+              }
+           }
+        },
+        "Target": {
+           "description": "The type of collector to use",
+           "enum": ["ZIP", "GCS", "S3", "Azure", "SMBShare", "SFTP", "WebDAV"]
+        },
+        "EncryptionScheme": {
+           "enum": ["None", "X509", "Password", "PGP"],
+           "default": "None"
+        },
+        "EncryptionArgs": {
+           "type": "object",
+           "description": "Args for encryption",
+           "properties": {
+             "public_key": {
+               "type": "string"
+             },
+             "password": {
+               "type": "string"
+             }
+           },
+           "additionalProperties": false
+        },
+        "OptVerbose": {
+           "type": "boolean",
+           "default": true
+        },
+        "OptBanner": {
+           "type": "boolean",
+           "default": true
+        },
+        "OptPrompt": {
+           "type": "boolean",
+           "default": false
+        },
+        "OptAdmin": {
+           "type": "boolean",
+           "default": true
+        },
+        "OptTempdir": {
+            "type": "string",
+            "default": "$TMP"
+        },
+        "OptLevel": {
+           "type": "integer",
+           "default": 5
+        },
+        "OptConcurrency": {
+           "type": "integer",
+           "default": 2
+        },
+        "OptFilenameTemplate": {
+           "type": "string",
+           "default": "Collection-%FQDN%-%TIMESTAMP%"
+        },
+        "OptCollectorTemplate": {"type": "string"},
+        "OptFormat": {
+          "enum": ["jsonl", "csv"],
+          "default": "jsonl"
+        },
+        "OptOutputDirectory":  {"type": "string"},
+        "OptCpuLimit":  {"type": "integer"},
+        "OptProgressTimeout":  {"type": "integer"},
+        "OptTimeout":  {"type": "integer"},
+        "OptDeleteAtExit":  {"type": "boolean"}
+    },
+    "allOf": [
+      { "description": "Target Args for GCS",
+        "if": {
+           "properties": { "Target": { "const": "GCS" } }
+        },
+        "then": {
+           "properties": {
+              "TargetArgs": {
+                 "type": "object",
+                 "properties": {
+                    "bucket": {"type": "string"},
+                    "GCSKey": {"type": "string"}
+                 },
+                 "additionalProperties": false,
+                 "required": ["bucket", "GCSKey"]
+              }
+           }
+        }
+      },
+      { "description": "Target Args for S3",
+        "if": {
+           "properties": { "Target": { "const": "S3" } }
+        },
+        "then": {
+           "properties": {
+              "TargetArgs": {
+               "type": "object",
+               "properties": {
+                 "bucket": {"type": "string"},
+                 "credentialsKey": {"type": "string"},
+                 "credentialsSecret": {"type": "string"},
+                 "credentialsToken": {"type": "string"},
+                 "region": {"type": "string"},
+                 "endpoint": {"type": "string"},
+                 "s3UploadRoot": {"type": "string"},
+                 "serverSideEncryption": {"type": "string"},
+                 "kmsEncryptionKey": {"type": "string"},
+                 "noverifycert": {"type": "boolean"}
+               },
+               "additionalProperties": false,
+               "required": ["bucket"]
+              }
+           }
+        }
+      },
+      { "description": "Target Args for AzureSASURL",
+        "if": {
+           "properties": { "Target": { "const": "Azure" } }
+        },
+        "then": {
+           "properties": {
+              "TargetArgs": {
+                 "type": "object",
+                 "properties": {
+                    "sas_url": {"type": "string"}
+                 },
+                 "additionalProperties": false,
+                 "required": ["sas_url"]
+              }
+           }
+        }
+      },
+      { "description": "Target Args for SMBShare",
+        "if": {
+           "properties": { "Target": { "const": "SMBShare" } }
+        },
+        "then": {
+           "properties": {
+              "TargetArgs": {
+                 "type": "object",
+                 "properties": {
+                   "username": {"type": "string"},
+                   "password": {"type": "string"},
+                   "server_address": {"type": "string"}
+                 },
+                 "additionalProperties": false,
+                 "required": ["username", "password", "server_address"]
+              }
+           }
+        }
+      },
+      { "description": "Target Args for SFTPCollection",
+        "if": {
+           "properties": { "Target": { "const": "SFTP" } }
+        },
+        "then": {
+           "properties": {
+              "TargetArgs": {
+                 "type": "object",
+                  "properties": {
+                     "path": {"type": "string"},
+                     "privatekey": {"type": "string"},
+                     "user": {"type": "string"},
+                     "endpoint": {"type": "string"},
+                     "hostkey": {"type": "string"}
+                  },
+                  "additionalProperties": false,
+                  "required": ["user", "privatekey", "endpoint"]
+              }
+           }
+        }
+      },
+      { "description": "Target Args for WebDAVCollection",
+        "if": {
+           "properties": { "Target": { "const": "WebDAV" } }
+        },
+        "then": {
+           "properties": {
+              "TargetArgs": {
+                 "type": "object",
+                  "properties": {
+                     "url": {"type": "string"},
+                     "basic_auth_user": {"type": "string"},
+                     "basic_auth_password": {"type": "string"},
+                     "user_agent": {"type": "string"}
+                  },
+                  "additionalProperties": false,
+                  "required": ["url"]
+              }
+           }
+        }
+      },
+      { "description": "Target Args for ZIP",
+        "if": {
+           "properties": { "Target": { "const": "ZIP" } }
+        },
+        "then": {
+           "properties": {
+              "TargetArgs": {
+                 "type": "object",
+                 "default": {},
+                 "additionalProperties": false,
+                 "properties": {}
+             }
+           }
+        }
+      }
+    ]
+  }
+  '''
+
 sources:
   - query: |
-      LET Payload <= tempfile(extension=".zip")
+      LET ParameterSpec <= to_dict(item={
+         SELECT _value AS _key, dict() AS _value
+         FROM foreach(row=artifacts)
+      }) + parameters
+
+      -- Check for errors in the Spec
+      LET _ <= SELECT {
+         SELECT name FROM artifact_definitions(names=_key)
+      } AS Def
+      FROM items(item=ParameterSpec)
+      WHERE Def || log(message="Artifact <red>%v</> not found",
+           args=_key, dedup= -1, level="ERROR")
+
       LET Binaries <= SELECT * FROM foreach(
           row={
-             SELECT tools FROM artifact_definitions(names=artifacts)
+             SELECT tools FROM artifact_definitions(deps=TRUE, names=artifacts)
           }, query={
              SELECT * FROM foreach(row=tools,
              query={
-              SELECT name AS Binary FROM scope()
+                SELECT name AS Binary FROM scope()
              })
           }) GROUP BY Binary
-
-      // Get some tempfiles to work with.
-      LET Config <= tempfile()
-      LET Destination <= tempfile()
 
       // Choose the right target binary depending on the target OS
       LET tool_name = SELECT * FROM switch(
        a={ SELECT "VelociraptorWindows" AS Type FROM scope() WHERE OS = "Windows"},
        b={ SELECT "VelociraptorWindows_x86" AS Type FROM scope() WHERE OS = "Windows_x86"},
        c={ SELECT "VelociraptorLinux" AS Type FROM scope() WHERE OS = "Linux"},
-       d={ SELECT "VelociraptorDarwin" AS Type FROM scope() WHERE OS = "MacOS"},
-       e={ SELECT "" AS Type FROM scope()
+       d={ SELECT "VelociraptorCollector" AS Type FROM scope() WHERE OS = "MacOS"},
+       e={ SELECT "VelociraptorCollector" AS Type FROM scope() WHERE OS = "MacOSArm"},
+       f={ SELECT "VelociraptorCollector" AS Type FROM scope() WHERE OS = "Generic"},
+       g={ SELECT "" AS Type FROM scope()
            WHERE NOT log(message="Unknown target type " + OS) }
       )
 
-      // Repack this binary.
-      LET _ <= log(message="Will get tool " + tool_name[0].Type)
-
-      LET target_binary <= SELECT FullPath, Name
-         FROM Artifact.Generic.Utils.FetchBinary(
-            ToolName=tool_name[0].Type, SleepDuration="0",
-            ToolInfo=inventory_get(tool=tool_name[0].Type))
-         WHERE log(message="Target binary " + Name + " is at " + FullPath)
+      LET Target <= tool_name[0].Type
 
       // This is what we will call it.
-      LET CollectorName <= format(
-          format='Collector_%v',
-          args=[target_binary[0].Name, ])
-
-      // Create a zip file with the binaries in it.
-      LET _ <= SELECT * FROM collect(artifacts="PackageToolsArtifact",
-         output=Payload, args=dict(PackageToolsArtifact=dict(Binaries=Binaries.Binary)),
-         artifact_definitions=PackageToolsArtifact)
+      LET CollectorName <= opt_collector_filename ||
+          format(format='Collector_%v', args=inventory_get(tool=Target).Definition.filename)
 
       LET CollectionArtifact <= SELECT Value FROM switch(
         a = { SELECT CommonCollections + StandardCollection AS Value
@@ -405,12 +709,21 @@ sources:
         d = { SELECT SFTPCollection + CommonCollections + CloudCollection AS Value
               FROM scope()
               WHERE target = "SFTP" },
-        e = { SELECT "" AS Value  FROM scope()
+        e = { SELECT AzureSASURL + CommonCollections + CloudCollection AS Value
+              FROM scope()
+              WHERE target = "Azure" },
+        f = { SELECT SMBCollection + CommonCollections + CloudCollection AS Value
+              FROM scope()
+              WHERE target = "SMBShare" },
+        g = { SELECT WebDAVCollection + CommonCollections + CloudCollection AS Value
+              FROM scope()
+              WHERE target = "WebDAV" },
+        z = { SELECT "" AS Value  FROM scope()
               WHERE log(message="Unknown collection type " + target) }
       )
 
       LET use_server_cert = encryption_scheme =~ "x509"
-         AND NOT encryption_args.public_key =~ "----BEGIN CERTIFICATE-----"
+         AND NOT encryption_args.public_key =~ "-----BEGIN CERTIFICATE-----"
          AND log(message="Pubkey encryption specified, but no cert/key provided. Defaulting to server frontend cert")
 
       -- For x509, if no public key cert is specified, we use the
@@ -420,13 +733,14 @@ sources:
          condition=use_server_cert,
          then=dict(public_key=server_frontend_cert(),
                    scheme="x509"),
-         else=encryption_args
+         else=encryption_args || dict()
       )
 
+      -- Add custom definition if needed. Built in definitions are not added
       LET definitions <= SELECT * FROM chain(
-      a = { SELECT name, description, tools, parameters, sources
-            FROM artifact_definitions(names=artifacts)
-            WHERE NOT built_in AND
+      a = { SELECT name, description, tools, export, parameters, sources
+            FROM artifact_definitions(deps=TRUE, names=artifacts)
+            WHERE NOT compiled_in AND
               log(message="Adding artifact_definition for " + name) },
 
       // Create the definition of the Collector artifact.
@@ -435,7 +749,7 @@ sources:
                          default=serialize(format='json', item=artifacts),
                          type="json_array"),
                     dict(name="Parameters",
-                         default=serialize(format='json', item=parameters),
+                         default=serialize(format='json', item=ParameterSpec),
                          type="json"),
                     dict(name="encryption_scheme", default=encryption_scheme),
                     dict(name="encryption_args",
@@ -443,13 +757,17 @@ sources:
                          type="json"
                          ),
                     dict(name="Level", default=opt_level, type="int"),
+                    dict(name="Remapping", default=""),
+                    dict(name="Concurrency", default=opt_concurrency, type="int"),
                     dict(name="Format", default=opt_format),
                     dict(name="OutputPrefix", default=opt_output_directory),
+                    dict(name="FilenameTemplate", default=opt_filename_template),
                     dict(name="CpuLimit", type="int",
                          default=opt_cpu_limit),
                     dict(name="ProgressTimeout", type="int",
                          default=opt_progress_timeout),
                     dict(name="Timeout", default=opt_timeout, type="int"),
+                    dict(name="DeleteOnExit", default=opt_delete_at_exit, type="bool"),
                     dict(name="target_args",
                          default=serialize(format='json', item=target_args),
                          type="json"),
@@ -465,6 +783,8 @@ sources:
                dict(name="SleepDuration", type="int", default="0"),
                dict(name="ToolName"),
                dict(name="ToolInfo"),
+               dict(name="TemporaryOnly", type="bool"),
+               dict(name="Version"),
                dict(name="IsExecutable", type="bool", default="Y"),
             ) AS parameters,
             (
@@ -484,31 +804,39 @@ sources:
       // Build the autoexec config file depending on the user's
       // collection type choices.
       LET autoexec <= dict(autoexec=dict(
-          argv=("artifacts", "collect", "Collector",
-                "--logfile", CollectorName + ".log") + optional_cmdline.Opt,
+          argv=("artifacts", "collect", "Collector") + optional_cmdline.Opt,
           artifact_definitions=definitions)
       )
 
-      LET me <= SELECT Exe FROM info()
-                WHERE log(message="My binary is " + Exe)
+      LET _ <= upload(accessor="data", file=serialize(format="yaml",
+        item=dict(
+          OS=OS,
+          Artifacts=ParameterSpec,
+          Target=target,
+          EncryptionScheme=encryption_scheme || "None",
+          EncryptionArgs=encryption_args || dict(),
+          OptVerbose=opt_verbose,
+          OptBanner=opt_banner,
+          OptPrompt=opt_prompt,
+          OptAdmin=opt_admin,
+          OptTempdir=opt_tempdir,
+          OptLevel=opt_level,
+          OptConcurrency=opt_concurrency,
+          OptFormat=opt_format,
+          OptOutputDirectory=opt_output_directory,
+          OptFilenameTemplate=opt_filename_template,
+          OptCollectorFilename=opt_collector_filename,
+          OptCpuLimit=opt_cpu_limit,
+          OptProgressTimeout=opt_progress_timeout,
+          OptTimeout=opt_timeout,
+          OptDeleteAtExit=opt_delete_at_exit
+        )), name="spec.yaml")
 
-      // Copy the configuration to a temp file and shell out to our
-      // binary to repack it.
-      LET repack_step = SELECT upload(
-           file=Destination,
-           accessor="file",
-           name=CollectorName) AS Binary,
-           timestamp(epoch=now()) As CreationTime
-      FROM execve(argv=[
-        me[0].Exe, "config", "repack",
-        "--exe", target_binary[0].FullPath,
-        "--append", Payload,
-        copy(dest=Config,
-             accessor='data',
-             filename=serialize(format='json', item=autoexec)),
-        Destination ], length=1000000)
-      WHERE log(message="Creating config on " + Config) AND log(message=Stderr)
-
-      // Only actually run stuff if everything looks right.
-      SELECT * FROM if(condition=autoexec AND target_binary AND me[0].Exe,
-         then=repack_step)
+      // Do the actual repacking.
+      SELECT repack(
+           upload_name=CollectorName,
+           target=tool_name[0].Type,
+           binaries=Binaries.Binary,
+           version=opt_version,
+           config=serialize(format='json', item=autoexec)) AS Repacked
+      FROM scope()

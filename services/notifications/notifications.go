@@ -27,6 +27,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/notifications"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/debug"
 	"www.velocidex.com/golang/velociraptor/services/journal"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
@@ -71,6 +72,8 @@ type Notifier struct {
 	uuid int64
 
 	client_connection_tracker map[string]*tracker
+
+	config_obj *config_proto.Config
 }
 
 // The notifier service watches for events from
@@ -84,9 +87,16 @@ func NewNotificationService(
 	config_obj *config_proto.Config) (services.Notifier, error) {
 
 	self := &Notifier{
-		notification_pool:         notifications.NewNotificationPool(),
+		notification_pool:         notifications.NewNotificationPool(ctx, wg),
 		uuid:                      utils.GetGUID(),
 		client_connection_tracker: make(map[string]*tracker),
+		config_obj:                config_obj,
+	}
+
+	// On clients the notifications service is local only.
+	if config_obj.Services != nil &&
+		config_obj.Services.ClientEventTable {
+		return self, nil
 	}
 
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
@@ -124,10 +134,7 @@ func NewNotificationService(
 			self.mu.Lock()
 			defer self.mu.Unlock()
 
-			if self.notification_pool != nil {
-				self.notification_pool.Shutdown()
-			}
-			self.notification_pool = nil
+			self.notification_pool.Shutdown()
 		}()
 		defer logger.Info("<red>Exiting</> notification service for %v!",
 			services.GetOrgName(config_obj))
@@ -146,13 +153,18 @@ func NewNotificationService(
 				if !ok {
 					continue
 				}
-				if self.notification_pool != nil {
-					notificationsReceivedCounter.Inc()
-					self.notification_pool.Notify(target)
-				}
+				notificationsReceivedCounter.Inc()
+				self.notification_pool.Notify(target)
 			}
 		}
 	}()
+
+	debug.RegisterProfileWriter(debug.ProfileWriterInfo{
+		Name:          "notifier-" + utils.GetOrgId(config_obj),
+		Description:   "Information about directly connected clients.",
+		ProfileWriter: self.WriteProfile,
+		Categories:    []string{"Org", services.GetOrgName(config_obj), "Services"},
+	})
 
 	return self, nil
 }
@@ -218,12 +230,9 @@ func (self *Notifier) ProcessPing(ctx context.Context,
 		return nil
 	}
 
-	is_client_connected := false
-	if self.notification_pool != nil {
-		is_client_connected = self.notification_pool.IsClientConnected(client_id)
-	}
+	is_client_connected := self.notification_pool.IsClientConnected(client_id)
 
-	return journal.PushRowsToArtifact(config_obj,
+	return journal.PushRowsToArtifact(ctx, config_obj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("ClientId", client_id).
 			Set("NotifyTarget", notify_target).
@@ -233,25 +242,17 @@ func (self *Notifier) ProcessPing(ctx context.Context,
 }
 
 func (self *Notifier) ListenForNotification(client_id string) (chan bool, func()) {
-	self.mu.Lock()
-	if self.notification_pool == nil {
-		self.notification_pool = notifications.NewNotificationPool()
-	}
-	notification_pool := self.notification_pool
-	self.mu.Unlock()
-
-	return notification_pool.Listen(client_id)
+	return self.notification_pool.Listen(client_id)
 }
 
 func (self *Notifier) CountConnectedClients() uint64 {
-	if self.notification_pool == nil {
-		return 0
-	}
 	return self.notification_pool.Count()
 }
 
-func (self *Notifier) NotifyListener(config_obj *config_proto.Config,
+func (self *Notifier) NotifyListener(
+	ctx context.Context, config_obj *config_proto.Config,
 	id, tag string) error {
+
 	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return err
@@ -259,7 +260,7 @@ func (self *Notifier) NotifyListener(config_obj *config_proto.Config,
 
 	// We need to send this ASAP so we do not use an async send.
 	notificationsSentCounter.Inc()
-	return journal.PushRowsToArtifact(config_obj,
+	return journal.PushRowsToArtifact(ctx, config_obj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("Tag", tag).
 			Set("Target", id)},
@@ -271,21 +272,20 @@ func (self *Notifier) NotifyDirectListener(client_id string) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	if self.notification_pool != nil &&
-		self.notification_pool.IsClientConnected(client_id) {
+	if self.notification_pool.IsClientConnected(client_id) {
 		self.notification_pool.Notify(client_id)
 	}
 }
 
-func (self *Notifier) NotifyListenerAsync(config_obj *config_proto.Config,
-	id, tag string) {
+func (self *Notifier) NotifyListenerAsync(
+	ctx context.Context, config_obj *config_proto.Config, id, tag string) {
 	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return
 	}
 
 	notificationsSentCounter.Inc()
-	journal.PushRowsToArtifactAsync(config_obj,
+	journal.PushRowsToArtifactAsync(ctx, config_obj,
 		ordereddict.NewDict().
 			Set("Tag", tag).
 			Set("Target", id),
@@ -293,18 +293,13 @@ func (self *Notifier) NotifyListenerAsync(config_obj *config_proto.Config,
 }
 
 func (self *Notifier) IsClientDirectlyConnected(client_id string) bool {
-	if self.notification_pool == nil {
-		return false
-	}
+	self.mu.Lock()
+	defer self.mu.Unlock()
 
 	return self.notification_pool.IsClientConnected(client_id)
 }
 
 func (self *Notifier) ListClients() []string {
-	if self.notification_pool == nil {
-		return nil
-	}
-
 	return self.notification_pool.ListClients()
 }
 
@@ -371,7 +366,7 @@ func (self *Notifier) IsClientConnected(
 	self.mu.Unlock()
 
 	// Push request immediately for low latency.
-	err = journal.PushRowsToArtifact(config_obj,
+	err = journal.PushRowsToArtifact(ctx, config_obj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("ClientId", client_id).
 			Set("NotifyTarget", id)},
@@ -386,7 +381,7 @@ func (self *Notifier) IsClientConnected(
 		// Signal that all minions indicated if the client was found
 		// or not.
 
-	case <-time.After(time.Duration(timeout) * time.Second):
+	case <-time.After(utils.Jitter(time.Duration(timeout) * time.Second)):
 		if timeout > 0 {
 			timeoutClientPing.Inc()
 		}

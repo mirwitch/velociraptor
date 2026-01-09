@@ -3,7 +3,6 @@ package directory_test
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -13,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"www.velocidex.com/golang/velociraptor/config"
+	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/directory"
 	"www.velocidex.com/golang/velociraptor/file_store/memory"
@@ -21,6 +21,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/simple"
@@ -35,7 +36,7 @@ type: SERVER_EVENT
 )
 
 func TestDirectoryQueueManager(t *testing.T) {
-	dir, err := ioutil.TempDir("", "file_store_test")
+	dir, err := tempfile.TempDir("file_store_test")
 	assert.NoError(t, err)
 
 	defer os.RemoveAll(dir) // clean up
@@ -45,10 +46,13 @@ func TestDirectoryQueueManager(t *testing.T) {
 	ConfigObj.Datastore.FilestoreDirectory = dir
 	ConfigObj.Datastore.Location = dir
 
-	file_store := memory.NewMemoryFileStore(ConfigObj)
-	manager := directory.NewDirectoryQueueManager(ConfigObj, file_store)
+	file_store_factory := memory.NewMemoryFileStore(ConfigObj)
+	manager := directory.NewDirectoryQueueManager(ConfigObj, file_store_factory)
+
+	file_store.OverrideFilestoreImplementation(ConfigObj, file_store_factory)
+
 	suite.Run(t, tests.NewQueueManagerTestSuite(
-		ConfigObj, manager, file_store))
+		ConfigObj, manager, file_store_factory))
 }
 
 type TestSuite struct {
@@ -60,7 +64,7 @@ type TestSuite struct {
 func (self *TestSuite) SetupTest() {
 	self.TestSuite.SetupTest()
 
-	dir, err := ioutil.TempDir("", "file_store_test")
+	dir, err := tempfile.TempDir("file_store_test")
 	assert.NoError(self.T(), err)
 	self.dir = dir
 
@@ -80,7 +84,10 @@ func (self *TestSuite) TestQueueManager() {
 	repository, err := repo_manager.GetGlobalRepository(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	_, err = repository.LoadYaml(monitoringArtifact, true, true)
+	_, err = repository.LoadYaml(monitoringArtifact,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: true})
 	assert.NoError(self.T(), err)
 
 	file_store := test_utils.GetMemoryFileStore(self.T(), self.ConfigObj)
@@ -94,7 +101,7 @@ func (self *TestSuite) TestQueueManager() {
 		FileBufferLeaseSize: 1,
 	})
 
-	path_manager, err := artifacts.NewArtifactPathManager(self.ConfigObj,
+	path_manager, err := artifacts.NewArtifactPathManager(self.Ctx, self.ConfigObj,
 		"C.123", "", "TestQueue")
 	assert.NoError(self.T(), err)
 
@@ -117,10 +124,14 @@ func (self *TestSuite) TestQueueManager() {
 		// The file should contain all the rows now.  File size is not
 		// exact due to timestamps but it should be larger than 300.
 		dbg = manager.Debug()
-		return utils.GetInt64(dbg, "TestQueue.0.Size") > int64(300)
+		return utils.GetInt64(dbg, "TestQueue.0.Size") > int64(300) &&
+			utils.GetString(dbg, "TestQueue.0.BackingFile") != ""
 	})
 
-	// Now read all the rows from the file.
+	dbg = manager.Debug()
+	backing_file := utils.GetString(dbg, "TestQueue.0.BackingFile")
+
+	// Now read 10 rows from the file.
 	count := 0
 	for row := range reader {
 		count++
@@ -132,9 +143,10 @@ func (self *TestSuite) TestQueueManager() {
 		}
 	}
 
-	// Now check the file - it should be truncated since we read all messages.
+	// Now check the file - it should be truncated since we read all
+	// messages. This will also clear the tempfile.
 	dbg = manager.Debug()
-	assert.Equal(self.T(), int64(50), utils.GetInt64(dbg, "TestQueue.0.Size"))
+	assert.Equal(self.T(), "", utils.GetString(dbg, "TestQueue.0.BackingFile"))
 
 	// Now cancel the watcher - further reads from the channel
 	// should not block - the channel is closed.
@@ -144,8 +156,7 @@ func (self *TestSuite) TestQueueManager() {
 	}
 
 	// Now make sure the tempfile is removed.
-	tempfile := utils.GetString(dbg, "TestQueue.0.BackingFile")
-	_, err = os.Stat(tempfile)
+	_, err = os.Stat(backing_file)
 	assert.Error(self.T(), err)
 }
 
@@ -156,14 +167,18 @@ func (self *TestSuite) TestQueueManagerJsonl() {
 	repository, err := repo_manager.GetGlobalRepository(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	_, err = repository.LoadYaml(monitoringArtifact, true, true)
+	_, err = repository.LoadYaml(monitoringArtifact,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: true})
+
 	assert.NoError(self.T(), err)
 
 	file_store := test_utils.GetMemoryFileStore(self.T(), self.ConfigObj)
 	manager := directory.NewDirectoryQueueManager(
 		self.ConfigObj, file_store).(*directory.DirectoryQueueManager)
 
-	path_manager, err := artifacts.NewArtifactPathManager(self.ConfigObj,
+	path_manager, err := artifacts.NewArtifactPathManager(self.Ctx, self.ConfigObj,
 		"C.123", "", "TestQueue")
 	assert.NoError(self.T(), err)
 

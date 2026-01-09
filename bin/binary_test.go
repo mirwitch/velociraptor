@@ -5,10 +5,10 @@ package main_test
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sync"
 	"testing"
@@ -21,6 +21,7 @@ import (
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 )
 
 var (
@@ -94,14 +95,14 @@ func TestAutoexec(t *testing.T) {
 	binary, extension := SetupTest(t)
 
 	// Create a tempfile for the repacked binary.
-	exe, err := ioutil.TempFile("", "exe*"+extension)
+	exe, err := tempfile.TempFile("exe*" + extension)
 	assert.NoError(t, err)
 
 	defer os.Remove(exe.Name())
 	exe.Close()
 
 	// A temp file for the config.
-	config_file, err := ioutil.TempFile("", "config")
+	config_file, err := tempfile.TempFile("config")
 	assert.NoError(t, err)
 
 	defer os.Remove(config_file.Name())
@@ -113,6 +114,8 @@ func TestAutoexec(t *testing.T) {
 		"config", "repack", config_file.Name(), exe.Name(), "-v")
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
+
+	os.Chmod(exe.Name(), 0755)
 
 	// Run the repacked binary with no args - it should run the
 	// `artifacts list` command.
@@ -128,8 +131,8 @@ func TestAutoexec(t *testing.T) {
 	// If provided args it works normally.
 	cmd = exec.Command(exe.Name(),
 		"artifacts", "collect", "Windows.Sys.Interfaces", "--format", "jsonl")
-	out, err = cmd.Output()
-	require.NoError(t, err)
+	out, err = cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
 
 	// Config artifacts override built in artifacts.
 	require.Contains(t, string(out), "MySpecialInterface")
@@ -147,7 +150,7 @@ func TestTimeout(t *testing.T) {
 	binary, _ := SetupTest(t)
 
 	// A temp file for the config.
-	config_file, err := ioutil.TempFile("", "config")
+	config_file, err := tempfile.TempFile("config")
 	assert.NoError(t, err)
 
 	defer os.Remove(config_file.Name())
@@ -170,7 +173,7 @@ func TestProgressTimeout(t *testing.T) {
 	binary, _ := SetupTest(t)
 
 	// A temp file for the config.
-	config_file, err := ioutil.TempFile("", "config")
+	config_file, err := tempfile.TempFile("config")
 	assert.NoError(t, err)
 
 	defer os.Remove(config_file.Name())
@@ -214,7 +217,7 @@ func TestCPULimit(t *testing.T) {
 	binary, _ := SetupTest(t)
 
 	// A temp file for the config.
-	config_file, err := ioutil.TempFile("", "config")
+	config_file, err := tempfile.TempFile("config")
 	assert.NoError(t, err)
 
 	defer os.Remove(config_file.Name())
@@ -236,11 +239,23 @@ func TestCPULimit(t *testing.T) {
 	assert.Regexp(t, "Will throttle query to 5 percent of", string(out))
 }
 
+var (
+	client_deb_regex = regexp.MustCompile("client.+\\.deb$")
+	server_deb_regex = regexp.MustCompile("server.+\\.deb$")
+)
+
 func TestBuildDeb(t *testing.T) {
 	binary, _ := SetupTest(t)
 
+	tempdir, err := tempfile.TempDir("TestBuildDeb")
+	assert.NoError(t, err)
+
+	defer os.RemoveAll(tempdir)
+
 	// A temp file for the generated config.
-	config_file, err := ioutil.TempFile("", "config")
+	config_file, err := os.OpenFile(filepath.Join(tempdir, "config"),
+		os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+
 	assert.NoError(t, err)
 	defer os.Remove(config_file.Name())
 
@@ -254,28 +269,20 @@ func TestBuildDeb(t *testing.T) {
 	config_file.Write(out)
 	config_file.Close()
 
-	// Create a tempfile for the binary executable.
-	binary_file, err := ioutil.TempFile("", "binary")
-	assert.NoError(t, err)
-
-	defer os.Remove(binary_file.Name())
-	binary_file.Write([]byte("\x7f\x45\x4c\x46XXXXXXXXXX"))
-	binary_file.Close()
-
-	output_file, err := ioutil.TempFile("", "output*.deb")
-	assert.NoError(t, err)
-	output_file.Close()
-	defer os.Remove(output_file.Name())
+	binary_file, _ := filepath.Abs("../artifacts/testdata/files/test.elf")
 
 	cmd = exec.Command(
 		binary, "--config", config_file.Name(),
-		"debian", "client", "--binary", binary_file.Name(),
-		"--output", output_file.Name())
-	_, err = cmd.Output()
-	require.NoError(t, err)
+		"debian", "client", "--binary", binary_file,
+		"--output", tempdir)
+	out, err = cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	output_file, err := tempfile.FindFile(tempdir, client_deb_regex)
+	assert.NoError(t, err)
 
 	// Make sure the file is written
-	fd, err := os.Open(output_file.Name())
+	fd, err := os.Open(output_file)
 	assert.NoError(t, err)
 
 	stat, err := fd.Stat()
@@ -284,20 +291,18 @@ func TestBuildDeb(t *testing.T) {
 	assert.Greater(t, stat.Size(), int64(0))
 
 	// Now the server deb
-	output_file, err = ioutil.TempFile("", "output*.deb")
-	assert.NoError(t, err)
-	output_file.Close()
-	defer os.Remove(output_file.Name())
-
 	cmd = exec.Command(
 		binary, "--config", config_file.Name(),
-		"debian", "server", "--binary", binary_file.Name(),
-		"--output", output_file.Name())
-	_, err = cmd.Output()
-	require.NoError(t, err)
+		"debian", "server", "--binary", binary_file,
+		"--output", tempdir)
+	out, err = cmd.Output()
+	require.NoError(t, err, string(out))
+
+	output_file, err = tempfile.FindFile(tempdir, server_deb_regex)
+	assert.NoError(t, err)
 
 	// Make sure the file is written
-	fd, err = os.Open(output_file.Name())
+	fd, err = os.Open(output_file)
 	assert.NoError(t, err)
 
 	stat, err = fd.Stat()
@@ -310,7 +315,7 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 	binary, extension := SetupTest(t)
 
 	// A temp file for the generated config.
-	config_file, err := ioutil.TempFile("", "config")
+	config_file, err := tempfile.TempFile("config")
 	assert.NoError(t, err)
 	defer os.Remove(config_file.Name())
 
@@ -318,7 +323,7 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 		binary, "config", "generate", "--merge",
 		`{"Client": {"nonce": "Foo", "writeback_linux": "some_location"}}`)
 	out, err := cmd.Output()
-	require.NoError(t, err)
+	require.NoError(t, err, string(out))
 
 	// Write the config to the tmp file
 	config_file_content := out
@@ -340,7 +345,7 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 		"VELOCIRAPTOR_CONFIG=",
 	)
 	out, err = cmd.Output()
-	require.Error(t, err)
+	require.Error(t, err, string(out))
 
 	// Specify the config on the commandline - should load correctly
 	cmd = exec.Command(binary, "config", "show", "--config", config_file.Name())
@@ -348,13 +353,23 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 		"VELOCIRAPTOR_CONFIG=",
 	)
 	out, err = cmd.Output()
-	require.NoError(t, err)
+	require.NoError(t, err, string(out))
 	require.Contains(t, string(out), "Foo")
 
 	// Specify the config in the environment
 	cmd = exec.Command(binary, "config", "show")
 	cmd.Env = append(os.Environ(),
 		"VELOCIRAPTOR_CONFIG="+config_file.Name(),
+	)
+	out, err = cmd.Output()
+	require.NoError(t, err)
+	require.Contains(t, string(out), "Foo")
+
+	// Specify the literal config in the environment
+	cmd = exec.Command(binary, "config", "show")
+	cmd.Env = append(os.Environ(),
+		"VELOCIRAPTOR_LITERAL_CONFIG="+string(config_file_content),
+		"VELOCIRAPTOR_CONFIG=",
 	)
 	out, err = cmd.Output()
 	require.NoError(t, err)
@@ -370,7 +385,7 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 	require.Error(t, err)
 
 	// Create a tempfile for the repacked binary.
-	exe, err := ioutil.TempFile("", "exe*"+extension)
+	exe, err := tempfile.TempFile("exe*" + extension)
 	assert.NoError(t, err)
 
 	defer os.Remove(exe.Name())
@@ -379,7 +394,9 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 	// Repack the config in the binary.
 	cmd = exec.Command(binary, "config", "repack", config_file.Name(), exe.Name())
 	out, err = cmd.CombinedOutput()
-	require.NoError(t, err)
+	require.NoError(t, err, string(out))
+
+	os.Chmod(exe.Name(), 0755)
 
 	// Run the repacked binary with invalid environ - config
 	// should come from embedded.
@@ -392,7 +409,7 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 	require.Contains(t, string(out), "Foo")
 
 	// Make second copy of config file and store modified version
-	second_config_file, err := ioutil.TempFile("", "config")
+	second_config_file, err := tempfile.TempFile("config")
 	assert.NoError(t, err)
 
 	defer os.Remove(second_config_file.Name())
@@ -428,7 +445,7 @@ func TestShowConfigWithMergePatch(t *testing.T) {
 	binary, _ := SetupTest(t)
 
 	// A temp file for the generated config.
-	config_file, err := ioutil.TempFile("", "config")
+	config_file, err := tempfile.TempFile("config")
 	assert.NoError(t, err)
 
 	defer os.Remove(config_file.Name())

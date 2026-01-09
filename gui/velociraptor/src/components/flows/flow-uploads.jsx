@@ -1,21 +1,14 @@
-import _ from 'lodash';
-
 import React from 'react';
 import PropTypes from 'prop-types';
 import Button from 'react-bootstrap/Button';
-import axios from 'axios';
-import VeloTable, { PrepareData } from '../core/table.jsx';
-import T from '../i8n/i8n.jsx';
-import Spinner from '../utils/spinner.jsx';
-import CardDeck from 'react-bootstrap/CardDeck';
-import Card from 'react-bootstrap/Card';
+import VeloPagedTable from '../core/paged-table.jsx';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import OverlayTrigger from 'react-bootstrap/OverlayTrigger';
-import Tooltip from 'react-bootstrap/Tooltip';
+import T from '../i8n/i8n.jsx';
+import ToolTip from '../widgets/tooltip.jsx';
 import PreviewUpload from '../widgets/preview_uploads.jsx';
-
 import api from '../core/api-service.jsx';
-const MAX_ROWS_PER_TABLE = 500;
+import UserConfig from '../core/user.jsx';
+import VeloTimestamp from "../utils/time.jsx";
 
 // Older collections had the upload includes the full filestore path
 // to the file, but this is un necessary because the file must reside
@@ -34,93 +27,31 @@ const normalizeComponentList = (components, client_id, flow_id)=>{
 
 
 export default class FlowUploads extends React.Component {
+    static contextType = UserConfig;
+
     static propTypes = {
         flow: PropTypes.object,
     };
 
-    componentDidMount = () => {
-        this.source = axios.CancelToken.source();
-        this.fetchRows();
-    }
-
-    componentWillUnmount() {
-        this.source.cancel();
-    }
-
-    componentDidUpdate(prevProps, prevState, snapshot) {
-        let prev_flow_id = prevProps.flow && prevProps.flow.session_id;
-        if (this.props.flow.session_id !== prev_flow_id) {
-            this.fetchRows();
-        }
-    }
-
-    state = {
-        loading: false,
-        pageData: {},
-    }
-
-    fetchRows = () => {
-        let params = {
-            client_id: this.props.flow.client_id,
-            flow_id: this.props.flow.session_id,
-            type: "uploads",
-            start_row: 0,
-            rows: MAX_ROWS_PER_TABLE,
-        };
-
-        this.source.cancel();
-        this.source = axios.CancelToken.source();
-
-        this.setState({loading: true});
-        api.get("v1/GetTable", params, this.source.token).then((response) => {
-            if (response.cancel) return;
-
-            let prepared_data = PrepareData(response.data);
-            prepared_data.columns.push("Preview");
-            // Translate the columns
-            let headers = {};
-            _.each(prepared_data.columns, x=>{
-                headers[x] = T(x);
-            });
-
-            this.setState({loading: false,
-                           headers: headers,
-                           pageData: prepared_data});
-        }).catch(() => {
-            this.setState({loading: false, pageData: {}});
-        });
-    }
-
-    downloadFile = (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-    }
-
     render() {
-        if (!this.state.pageData || !this.state.pageData.columns) {
-            return (
-                <CardDeck>
-                  <Card>
-                    <Card.Header>{T("Uploaded Files")}</Card.Header>
-                    <Card.Body>
-                      <Spinner loading={this.state.loading}/>
-                      <div className="no-content">{T("Collection did not upload files")}</div>
-                    </Card.Body>
-                  </Card>
-                </CardDeck>
-            );
-        }
+        let flow_id = this.props.flow && this.props.flow.session_id;
 
         let renderers = {
+            Timestamp: (cell, row) => {
+                return <VeloTimestamp usec={cell}/>;
+            },
+
             Preview: (cell, row, rowIndex) => {
                 let client_id = this.props.flow && this.props.flow.client_id;
                 let flow_id = this.props.flow && this.props.flow.session_id;
                 let components = normalizeComponentList(
                     row._Components, client_id, flow_id);
+                let padding = row.vfs_path && row.vfs_path.endsWith(".idx");
                 return <PreviewUpload
                          env={{client_id: client_id, flow_id: flow_id}}
                          upload={{Path: row.vfs_path,
                                   Timestamp: row.started,
+                                  Padding: padding,
                                   Size: row.uploaded_size || row.file_size,
                                   Components: components}} />;
             },
@@ -129,17 +60,13 @@ export default class FlowUploads extends React.Component {
             // make a zip file.
             vfs_path: (cell, row, rowIndex) => {
                 let filename = cell;
+                let no_password = !this.context.traits.default_password;
 
                 if (filename.endsWith(".idx")) {
                     filename = filename.slice(0, -4);
                     return <>
-                             <OverlayTrigger
-                               delay={{show: 250, hide: 400}}
-                               overlay={(props)=>{
-                                   return <Tooltip {...props}>
-                                            Download padded file.
-                                          </Tooltip>;
-                               }}>
+                             <ToolTip tooltip={T("Download padded file.")}
+                                      key={rowIndex}>
                                <Button as="a"
                                        className="flow-file-download-button"
                                        target="_blank"
@@ -149,20 +76,21 @@ export default class FlowUploads extends React.Component {
                                                row._Components, this.props.flow.client_id,
                                                this.props.flow.session_id),
                                            padding: true,
-                                           vfs_path: filename}, {arrayFormat: 'brackets'})}>
-                                 {filename} &nbsp;&nbsp; <FontAwesomeIcon icon="expand"/>
+                                           zip: !no_password,
+                                           vfs_path: filename})}>
+                                 {filename} &nbsp;&nbsp;
+                                 <FontAwesomeIcon icon="expand"/>
+                                 { !no_password &&
+                                   <div className="velo-icon">
+                                     <FontAwesomeIcon icon="lock" />
+                                   </div>}
                                </Button>
-                             </OverlayTrigger>
+                             </ToolTip>
                            </>;
                 }
 
-                return <OverlayTrigger
-                         delay={{show: 250, hide: 400}}
-                         overlay={(props)=>{
-                             return <Tooltip {...props}>
-                                      Download file.
-                                    </Tooltip>;
-                         }}>
+                return <ToolTip tooltip={T("Download file.")}
+                                key={rowIndex}>
                          <Button as="a"
                                  className="flow-file-download-button"
                                  target="_blank"
@@ -172,20 +100,30 @@ export default class FlowUploads extends React.Component {
                                          row._Components, this.props.flow.client_id,
                                          this.props.flow.session_id),
                                      padding: false,
-                                     vfs_path: filename}, {arrayFormat: 'brackets'})}>
+                                     zip: !no_password,
+                                     vfs_path: filename})}>
+                           { !no_password &&
+                             <div className="velo-icon">
+                               <FontAwesomeIcon icon="lock" />
+                             </div>}
                            {filename}
                          </Button>
-                       </OverlayTrigger>;
+                       </ToolTip>;
             },
         };
 
         return (
-            <VeloTable
+            <VeloPagedTable
               className="col-12"
               renderers={renderers}
-              rows={this.state.pageData.rows}
-              headers={this.state.headers}
-              columns={this.state.pageData.columns} />
+              extra_columns={["Preview"]}
+              params={{
+                  client_id: this.props.flow.client_id,
+                  flow_id: this.props.flow.session_id,
+                  type: "uploads",
+              }}
+              name={"FlowUploads" + flow_id}
+            />
         );
     }
 };

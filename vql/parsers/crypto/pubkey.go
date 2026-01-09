@@ -3,8 +3,8 @@ package crypto
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
-	"io/ioutil"
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
@@ -12,9 +12,11 @@ import (
 	"golang.org/x/crypto/openpgp/armor"
 	"golang.org/x/crypto/openpgp/packet"
 
-	"golang.org/x/net/context"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/constants"
 	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
+	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -41,6 +43,8 @@ type PKDecryptFunction struct{}
 func (self *PKEncryptFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "pk_encrypt", args)()
 
 	arg := &PKEncryptArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -151,6 +155,7 @@ func encryptPGP(recip []*openpgp.Entity,
 func (self *PKDecryptFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "pk_decrypt", args)()
 
 	arg := &PKDecryptArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -201,7 +206,8 @@ func (self *PKDecryptFunction) Call(ctx context.Context,
 				scope.Log("ERROR:pk_decrypt: %s", err.Error())
 				return vfilter.Null{}
 			}
-			bytes, err := ioutil.ReadAll(m.UnverifiedBody)
+			bytes, err := utils.ReadAllWithLimit(m.UnverifiedBody,
+				constants.MAX_MEMORY)
 			if err != nil {
 				scope.Log("ERROR:pk_decrypt: %s", err.Error())
 				return vfilter.Null{}
@@ -244,9 +250,10 @@ func decryptPGP(recip openpgp.EntityList,
 func (self PKEncryptFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "pk_encrypt",
-		Doc:     "Encrypt files using pubkey encryption",
-		ArgType: type_map.AddType(scope, &PKEncryptArgs{}),
+		Name:     "pk_encrypt",
+		Doc:      "Encrypt files using pubkey encryption",
+		ArgType:  type_map.AddType(scope, &PKEncryptArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.SERVER_ADMIN).Build(),
 	}
 }
 

@@ -3,11 +3,11 @@ package directory
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Velocidex/ordereddict"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
@@ -30,13 +30,15 @@ import (
 // ordering is preserved. When the file buffer is fully drained, the
 // Listener is able to go back into direct delivering mode.
 type Listener struct {
+	// If set do not use the file buffer - this will block senders!
+	disable_file_buffering int32
+
 	mu sync.Mutex
+
+	start time.Time
 
 	// should new messages go directly to the file buffer?
 	file_buffer_active bool // Locked
-
-	// If set do not use the file buffer - this will block senders!
-	disable_file_buffering int32
 
 	// If we are closed we drop any new messages.
 	closed bool
@@ -57,16 +59,39 @@ type Listener struct {
 	// file buffer to the output.
 	file_buffer_ready chan bool
 
-	// Name of the file_buffer
-	tmpfile string
-
 	// Listener context.
 	ctx    context.Context
 	cancel func()
+
+	// Number of events forwarded to this listener.
+	count int64
+}
+
+func (self *Listener) Stats() *ordereddict.Dict {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	file_buffer := ""
+	if self.file_buffer_active {
+		file_buffer = self.file_buffer.GetBackingFile()
+	}
+
+	return ordereddict.NewDict().
+		Set("Name", self.name).
+		Set("Started", self.start).
+		Set("Options", self.options).
+		Set("FileBuffer", file_buffer).
+		Set("EventCount", self.count)
 }
 
 // Should not block - very fast.
 func (self *Listener) Send(item *ordereddict.Dict) {
+	defer utils.CheckForPanic("Listener.Send: %v", item)
+
+	if self.closed {
+		return
+	}
+
 	// This will block senders until we can send output
 	if atomic.LoadInt32(&self.disable_file_buffering) > 0 {
 		select {
@@ -75,6 +100,9 @@ func (self *Listener) Send(item *ordereddict.Dict) {
 
 			// Try to deliver message immediately.
 		case self.output <- item:
+			self.mu.Lock()
+			self.count++
+			self.mu.Unlock()
 			return
 		}
 	}
@@ -89,7 +117,7 @@ func (self *Listener) Send(item *ordereddict.Dict) {
 
 	// No direct delivery available - force buffer file enqueue
 	if self.file_buffer_active {
-		self.file_buffer.Enqueue(item)
+		_ = self.file_buffer.Enqueue(item)
 		return
 	}
 
@@ -104,7 +132,7 @@ func (self *Listener) Send(item *ordereddict.Dict) {
 		// enqueue mode, all further messages will be enqueued to the
 		// file until it is drained.
 	default:
-		self.file_buffer.Enqueue(item)
+		_ = self.file_buffer.Enqueue(item)
 
 		// Switch to file buffer mode
 		self._switchToFileMode()
@@ -153,14 +181,13 @@ func (self *Listener) Output() chan *ordereddict.Dict {
 // 3. Close the output to release readers downstream.
 func (self *Listener) Close() {
 	self.mu.Lock()
+	defer self.mu.Unlock()
 
 	// Stop new messages from coming in.
 	self.closed = true
 
 	// Stop the file buffer pump
 	self._switchToDirectMode()
-
-	self.mu.Unlock()
 
 	// Wait for all outstanding file buffer messages to be sent.
 	if self.file_buffer != nil {
@@ -187,12 +214,11 @@ func (self *Listener) Close() {
 	// Close the output to release our readers.
 	close(self.output)
 
-	// Done -  remove the tmp file.
 	self.cancel()
+}
 
-	if self.tmpfile != "" {
-		os.Remove(self.tmpfile) // clean up file buffer
-	}
+func (self *Listener) FileBufferSize() int64 {
+	return self.file_buffer.PendingSize()
 }
 
 func (self *Listener) Debug() *ordereddict.Dict {
@@ -200,15 +226,69 @@ func (self *Listener) Debug() *ordereddict.Dict {
 	defer self.mu.Unlock()
 
 	result := ordereddict.NewDict().
-		Set("BackingFile", self.tmpfile).
 		Set("Name", self.name).
 		Set("file_buffer_active", self.file_buffer_active).
-		Set("closed", self.closed)
+		Set("closed", self.closed).
+		Set("owner", self.options.OwnerName)
 
-	st, _ := os.Stat(self.tmpfile)
-	result.Set("Size", int64(st.Size()))
+	if self.file_buffer != nil {
+		result.Set("PendingSize", self.file_buffer.PendingSize())
+		backing_file := self.file_buffer.GetBackingFile()
+		if backing_file != "" {
+			result.Set("BackingFile", backing_file)
+			st, err := os.Stat(backing_file)
+			if err == nil {
+				result.Set("Size", int64(st.Size()))
+			}
+		}
+	}
 
 	return result
+}
+
+func (self *Listener) pumpFileBufferToOutput(ctx context.Context) {
+	for {
+		// Wait here until the file has some data in it.
+		select {
+		case <-ctx.Done():
+			return
+
+			// Wait here until the Send() routine signals that
+			// messages were enqueued.
+		case <-self._file_buffer_ready():
+			// Get some messages from the buffer file.
+			lease_size := self.options.FileBufferLeaseSize
+			if lease_size == 0 {
+				lease_size = 100
+			}
+
+			self.mu.Lock()
+			items := self.file_buffer.Lease(lease_size)
+			if len(items) == 0 {
+				// Buffer file is empty - reset the trigger and
+				// signal to the Send() function that direct
+				// delivery is allowed again.
+				self._switchToDirectMode()
+			}
+			self.mu.Unlock()
+
+			// Try to deliver messages - this can take a while but
+			// we no longer hold the lock, so Send() can continue
+			// enqueuing messages to the file.
+			for _, item := range items {
+				select {
+				case <-self.ctx.Done():
+					// Just drain all work items so we can safely exit
+					self.file_buffer.Wg.Done()
+
+					// As each message is delivered we can let the
+					// file buffer know it is delivered.
+				case self.output <- item:
+					self.file_buffer.Wg.Done()
+				}
+			}
+		}
+	}
 }
 
 func NewListener(
@@ -219,6 +299,7 @@ func NewListener(
 	subctx, cancel := context.WithCancel(ctx)
 
 	self := &Listener{
+		start:   utils.GetTime().Now(),
 		id:      utils.GetId(),
 		name:    name,
 		output:  make(chan *ordereddict.Dict),
@@ -241,66 +322,16 @@ func NewListener(
 
 		base_name := fmt.Sprintf("journal_%s_%s_", name, node_name)
 		base_name = strings.Replace(base_name, "/", "...", -1)
-		tmpfile, err := ioutil.TempFile("", base_name)
-		if err != nil {
-			return nil, err
-		}
-
-		file_buffer, err := NewFileBasedRingBuffer(config_obj, tmpfile)
+		file_buffer, err := NewFileBasedRingBuffer(config_obj, base_name)
 		if err != nil {
 			return nil, err
 		}
 
 		self.file_buffer = file_buffer
 		self.file_buffer_ready = make(chan bool)
-		self.tmpfile = tmpfile.Name()
+
+		// Pump messages from the file_buffer to our listeners.
+		go self.pumpFileBufferToOutput(subctx)
 	}
-
-	// Pump messages from the file_buffer to our listeners.
-	go func() {
-		for {
-			// Wait here until the file has some data in it.
-			select {
-			case <-subctx.Done():
-				return
-
-				// Wait here until the Send() routine signals that
-				// messages were enqueued.
-			case <-self._file_buffer_ready():
-				// Get some messages from the buffer file.
-				lease_size := self.options.FileBufferLeaseSize
-				if lease_size == 0 {
-					lease_size = 100
-				}
-
-				self.mu.Lock()
-				items := self.file_buffer.Lease(lease_size)
-				if len(items) == 0 {
-					// Buffer file is empty - reset the trigger and
-					// signal to the Send() function that direct
-					// delivery is allowed again.
-					self._switchToDirectMode()
-				}
-				self.mu.Unlock()
-
-				// Try to deliver messages - this can take a while but
-				// we no longer hold the lock, so Send() can continue
-				// enqueuing messages to the file.
-				for _, item := range items {
-					select {
-					case <-self.ctx.Done():
-						// Just drain all work items so we can safely exit
-						self.file_buffer.Wg.Done()
-
-						// As each message is delivered we can let the
-						// file buffer know it is delivered.
-					case self.output <- item:
-						self.file_buffer.Wg.Done()
-					}
-				}
-			}
-		}
-	}()
-
 	return self, nil
 }

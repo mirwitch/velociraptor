@@ -117,27 +117,20 @@ package launcher
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base32"
-	"encoding/binary"
 	"fmt"
-	"strings"
 	"sync"
-	"time"
 
 	"github.com/go-errors/errors"
 	"google.golang.org/protobuf/proto"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	"www.velocidex.com/golang/velociraptor/artifacts"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
+	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
@@ -177,7 +170,9 @@ func getCollectorSpecs(
 	return result
 }
 
-type Launcher struct{}
+type Launcher struct {
+	Storage_ services.FlowStorer
+}
 
 func (self *Launcher) CompileCollectorArgs(
 	ctx context.Context,
@@ -201,12 +196,24 @@ func (self *Launcher) CompileCollectorArgs(
 	for _, spec := range getCollectorSpecs(collector_request) {
 		var artifact *artifacts_proto.Artifact = nil
 
+		// Batching control
+		var local_cpu_limit float32
+		var max_batch_wait, max_batch_rows uint64
+		var max_batch_row_buffer uint64
+		var local_timeout uint64
+
+		if config_obj != nil && config_obj.Defaults != nil {
+			max_batch_rows = config_obj.Defaults.MaxRows
+			max_batch_row_buffer = config_obj.Defaults.MaxRowBufferSize
+			max_batch_wait = config_obj.Defaults.MaxBatchWait
+		}
+
 		if collector_request.AllowCustomOverrides {
-			artifact, _ = repository.Get(config_obj, "Custom."+spec.Artifact)
+			artifact, _ = repository.Get(ctx, config_obj, "Custom."+spec.Artifact)
 		}
 
 		if artifact == nil {
-			artifact, _ = repository.Get(config_obj, spec.Artifact)
+			artifact, _ = repository.Get(ctx, config_obj, spec.Artifact)
 		}
 
 		if artifact == nil {
@@ -220,7 +227,9 @@ func (self *Launcher) CompileCollectorArgs(
 			return nil, errors.New("Unknown artifact " + spec.Artifact)
 		}
 
-		err := CheckAccess(config_obj, artifact, acl_manager)
+		// Make sure the user can collect this artifact.
+		err := CheckAccess(
+			config_obj, artifact, collector_request, acl_manager)
 		if err != nil {
 			return nil, err
 		}
@@ -235,6 +244,49 @@ func (self *Launcher) CompileCollectorArgs(
 			if artifact.Resources.MaxUploadBytes > max_upload_bytes {
 				max_upload_bytes = artifact.Resources.MaxUploadBytes
 			}
+
+			if artifact.Resources.MaxBatchWait > max_batch_wait {
+				max_batch_wait = artifact.Resources.MaxBatchWait
+			}
+
+			if artifact.Resources.CpuLimit > 0 &&
+				artifact.Resources.CpuLimit > local_cpu_limit {
+				local_cpu_limit = artifact.Resources.CpuLimit
+			}
+
+			if artifact.Resources.MaxBatchRows > max_batch_rows {
+				max_batch_rows = artifact.Resources.MaxBatchRows
+			}
+
+			if artifact.Resources.MaxBatchRowsBuffer > max_batch_row_buffer {
+				max_batch_row_buffer = artifact.Resources.MaxBatchRowsBuffer
+			}
+
+			if artifact.Resources.Timeout > local_timeout {
+				local_timeout = artifact.Resources.Timeout
+			}
+		}
+
+		// If the spec specifies a value it overrides the artifact
+		// definition
+		if spec.CpuLimit > 0 {
+			local_cpu_limit = spec.CpuLimit
+		}
+
+		if spec.MaxBatchRows > 0 {
+			max_batch_rows = spec.MaxBatchRows
+		}
+
+		if spec.MaxBatchRowsBuffer > 0 {
+			max_batch_row_buffer = spec.MaxBatchRowsBuffer
+		}
+
+		if spec.MaxBatchWait > 0 {
+			max_batch_wait = spec.MaxBatchWait
+		}
+
+		if spec.Timeout > 0 {
+			local_timeout = spec.Timeout
 		}
 
 		for _, expanded_artifact := range expandArtifacts(artifact) {
@@ -244,6 +296,18 @@ func (self *Launcher) CompileCollectorArgs(
 			if err != nil {
 				return nil, err
 			}
+
+			if local_cpu_limit > 0 {
+				vql_collector_args.CpuLimit = local_cpu_limit
+			}
+
+			if local_timeout > 0 {
+				vql_collector_args.Timeout = local_timeout
+			}
+
+			vql_collector_args.MaxRow = max_batch_rows
+			vql_collector_args.MaxWait = max_batch_wait
+			vql_collector_args.MaxRowBufferSize = max_batch_row_buffer
 
 			// If the request specifies resource controls
 			// they override the defaults.
@@ -263,11 +327,14 @@ func (self *Launcher) CompileCollectorArgs(
 				vql_collector_args.IopsLimit = collector_request.IopsLimit
 			}
 
-			if collector_request.Timeout > 0 {
+			if vql_collector_args.Timeout == 0 &&
+				collector_request.Timeout > 0 {
 				vql_collector_args.Timeout = collector_request.Timeout
 			}
 
-			vql_collector_args.MaxRow = 1000
+			if vql_collector_args.MaxRow == 0 {
+				vql_collector_args.MaxRow = 1000
+			}
 
 			timeout = vql_collector_args.Timeout
 			ops_per_sec = vql_collector_args.OpsPerSecond
@@ -373,7 +440,8 @@ func (self *Launcher) GetVQLCollectorArgs(
 	options services.CompilerOptions) (*actions_proto.VQLCollectorArgs, error) {
 
 	vql_collector_args := &actions_proto.VQLCollectorArgs{}
-	err := self.CompileSingleArtifact(config_obj, options, artifact, vql_collector_args)
+	err := self.CompileSingleArtifact(ctx, config_obj,
+		options, artifact, repository, vql_collector_args)
 	if err != nil {
 		return nil, err
 	}
@@ -396,7 +464,8 @@ func (self *Launcher) GetVQLCollectorArgs(
 	}
 
 	for _, tool := range artifact.Tools {
-		err = AddToolDependency(ctx, config_obj, tool.Name, vql_collector_args)
+		err = AddToolDependency(ctx, config_obj, tool.Name,
+			tool.Version, vql_collector_args)
 		if err != nil {
 			return nil, err
 		}
@@ -424,7 +493,8 @@ func (self *Launcher) EnsureToolsDeclared(
 			return err
 		}
 
-		_, err = inventory.GetToolInfo(ctx, config_obj, tool.Name)
+		_, err = inventory.GetToolInfo(
+			ctx, config_obj, tool.Name, tool.Version)
 		if err != nil {
 			// Add tool info if it is not known but do not
 			// override existing tool. This allows the
@@ -432,10 +502,11 @@ func (self *Launcher) EnsureToolsDeclared(
 			// itself.
 			logger.Info("Adding tool %v from artifact %v",
 				tool.Name, artifact.Name)
-			err = inventory.AddTool(
+			err = inventory.AddTool(ctx,
 				config_obj, tool,
 				services.ToolOptions{
-					Upgrade: true,
+					Upgrade:            true,
+					ArtifactDefinition: true,
 				})
 			if err != nil {
 				return err
@@ -448,13 +519,13 @@ func (self *Launcher) EnsureToolsDeclared(
 func AddToolDependency(
 	ctx context.Context,
 	config_obj *config_proto.Config,
-	tool string, vql_collector_args *actions_proto.VQLCollectorArgs) error {
+	tool, version string, vql_collector_args *actions_proto.VQLCollectorArgs) error {
 	inventory, err := services.GetInventory(config_obj)
 	if err != nil {
 		return err
 	}
 
-	tool_info, err := inventory.GetToolInfo(ctx, config_obj, tool)
+	tool_info, err := inventory.GetToolInfo(ctx, config_obj, tool, version)
 	if err != nil {
 		return err
 	}
@@ -475,30 +546,36 @@ func AddToolDependency(
 			Key:   fmt.Sprintf("Tool_%v_PATH", tool_info.Name),
 			Value: tool_info.ServePath,
 		})
-	} else if tool_info.ServeUrl != "" {
-		// Where to download the binary from.
-		url := ""
 
-		// If we dont want to serve the binary locally, just
-		// tell the client where to get it from.
-		if tool_info.ServeUrl != "" {
-			url = tool_info.ServeUrl
-
-		} else if tool_info.Url != "" {
-			url = tool_info.Url
-
-		} else if config_obj.Client != nil {
-			url = config_obj.Client.ServerUrls[0] + "public/" + tool_info.FilestorePath
-		}
-
+	} else if len(tool_info.ServeUrls) > 0 {
 		vql_collector_args.Env = append(vql_collector_args.Env, &actions_proto.VQLEnv{
 			Key:   fmt.Sprintf("Tool_%v_URL", tool_info.Name),
-			Value: url,
+			Value: tool_info.ServeUrls[0],
+		})
+
+		serialized_urls := json.MustMarshalString(tool_info.ServeUrls)
+		vql_collector_args.Env = append(vql_collector_args.Env, &actions_proto.VQLEnv{
+			Key:   fmt.Sprintf("Tool_%v_URLs", tool_info.Name),
+			Value: serialized_urls,
+		})
+
+	} else if tool_info.Url != "" {
+		vql_collector_args.Env = append(vql_collector_args.Env, &actions_proto.VQLEnv{
+			Key:   fmt.Sprintf("Tool_%v_URL", tool_info.Name),
+			Value: tool_info.Url,
+		})
+
+		serialized_urls := json.MustMarshalString([]string{tool_info.Url})
+		vql_collector_args.Env = append(vql_collector_args.Env, &actions_proto.VQLEnv{
+			Key:   fmt.Sprintf("Tool_%v_URLs", tool_info.Name),
+			Value: serialized_urls,
 		})
 	}
 	return nil
 }
 
+// Scheduling artifact collections only happens on the master node at
+// the moment.
 func (self *Launcher) ScheduleArtifactCollection(
 	ctx context.Context,
 	config_obj *config_proto.Config,
@@ -506,6 +583,11 @@ func (self *Launcher) ScheduleArtifactCollection(
 	repository services.Repository,
 	collector_request *flows_proto.ArtifactCollectorArgs,
 	completion func()) (string, error) {
+
+	if !services.IsMaster(config_obj) {
+		return "", errors.New(
+			"ScheduleArtifactCollection can only be called on the master node")
+	}
 
 	args := collector_request.CompiledCollectorArgs
 	if args == nil {
@@ -525,45 +607,49 @@ func (self *Launcher) ScheduleArtifactCollection(
 		args = append(args, compiled...)
 	}
 
-	return self.ScheduleArtifactCollectionFromCollectorArgs(
-		ctx, config_obj, collector_request, args, completion)
+	return self.WriteArtifactCollectionRecord(
+		ctx, config_obj, collector_request, args,
+		func(task *crypto_proto.VeloMessage) {
+			client_manager, err := services.GetClientInfoManager(config_obj)
+			if err != nil {
+				return
+			}
+
+			// Queue and notify the client about the new tasks
+			_ = client_manager.QueueMessageForClient(
+				ctx, collector_request.ClientId, task,
+				services.NOTIFY_CLIENT, completion)
+		})
 }
 
-func (self *Launcher) ScheduleArtifactCollectionFromCollectorArgs(
+func (self *Launcher) WriteArtifactCollectionRecord(
 	ctx context.Context,
 	config_obj *config_proto.Config,
 	collector_request *flows_proto.ArtifactCollectorArgs,
 	vql_collector_args []*actions_proto.VQLCollectorArgs,
-	completion func()) (string, error) {
-
-	client_id := collector_request.ClientId
-	if client_id == "" {
-		return "", errors.New("Client id not provided.")
-	}
-
-	if !utils.ValidateClientId(client_id) {
-		return "", errors.New("Client id not valid.")
-	}
-
-	db, err := datastore.GetDB(config_obj)
-	if err != nil {
-		return "", err
-	}
+	completion func(task *crypto_proto.VeloMessage)) (string, error) {
 
 	client_manager, err := services.GetClientInfoManager(config_obj)
 	if err != nil {
 		return "", err
 	}
 
-	session_id := NewFlowId(client_id)
+	client_id := collector_request.ClientId
+	err = client_manager.ValidateClientId(client_id)
+	if err != nil {
+		return "", err
+	}
 
-	// If the flow was created by a hunt, we encode the hunt id in the
-	// session id. The session id will be returned by the client, and
-	// the ingestor will be able to tie the session to the hunt
-	// without consulting the datastore. The ID will look something
-	// like F.1233.H.1234
-	if strings.HasPrefix(collector_request.Creator, "H.") {
-		session_id += "." + collector_request.Creator
+	// If the client id is not known, refuse to schedule messages to
+	// it.
+	_, err = client_manager.Get(ctx, client_id)
+	if err != nil {
+		return "", err
+	}
+
+	session_id := collector_request.FlowId
+	if session_id == "" {
+		session_id = utils.NewFlowId(client_id)
 	}
 
 	// How long to batch log messages for on the client.
@@ -584,27 +670,41 @@ func (self *Launcher) ScheduleArtifactCollectionFromCollectorArgs(
 		FlowRequest: &crypto_proto.FlowRequest{
 			LogBatchTime:   batch_delay,
 			MaxRows:        collector_request.MaxRows,
+			MaxLogs:        collector_request.MaxLogs,
 			MaxUploadBytes: collector_request.MaxUploadBytes,
 		},
 	}
 
+	if config_obj.Datastore.Compression == "zlib" {
+		task.FlowRequest.Compression = crypto_proto.FlowRequest_ZLIB
+	}
+
+	if config_obj.Frontend.CollectionErrorRegex != "" {
+		task.FlowRequest.LogErrorRegex = config_obj.Frontend.CollectionErrorRegex
+	}
+
+	if collector_request.TraceFreqSec > 0 {
+		task.FlowRequest.Trace, err = self.calculateTraceQuery(ctx, config_obj,
+			collector_request.TraceFreqSec)
+		if err != nil {
+			return "", err
+		}
+	}
+
 	for _, arg := range vql_collector_args {
-		// If sending to the server record who actually launched this.
+		// If sending to the server, record who actually launched this.
 		if client_id == "server" {
 			arg.Principal = collector_request.Creator
-		}
-
-		// Send an urgent request to the client.
-		if collector_request.Urgent {
-			task.Urgent = true
 		}
 
 		task.FlowRequest.VQLClientActions = append(
 			task.FlowRequest.VQLClientActions, arg)
 	}
 
-	// Save the collection context first.
-	flow_path_manager := paths.NewFlowPathManager(client_id, session_id)
+	// Send an urgent request to the client.
+	if collector_request.Urgent {
+		task.Urgent = true
+	}
 
 	// Generate a new collection context for this flow.
 	collection_context := &flows_proto.ArtifactCollectorContext{
@@ -617,32 +717,55 @@ func (self *Launcher) ScheduleArtifactCollectionFromCollectorArgs(
 		OutstandingRequests: int64(len(vql_collector_args)),
 	}
 
+	// Record the tasks for provenance of what we actually did.
+	err = self.Storage().WriteTask(
+		ctx, config_obj, client_id, redactTask(task))
+	if err != nil {
+		return "", err
+	}
+
+	// Run server artifacts inline.
+	if client_id == "server" {
+		server_artifacts_service, err := services.GetServerArtifactRunner(
+			config_obj)
+		if err != nil {
+			return "", err
+		}
+
+		// Write the collection object so the GUI can start tracking
+		// it.
+		redacted := redactCollectContext(collection_context)
+		err = self.Storage().WriteFlow(
+			ctx, config_obj, redacted, utils.BackgroundWriter)
+		if err != nil {
+			return "", err
+		}
+
+		// Write the flow on the index.
+		err = self.Storage().WriteFlowIndex(ctx, config_obj, redacted)
+		if err != nil {
+			return "", err
+		}
+
+		err = server_artifacts_service.LaunchServerArtifact(
+			config_obj, session_id, task.FlowRequest, collection_context)
+		return collection_context.SessionId, err
+	}
+
 	// Store the collection_context first, then queue all the tasks.
-	err = db.SetSubjectWithCompletion(config_obj,
-		flow_path_manager.Path(),
-		collection_context,
+	err = self.Storage().WriteFlow(ctx, config_obj,
+		redactCollectContext(collection_context),
 
 		func() {
-			// Queue and notify the client about the new tasks
-			client_manager.QueueMessageForClient(
-				ctx, client_id, task,
-				services.NOTIFY_CLIENT, utils.BackgroundWriter)
+			completion(task)
 		})
 	if err != nil {
 		return "", err
 	}
 
-	// Record the tasks for provenance of what we actually did.
-	err = db.SetSubjectWithCompletion(config_obj,
-		flow_path_manager.Task(),
-		&api_proto.ApiFlowRequestDetails{
-			Items: []*crypto_proto.VeloMessage{task},
-		}, nil)
-	if err != nil {
-		return "", err
-	}
-
-	return collection_context.SessionId, nil
+	// Write the flow on the index.
+	err = self.Storage().WriteFlowIndex(ctx, config_obj, collection_context)
+	return collection_context.SessionId, err
 }
 
 // Adds any parameters set in the ArtifactCollectorArgs into the
@@ -676,34 +799,11 @@ func addOrReplaceParameter(
 	for _, item := range result {
 		if item.Key == param.Key {
 			item.Value = param.Value
+			param.Comment = item.Comment
 			return result
 		}
 	}
 	return append(result, param)
-}
-
-func (self *Launcher) SetFlowIdForTests(id string) {
-	NextFlowIdForTests = id
-}
-
-var (
-	NextFlowIdForTests string
-)
-
-func NewFlowId(client_id string) string {
-	if NextFlowIdForTests != "" {
-		result := NextFlowIdForTests
-		NextFlowIdForTests = ""
-		return result
-	}
-
-	buf := make([]byte, 8)
-	_, _ = rand.Read(buf)
-
-	binary.BigEndian.PutUint32(buf, uint32(time.Now().Unix()))
-	result := base32.HexEncoding.EncodeToString(buf)[:13]
-
-	return constants.FLOW_PREFIX + result
 }
 
 func NewLauncherService(
@@ -711,5 +811,17 @@ func NewLauncherService(
 	wg *sync.WaitGroup,
 	config_obj *config_proto.Config) (services.Launcher, error) {
 
-	return &Launcher{}, nil
+	// The laucher service is also created on the client to ensure it
+	// can compile artifacts etc. But it does not make sense to
+	// actually store any of the flows on the client. We therefore
+	// install a dummy storer which just returns errors for any
+	// attempts to store flows.
+	if config_obj.Datastore == nil {
+		return &Launcher{Storage_: &DummyStorer{}}, nil
+	}
+
+	res := &Launcher{
+		Storage_: NewFlowStorageManager(ctx, config_obj, wg),
+	}
+	return res, nil
 }

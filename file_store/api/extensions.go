@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"strings"
 )
 
@@ -26,8 +27,9 @@ func GetExtensionForFilestore(path_spec FSPathSpec) string {
 
 	switch t {
 	case PATH_TYPE_DATASTORE_PROTO, PATH_TYPE_DATASTORE_JSON:
-		panic("datastore path used for filestore for " +
-			path_spec.AsClientPath())
+		panic(fmt.Sprintf(
+			"datastore path used for filestore for %v ",
+			path_spec.Components()))
 
 	case PATH_TYPE_FILESTORE_JSON:
 		return ".json"
@@ -43,6 +45,9 @@ func GetExtensionForFilestore(path_spec FSPathSpec) string {
 
 	case PATH_TYPE_FILESTORE_DOWNLOAD_ZIP:
 		return ".zip"
+
+	case PATH_TYPE_FILESTORE_CHUNK_INDEX:
+		return ".chunk"
 
 	case PATH_TYPE_FILESTORE_DOWNLOAD_REPORT:
 		return ".html"
@@ -104,6 +109,10 @@ func GetFileStorePathTypeFromExtension(name string) (PathType, string) {
 
 	if strings.HasSuffix(name, ".zip") {
 		return PATH_TYPE_FILESTORE_DOWNLOAD_ZIP, name[:len(name)-4]
+	}
+
+	if strings.HasSuffix(name, ".chunk") {
+		return PATH_TYPE_FILESTORE_CHUNK_INDEX, name[:len(name)-7]
 	}
 
 	if strings.HasSuffix(name, ".html") {

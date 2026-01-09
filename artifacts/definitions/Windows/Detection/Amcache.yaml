@@ -13,13 +13,13 @@ description: |
 
       - SHA1regex - regex entries to filter by SHA1.
       - PathRegex - filter on path if available.
-      - NameRegex - filter on EntryName / binary.
+      - NameRegex - filter on EntryName OR OriginalFileName.
 
     NOTE:
 
       - Secondary fields are not consistent across AMCache types and some legacy
       versions do not return these fields.
-      - Some enrichment has occured but any secondary fields should be treated as
+      - Some enrichment has occurred but any secondary fields should be treated as
       guidance only.
       - This artifact collects only entries with a SHA1, for complete AMCache
       analysis please download raw artifact sets.
@@ -32,7 +32,7 @@ parameters:
     default: "%SYSTEMROOT%/appcompat/Programs/Amcache.hve"
     description: AMCache hive path
   - name: KeyPathGlob
-    default: /Root/{Inventory, File}**
+    default: /Root/{Inventory, File}*/**
     type: hidden
     description: Registry key path glob
   - name: SHA1Regex
@@ -109,8 +109,8 @@ sources:
                     WHERE SHA1
                         AND SHA1 =~ SHA1Regex
                         AND if(condition= NameRegex,
-                            then= EntryName =~ NameRegex,
-                            else= True)
+                                then= EntryName =~ NameRegex OR OriginalFileName =~ NameRegex,
+                                else= True)
                         AND if(condition= PathRegex,
                             then= EntryPath =~ PathRegex,
                             else= True)

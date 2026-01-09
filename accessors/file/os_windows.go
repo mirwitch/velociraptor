@@ -1,8 +1,9 @@
+//go:build windows
 // +build windows
 
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -38,8 +39,6 @@ import (
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/utils"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
-	"www.velocidex.com/golang/velociraptor/vql/windows/wmi"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -130,6 +129,7 @@ func (self *OSFileInfo) sys() *syscall.Win32FileAttributeData {
 
 type OSFileSystemAccessor struct {
 	follow_links bool
+	scope        vfilter.Scope
 }
 
 func (self OSFileSystemAccessor) ParsePath(path string) (
@@ -140,45 +140,23 @@ func (self OSFileSystemAccessor) ParsePath(path string) (
 func (self OSFileSystemAccessor) New(scope vfilter.Scope) (
 	accessors.FileSystemAccessor, error) {
 
-	// Check we have permission to open files.
-	err := vql_subsystem.CheckAccess(scope, acls.FILESYSTEM_READ)
-	if err != nil {
-		return nil, err
-	}
-
-	result := &OSFileSystemAccessor{follow_links: self.follow_links}
-	return result, nil
+	return &OSFileSystemAccessor{
+		follow_links: self.follow_links,
+		scope:        scope,
+	}, nil
 }
 
-func discoverDriveLetters() ([]accessors.FileInfo, error) {
-	result := []accessors.FileInfo{}
-
-	shadow_volumes, err := wmi.Query(
-		"SELECT DeviceID, Description, VolumeName, FreeSpace, "+
-			"Size, SystemName, VolumeSerialNumber "+
-			"from Win32_LogicalDisk",
-		"ROOT\\CIMV2")
-	if err == nil {
-		for _, row := range shadow_volumes {
-			size, _ := row.GetInt64("Size")
-			device_name, pres := row.GetString("DeviceID")
-			if pres {
-				device_path, err := accessors.NewWindowsOSPath(device_name)
-				if err != nil {
-					return nil, err
-				}
-
-				result = append(result, &accessors.VirtualFileInfo{
-					IsDir_: true,
-					Size_:  size,
-					Data_:  row,
-					Path:   device_path,
-				})
-			}
-		}
+func (self OSFileSystemAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name:        "file",
+		Description: `Access the filesystem using the OS API.`,
+		Permissions: []acls.ACL_PERMISSION{acls.FILESYSTEM_READ},
 	}
+}
 
-	return result, nil
+func (self *OSFileSystemAccessor) GetUnderlyingAPIFilename(
+	full_path *accessors.OSPath) (string, error) {
+	return full_path.PathSpec().Path, nil
 }
 
 func (self OSFileSystemAccessor) ReadDir(path string) (
@@ -191,13 +169,26 @@ func (self OSFileSystemAccessor) ReadDir(path string) (
 	return self.ReadDirWithOSPath(full_path)
 }
 
+// On Windows filesystems are usually case insensitive.
+func (self OSFileSystemAccessor) GetCanonicalFilename(
+	path *accessors.OSPath) string {
+	return strings.ToLower(path.String())
+}
+
 func (self OSFileSystemAccessor) ReadDirWithOSPath(
 	full_path *accessors.OSPath) ([]accessors.FileInfo, error) {
 	var result []accessors.FileInfo
 
+	defer Instrument("ReadDirWithOSPath")()
+
+	err := CheckPrefix(full_path)
+	if err != nil {
+		return nil, err
+	}
+
 	// No drive part, so list all drives.
 	if len(full_path.Components) == 0 {
-		return discoverDriveLetters()
+		return Cache.DiscoverDriveLetters()
 	}
 
 	// Add a final \ to turn path into a directory path. This is
@@ -241,11 +232,17 @@ func (self OSFileSystemAccessor) ReadDirWithOSPath(
 	}
 
 	for _, f := range files {
+		child_path := full_path.Append(f.Name())
+		err := CheckPrefix(child_path)
+		if err != nil {
+			continue
+		}
+
 		result = append(result,
 			&OSFileInfo{
 				follow_links: self.follow_links,
 				FileInfo:     f,
-				_full_path:   full_path.Append(f.Name()),
+				_full_path:   child_path,
 			})
 	}
 	return result, nil
@@ -254,6 +251,10 @@ func (self OSFileSystemAccessor) ReadDirWithOSPath(
 // Wrap the os.File object to keep track of open file handles.
 type OSFileWrapper struct {
 	*os.File
+}
+
+func (self OSFileWrapper) IsSeekable() bool {
+	return true
 }
 
 func (self OSFileWrapper) Close() error {
@@ -271,6 +272,21 @@ func (self OSFileSystemAccessor) Open(path string) (accessors.ReadSeekCloser, er
 
 func (self OSFileSystemAccessor) OpenWithOSPath(full_path *accessors.OSPath) (
 	accessors.ReadSeekCloser, error) {
+
+	defer Instrument("OpenWithOSPath")()
+
+	err := CheckPrefix(full_path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Opening the drive letter directly produces a reader over the
+	// raw disk.
+	if len(full_path.Components) == 1 {
+		device_name := full_path.Components[0]
+		return getDeviceReader(self.scope, device_name)
+	}
+
 	filename := full_path.String()
 
 	// The API does not accept filenames with trailing \\ for an open call.
@@ -285,11 +301,18 @@ func (self OSFileSystemAccessor) OpenWithOSPath(full_path *accessors.OSPath) (
 }
 
 func (self *OSFileSystemAccessor) Lstat(path string) (accessors.FileInfo, error) {
+	defer Instrument("Lstat")()
 
 	full_path, err := self.ParsePath(path)
 	if err != nil {
 		return nil, err
 	}
+
+	err = CheckPrefix(full_path)
+	if err != nil {
+		return nil, err
+	}
+
 	stat, err := os.Lstat(full_path.String())
 	return &OSFileInfo{
 		follow_links: self.follow_links,
@@ -301,6 +324,29 @@ func (self *OSFileSystemAccessor) Lstat(path string) (accessors.FileInfo, error)
 func (self *OSFileSystemAccessor) LstatWithOSPath(full_path *accessors.OSPath) (
 	accessors.FileInfo, error) {
 
+	defer Instrument("LstatWithOSPath")()
+
+	err := CheckPrefix(full_path)
+	if err != nil {
+		return nil, err
+	}
+
+	// An Lstat of a device returns metadata about the device
+	if len(full_path.Components) == 1 {
+		devices, err := Cache.DiscoverDriveLetters()
+		if err != nil {
+			return nil, err
+		}
+
+		// Find the right device information
+		for _, d := range devices {
+			if full_path.Components[0] == d.Name() {
+				return d, nil
+			}
+		}
+		return nil, utils.NotFoundError
+	}
+
 	stat, err := os.Lstat(full_path.String())
 	return &OSFileInfo{
 		follow_links: self.follow_links,
@@ -310,16 +356,28 @@ func (self *OSFileSystemAccessor) LstatWithOSPath(full_path *accessors.OSPath) (
 }
 
 func init() {
-	accessors.Register("file", &OSFileSystemAccessor{},
-		`Access the filesystem using the OS API.`)
+	accessors.Register(&OSFileSystemAccessor{})
+
+	// Windows filesystem is already case insensitive so we provide an
+	// alias so artifacts can work with either.
+	accessors.Register(accessors.DescribeAccessor(
+		&OSFileSystemAccessor{}, accessors.AccessorDescriptor{
+			Name:        "file_nocase",
+			Description: `Access the filesystem using the OS API.`,
+		}))
 
 	// Register a variant which allows following links - be
 	// careful with it - it can get stuck on loops.
-	accessors.Register("file_links", &OSFileSystemAccessor{
-		follow_links: true,
-	}, `Access the filesystem using the OS APIs.
-
-This Accessor also follows any symlinks - Note: Take care with this accessor because there may be circular links.`)
+	accessors.Register(accessors.DescribeAccessor(
+		&OSFileSystemAccessor{
+			follow_links: true,
+		}, accessors.AccessorDescriptor{
+			Name: "file_links",
+			Description: `Access the filesystem using the OS API.
+This Accessor also follows any symlinks - Note: Take care with this accessor because there may be circular links.
+`,
+			Permissions: []acls.ACL_PERMISSION{acls.FILESYSTEM_READ},
+		}))
 
 	// We do not register the OSFileSystemAccessor directly - it
 	// is used through the AutoFilesystemAccessor: If we can not

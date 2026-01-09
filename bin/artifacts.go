@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package main
 
@@ -28,13 +28,16 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/Velocidex/yaml/v2"
+	errors "github.com/go-errors/errors"
 	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/executor"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
+	"www.velocidex.com/golang/velociraptor/json"
 	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/startup"
+	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 )
 
@@ -47,6 +50,10 @@ var (
 
 	artifact_command_show = artifact_command.Command(
 		"show", "Show an artifact")
+
+	artifact_command_collect_cli_mode = artifact_command_collect.Flag(
+		"cli_help_mode", "Display help like a CLI command").
+		Bool()
 
 	artifact_command_show_name = artifact_command_show.Arg(
 		"name", "Name to show.").Required().String()
@@ -83,14 +90,6 @@ var (
 		"output_level", "Compression level for zip output.").
 		Default("5").Int64()
 
-	artifact_command_collect_report = artifact_command_collect.Flag(
-		"report", "When specified we create a report html file.").
-		Default("").String()
-
-	artifact_command_collect_report_template = artifact_command_collect.Flag(
-		"report_template", "Use this artifact to provide the report template.").
-		Default("").String()
-
 	artificat_command_collect_admin_flag = artifact_command_collect.Flag(
 		"require_admin", "Ensure the user is an admin").Bool()
 
@@ -99,15 +98,15 @@ var (
 		Default("").String()
 
 	artifact_command_collect_format = artifact_command_collect.Flag(
-		"format", "Output format to use  (text,json,csv,jsonl).").
-		Default("json").Enum("text", "json", "csv", "jsonl")
+		"format", "Output format to use  (csv, json, csv_only).").
+		Default("json").Enum("json", "jsonl", "csv", "csv_only")
 
 	artifact_command_collect_names = artifact_command_collect.Arg(
 		"artifact_name", "The artifact name to collect.").
 		Required().HintAction(listArtifactsHint).Strings()
 
 	artifact_command_collect_args = artifact_command_collect.Flag(
-		"args", "Artifact args.").Strings()
+		"args", "Artifact args (e.g. --args Foo=Bar).").Strings()
 
 	artifact_command_collect_hardmemory = artifact_command_collect.Flag(
 		"hard_memory_limit", "If we reach this memory limit in bytes we exit.").Uint64()
@@ -146,6 +145,8 @@ func getRepository(config_obj *config_proto.Config) (services.Repository, error)
 }
 
 func doArtifactCollect() error {
+	logging.DisableLogging()
+
 	if *artificat_command_collect_admin_flag {
 		err := checkAdmin()
 		if err != nil {
@@ -169,6 +170,16 @@ func doArtifactCollect() error {
 		return err
 	}
 
+	manager, err := services.GetRepositoryManager(config_obj)
+	if err != nil {
+		return err
+	}
+
+	repository, err := manager.GetGlobalRepository(config_obj)
+	if err != nil {
+		return err
+	}
+
 	spec := ordereddict.NewDict()
 	for _, name := range *artifact_command_collect_names {
 		collect_args := ordereddict.NewDict()
@@ -187,34 +198,43 @@ func doArtifactCollect() error {
 			parts := strings.SplitN(item, "=", 2)
 			arg_name := parts[0]
 
+			arg_type, err := getParameterType(ctx, config_obj,
+				repository, name, arg_name)
+			if err != nil {
+				return err
+			}
+
 			if len(parts) < 2 {
 				collect_args.Set(arg_name, "Y")
 			} else {
-				collect_args.Set(arg_name, parts[1])
+				collect_args.Set(arg_name,
+					parseArtifactType(arg_type, parts[1]))
 			}
 		}
 
 		spec.Set(name, collect_args)
 	}
 
-	manager, err := services.GetRepositoryManager(config_obj)
-	if err != nil {
-		return err
+	if len(*artifact_command_collect_names) == 0 {
+		return errors.New("Need some artifact to collect")
 	}
 
-	logger := log.New(&LogWriter{config_obj}, "", 0)
+	if *artifact_command_collect_cli_mode {
+		for _, name := range *artifact_command_collect_names {
+			return doArtifactCLIHelp(ctx, config_obj, manager, name)
+		}
+	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	scope := manager.BuildScope(services.ScopeBuilder{
 		Config:     config_obj,
 		ACLManager: acl_managers.NullACLManager{},
-		Logger:     logger,
+		Logger:     log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set("Artifacts", *artifact_command_collect_names).
 			Set("Output", *artifact_command_collect_output).
 			Set("Level", *artifact_command_collect_output_compression).
 			Set("Password", *artifact_command_collect_output_password).
-			Set("Report", *artifact_command_collect_report).
-			Set("Template", *artifact_command_collect_report_template).
 			Set("Args", spec).
 			Set("Format", *artifact_command_collect_format).
 			Set("Timeout", *artifact_command_collect_timeout).
@@ -226,9 +246,25 @@ func doArtifactCollect() error {
 	// Stick around until the query completes so it gets a chance to
 	// close the collection zip.
 	sm.Wg.Add(1)
-	scope.AddDestructor(func() {
+	err = scope.AddDestructor(func() {
 		sm.Wg.Done()
 	})
+	if err != nil {
+		sm.Wg.Done()
+		return err
+	}
+
+	// If interrupt has occured we cancel everything and wait for any
+	// cleanups to occur. If we return too quickly from the main
+	// thread, we might leave some tempfiles behind.
+	defer func() {
+		select {
+		case <-ctx.Done():
+			scope.Log("ERROR:Interrupted! Sleeping on exit to allow cleanup")
+			time.Sleep(time.Second)
+		default:
+		}
+	}()
 
 	if *artifact_command_collect_hardmemory > 0 {
 		scope.Log("Installing hard memory limit of %v bytes",
@@ -237,20 +273,19 @@ func doArtifactCollect() error {
 			MaxMemoryHardLimit: *artifact_command_collect_hardmemory,
 			Logger: logging.GetLogger(
 				config_obj, &logging.ToolComponent),
-			OnExit: sm.Close,
 		}
+		Nanny.RegisterOnWarnings(utils.GetId(), sm.Close)
 
 		// Keep the nanny running after the query is done so it can
 		// hard kill the process if cancellation is not enough.
 		Nanny.Start(ctx, &sync.WaitGroup{})
 	}
 
-	now := time.Now()
+	start := utils.GetTime().Now()
 	defer func() {
 		logging.GetLogger(config_obj, &logging.ToolComponent).
 			Info("Collection completed in %v Seconds",
-				time.Now().Unix()-now.Unix())
-
+				utils.GetTime().Now().Sub(start))
 	}()
 
 	if *trace_vql_flag {
@@ -259,14 +294,18 @@ func doArtifactCollect() error {
 	}
 
 	query := `
-  SELECT * FROM collect(artifacts=Artifacts, output=Output, report=Report,
-                        level=Level, template=Template,
-                        timeout=Timeout, progress_timeout=ProgressTimeout,
-                        cpu_limit=CpuLimit,
-                        password=Password, args=Args, format=Format)`
-	return eval_local_query(
+  SELECT * FROM collect(
+     artifacts=Artifacts, output=Output,
+     level=Level, timeout=Timeout, progress_timeout=ProgressTimeout,
+     cpu_limit=CpuLimit, password=Password, args=Args, format=Format)`
+	err = eval_local_query(
 		sm.Ctx, config_obj,
 		*artifact_command_collect_format, query, scope)
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func getFilterRegEx(pattern string) (*regexp.Regexp, error) {
@@ -276,6 +315,8 @@ func getFilterRegEx(pattern string) (*regexp.Regexp, error) {
 }
 
 func doArtifactShow() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithNullLoader().LoadAndValidate()
 	if err != nil {
@@ -302,7 +343,8 @@ func doArtifactShow() error {
 		return err
 	}
 
-	artifact, pres := repository.Get(config_obj, *artifact_command_show_name)
+	artifact, pres := repository.Get(ctx, config_obj,
+		*artifact_command_show_name)
 	if !pres {
 		return fmt.Errorf("Artifact %s not found",
 			*artifact_command_show_name)
@@ -313,6 +355,8 @@ func doArtifactShow() error {
 }
 
 func doArtifactList() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithNullLoader().LoadAndValidate()
 	if err != nil {
@@ -365,7 +409,7 @@ func doArtifactList() error {
 			continue
 		}
 
-		artifact, pres := repository.Get(config_obj, name)
+		artifact, pres := repository.Get(ctx, config_obj, name)
 		if !pres {
 			return fmt.Errorf("Artifact %s not found", name)
 		}
@@ -404,6 +448,66 @@ func doArtifactList() error {
 	return nil
 }
 
+func doArtifactCLIHelp(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	manager services.RepositoryManager, artifact_name string) error {
+	repository, err := manager.GetGlobalRepository(config_obj)
+	if err != nil {
+		return err
+	}
+	artifact, pres := repository.Get(ctx, config_obj, artifact_name)
+	if !pres {
+		return utils.Wrap(utils.NotFoundError,
+			"Unknown artifact %v", artifact_name)
+	}
+
+	parse_context, err := app.ParseContext(
+		[]string{"artifacts", "collect", artifact.Name})
+	if err != nil {
+		return err
+	}
+	app.UsageForContextWithTemplate(
+		parse_context, 2, fmt.Sprintf(`
+usage: {{.App.Name}}[<common flags> ...] -r %v [<artifact params> ...]:
+
+Common Flags:
+{{with .Context.Flags|FlagsToTwoColumns}}{{FormatTwoColumnsWithIndent . 4 2}}{{end}}
+Artifact Parameters:
+`, artifact.Name))
+
+	for _, param := range artifact.Parameters {
+		desc := strings.TrimSpace(param.Description)
+		type_str := ""
+		if param.Type != "" {
+			type_str = fmt.Sprintf(" [%v] ", param.Type)
+			switch param.Type {
+			case "bool":
+				desc += "\n\nValid values: Y / N"
+			case "multichoice":
+				desc += `
+
+NOTE: Provide one or more of the following separated by ,
+Valid values one or more of: ` + strings.Join(param.Choices, ", ")
+
+			case "regex":
+				desc += "\n\nNOTE: Be careful to escape regex backslashes from the shell!"
+			}
+		}
+
+		desc = utils.Indent(utils.WrapString(desc, 100), 10) + "\n"
+
+		if param.Default != "" {
+			fmt.Printf(" --%v%v\n   default: '%v'\n%v",
+				param.Name, type_str, param.Default, desc)
+		} else {
+			fmt.Printf(" --%v%v\n%v",
+				param.Name, type_str, desc)
+		}
+	}
+	return nil
+}
+
 func maybeAddDefinitionsDirectory(config_obj *config_proto.Config) error {
 	if *artifact_definitions_dir != "" {
 		if config_obj.Defaults == nil {
@@ -415,6 +519,48 @@ func maybeAddDefinitionsDirectory(config_obj *config_proto.Config) error {
 			*artifact_definitions_dir)
 	}
 	return nil
+}
+
+// Simplify parsing of some parameter types. Since typing complicated
+// JSON escapes on the command line may be complicated (especially on
+// Windows) we also support some simpler types here
+func parseArtifactType(param_type string, param string) string {
+	switch param_type {
+	case "multichoice", "json_array":
+		var res []string
+		err := json.Unmarshal([]byte(param), &res)
+		if err != nil {
+			// As an alternative for multi choice we allow items to be
+			// separated by comma.
+			for _, part := range strings.Split(param, ",") {
+				res = append(res, strings.TrimSpace(part))
+			}
+			return json.MustMarshalString(res)
+		}
+	}
+	return param
+}
+
+func getParameterType(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	repository services.Repository,
+	artifact_name, param_name string) (string, error) {
+	artifact, pres := repository.Get(ctx, config_obj, artifact_name)
+	if !pres {
+		return "", utils.Wrap(utils.NotFoundError,
+			"Unknown artifact %v", artifact_name)
+	}
+
+	for _, p := range artifact.Parameters {
+		if p.Name == param_name {
+			return p.Type, nil
+		}
+	}
+
+	return "", utils.Wrap(utils.NotFoundError,
+		"Parameter %v not known for artifact %v",
+		param_name, artifact_name)
 }
 
 func init() {

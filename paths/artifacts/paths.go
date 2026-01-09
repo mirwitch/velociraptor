@@ -23,7 +23,6 @@ type ArtifactPathManager struct {
 	ClientId, FlowId, FullArtifactName string
 	base_artifact_name, source         string
 	mode                               int
-	Clock                              utils.Clock
 	file_store                         api.FileStore
 }
 
@@ -31,6 +30,13 @@ func NewArtifactPathManagerWithMode(
 	config_obj *config_proto.Config,
 	client_id, flow_id, full_artifact_name string,
 	mode int) *ArtifactPathManager {
+
+	// Override the internal mode for debugging.
+	if mode == paths.INTERNAL &&
+		config_obj.Defaults != nil &&
+		config_obj.Defaults.WriteInternalEvents {
+		mode = paths.MODE_SERVER_EVENT
+	}
 
 	artifact_name, artifact_source := paths.SplitFullSourceName(full_artifact_name)
 
@@ -43,18 +49,17 @@ func NewArtifactPathManagerWithMode(
 		base_artifact_name: artifact_name,
 		source:             artifact_source,
 		mode:               mode,
-		Clock:              utils.RealClock{},
 		file_store:         file_store_factory,
 	}
 }
 
 func NewArtifactPathManager(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	client_id, flow_id, full_artifact_name string) (
 	*ArtifactPathManager, error) {
 	artifact_name, artifact_source := paths.SplitFullSourceName(full_artifact_name)
 
-	mode, err := GetArtifactMode(config_obj, artifact_name)
+	mode, err := GetArtifactMode(ctx, config_obj, artifact_name)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +73,6 @@ func NewArtifactPathManager(
 		base_artifact_name: artifact_name,
 		source:             artifact_source,
 		mode:               mode,
-		Clock:              utils.RealClock{},
 		file_store:         file_store_factory,
 	}, nil
 }
@@ -79,7 +83,7 @@ func NewArtifactPathManager(
 func (self *ArtifactPathManager) IsEvent() bool {
 	switch self.mode {
 	// These are regular artifacts
-	case paths.MODE_CLIENT, paths.MODE_SERVER:
+	case paths.MODE_CLIENT, paths.MODE_SERVER, paths.MODE_NOTEBOOK:
 		return false
 
 		// These are all event artifacts
@@ -138,7 +142,7 @@ func (self *ArtifactPathManager) GetRootPath() api.FSPathSpec {
 }
 
 func (self *ArtifactPathManager) getDayName() string {
-	now := self.Clock.Now().UTC()
+	now := utils.GetTime().Now().UTC()
 	return fmt.Sprintf("%d-%02d-%02d", now.Year(),
 		now.Month(), now.Day())
 }
@@ -169,7 +173,7 @@ func (self *ArtifactPathManager) GetPathForWriting() (api.FSPathSpec, error) {
 					self.FlowId), nil
 		}
 
-	case paths.MODE_SERVER:
+	case paths.MODE_SERVER, paths.MODE_NOTEBOOK:
 		if self.source != "" {
 			return paths.CLIENTS_ROOT.AsFilestorePath().
 				SetType(api.PATH_TYPE_FILESTORE_JSON).
@@ -304,7 +308,15 @@ func DayNameToTimestamp(name string) time.Time {
 	return time.Time{}
 }
 
-func GetArtifactMode(config_obj *config_proto.Config, artifact_name string) (int, error) {
+func GetArtifactMode(
+	ctx context.Context, config_obj *config_proto.Config,
+	artifact_name string) (int, error) {
+
+	if config_obj.Defaults != nil &&
+		config_obj.Defaults.WriteInternalEvents {
+		return paths.MODE_SERVER_EVENT, nil
+	}
+
 	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return 0, err
@@ -315,7 +327,8 @@ func GetArtifactMode(config_obj *config_proto.Config, artifact_name string) (int
 		return 0, err
 	}
 
-	artifact_type, err := repository.GetArtifactType(config_obj, artifact_name)
+	artifact_type, err := repository.GetArtifactType(
+		ctx, config_obj, artifact_name)
 	if err != nil {
 		return 0, err
 	}

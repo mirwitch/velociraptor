@@ -1,3 +1,4 @@
+//go:build windows && amd64
 // +build windows,amd64
 
 // References
@@ -14,6 +15,8 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"github.com/hillu/go-ntdll"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/windows"
 	"www.velocidex.com/golang/vfilter"
@@ -40,10 +43,11 @@ func (self WinObjPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "winobj", args)()
 
 		err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
 		if err != nil {
-			scope.Log("proc_dump: %s", err)
+			scope.Log("winobj: %s", err)
 			return
 		}
 
@@ -71,9 +75,10 @@ func (self WinObjPlugin) Call(
 
 func (self WinObjPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "winobj",
-		Doc:     "Enumerate The Windows Object Manager namespace.",
-		ArgType: type_map.AddType(scope, &WinObjPluginArgs{}),
+		Name:     "winobj",
+		Doc:      "Enumerate The Windows Object Manager namespace.",
+		ArgType:  type_map.AddType(scope, &WinObjPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 
@@ -103,7 +108,7 @@ func GetObjects(ctx context.Context,
 	}
 	defer ntdll.NtClose(dir_handle)
 
-	buffer := make([]byte, 1024*1024)
+	buffer := utils.AllocateBuff(1024 * 1024)
 	length := uint32(0)
 	index := uint32(0)
 

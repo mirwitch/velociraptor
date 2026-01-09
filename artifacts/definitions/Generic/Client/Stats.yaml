@@ -23,6 +23,23 @@ sources:
            FROM pslist(pid=getpid())
          })
 
+    notebook:
+      - type: vql_suggestion
+        name: Graph CPU usage
+        template: |
+          /*
+          # Events from Generic.Client.Stats
+          */
+          LET resources = SELECT Timestamp, rate(x=CPU, y=Timestamp) * 100 As CPUPercent,
+               RSS / 1000000 AS MemoryUse
+          FROM source(start_time=StartTime, end_time=EndTime)
+          WHERE CPUPercent >= 0
+          /*
+            {{ Query "SELECT * FROM resources" | LineChart "xaxis_mode" "time" "RSS.yaxis" 2 }}
+          */
+          SELECT * FROM resources
+          LIMIT 50
+
   - precondition: SELECT OS From info() where OS != 'windows'
     query: |
       SELECT *, rate(x=CPU, y=Timestamp) AS CPUPercent

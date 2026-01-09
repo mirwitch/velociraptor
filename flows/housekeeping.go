@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -74,12 +74,15 @@ func CheckClientStatus(
 
 		// Inform the client manager that this client will now receive
 		// the latest event table.
-		client_manager.UpdateStats(ctx, client_id, &services.Stats{
+		err := client_manager.UpdateStats(ctx, client_id, &services.Stats{
 			LastEventTableVersion: update_message.UpdateEventTable.Version,
 		})
+		if err != nil {
+			return err
+		}
 
 		clientEventUpdateCounter.Inc()
-		err := client_manager.QueueMessageForClient(
+		err = client_manager.QueueMessageForClient(
 			ctx, client_id, update_message,
 			services.NOTIFY_CLIENT, utils.BackgroundWriter)
 		if err != nil {
@@ -94,8 +97,8 @@ func CheckClientStatus(
 		return err
 	}
 
-	// Can we get away without a lock? If the client is already up
-	// to date we dont need to look further.
+	// If the client is already up to date we dont need to look
+	// further.
 	hunts_last_timestamp := dispatcher.GetLastTimestamp()
 	if stats.LastHuntTimestamp >= hunts_last_timestamp {
 		return nil
@@ -104,25 +107,26 @@ func CheckClientStatus(
 	// Take a snapshot of the hunts that we need to run on this
 	// client to reduce the time under lock.
 	hunts := make([]*api_proto.Hunt, 0)
-	err = dispatcher.ApplyFuncOnHunts(func(hunt *api_proto.Hunt) error {
-		// Hunt is stopped we dont care about it.
-		if hunt.State != api_proto.Hunt_RUNNING {
-			return nil
-		}
+	err = dispatcher.ApplyFuncOnHunts(ctx, services.OnlyRunningHunts,
+		func(hunt *api_proto.Hunt) error {
+			// Hunt is stopped we dont care about it.
+			if hunt.State != api_proto.Hunt_RUNNING {
+				return nil
+			}
 
-		// This hunt is not relevant to this client.
-		if hunt.StartTime <= stats.LastHuntTimestamp {
-			return nil
-		}
+			// This hunt is not relevant to this client.
+			if hunt.StartTime <= stats.LastHuntTimestamp {
+				return nil
+			}
 
-		// Take a snapshot of the hunt id and start time.
-		hunts = append(hunts, &api_proto.Hunt{
-			HuntId:    hunt.HuntId,
-			StartTime: hunt.StartTime,
+			// Take a snapshot of the hunt id and start time.
+			hunts = append(hunts, &api_proto.Hunt{
+				HuntId:    hunt.HuntId,
+				StartTime: hunt.StartTime,
+			})
+
+			return nil
 		})
-
-		return nil
-	})
 
 	if err != nil {
 		return err
@@ -143,7 +147,7 @@ func CheckClientStatus(
 	latest_timestamp := uint64(0)
 	for _, hunt := range hunts {
 		// Notify the hunt manager that we need to hunt this client.
-		journal.PushRowsToArtifactAsync(config_obj,
+		journal.PushRowsToArtifactAsync(ctx, config_obj,
 			ordereddict.NewDict().
 				Set("HuntId", hunt.HuntId).
 				Set("ClientId", client_id),
@@ -154,8 +158,7 @@ func CheckClientStatus(
 		}
 	}
 
-	client_manager.UpdateStats(ctx, client_id, &services.Stats{
+	return client_manager.UpdateStats(ctx, client_id, &services.Stats{
 		LastHuntTimestamp: latest_timestamp,
 	})
-	return nil
 }

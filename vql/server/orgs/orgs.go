@@ -7,7 +7,6 @@ import (
 	"github.com/Velocidex/yaml/v2"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/users"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -22,7 +21,9 @@ func (self OrgsPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "orgs", args)()
 
+		user_manager := services.GetUserManager()
 		org_manager, err := services.GetOrgManager()
 		if err != nil {
 			scope.Log("orgs: %v", err)
@@ -31,7 +32,7 @@ func (self OrgsPlugin) Call(
 
 		// ACLs are checked by the users module
 		principal := vql_subsystem.GetPrincipal(scope)
-		for _, org_record := range users.GetOrgs(ctx, principal) {
+		for _, org_record := range user_manager.GetOrgs(ctx, principal) {
 			org_config_obj, err := org_manager.GetOrgConfig(org_record.Id)
 			if err != nil {
 				continue

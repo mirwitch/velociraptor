@@ -1,8 +1,9 @@
+//go:build server_vql
 // +build server_vql
 
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -28,6 +29,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -35,8 +37,6 @@ import (
 
 type ClientsPluginArgs struct {
 	Search   string `vfilter:"optional,field=search,doc=Client search string. Can have the following prefixes: 'label:', 'host:'"`
-	Start    uint64 `vfilter:"optional,field=start,doc=First client to fetch (0)'"`
-	Limit    uint64 `vfilter:"optional,field=count,doc=Maximum number of clients to fetch (1000)'"`
 	ClientId string `vfilter:"optional,field=client_id"`
 }
 
@@ -50,8 +50,15 @@ func (self ClientsPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "clients", args)()
 
 		err := vql_subsystem.CheckAccess(scope, acls.READ_RESULTS)
+		if err != nil {
+			scope.Log("clients: %v", err)
+			return
+		}
+
+		err = services.RequireFrontend()
 		if err != nil {
 			scope.Log("clients: %v", err)
 			return
@@ -66,7 +73,7 @@ func (self ClientsPlugin) Call(
 
 		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
-			scope.Log("Command can only run on the server")
+			scope.Log("clients: Command can only run on the server")
 			return
 		}
 
@@ -93,11 +100,6 @@ func (self ClientsPlugin) Call(
 		search_term := arg.Search
 		if search_term == "" {
 			search_term = "all"
-		}
-
-		limit := arg.Limit
-		if limit == 0 {
-			limit = 100000
 		}
 
 		indexer, err := services.GetIndexer(config_obj)
@@ -127,9 +129,10 @@ func (self ClientsPlugin) Call(
 
 func (self ClientsPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "clients",
-		Doc:     "Retrieve the list of clients.",
-		ArgType: type_map.AddType(scope, &ClientsPluginArgs{}),
+		Name:     "clients",
+		Doc:      "Retrieve the list of clients.",
+		ArgType:  type_map.AddType(scope, &ClientsPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 
@@ -156,9 +159,15 @@ func (self *ClientInfoFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("client_info: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("client_info: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -180,9 +189,11 @@ func (self *ClientInfoFunction) Call(ctx context.Context,
 func (self ClientInfoFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "client_info",
-		Doc:     "Returns client info (like the fqdn) from the datastore.",
-		ArgType: type_map.AddType(scope, &ClientInfoFunctionArgs{}),
+		Name:     "client_info",
+		Doc:      "Returns client info (like the fqdn) from the datastore.",
+		ArgType:  type_map.AddType(scope, &ClientInfoFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
+		Version:  2,
 	}
 }
 

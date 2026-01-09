@@ -1,6 +1,8 @@
 package paths
 
 import (
+	"strings"
+
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 )
 
@@ -11,6 +13,10 @@ type HuntPathManager struct {
 
 func (self HuntPathManager) Path() api.DSPathSpec {
 	return self.path
+}
+
+func (self HuntPathManager) HuntDownloadsDirectory() api.FSPathSpec {
+	return DOWNLOADS_ROOT.AddUnsafeChild("hunts", self.hunt_id)
 }
 
 // Get the file store path for placing the download zip for the flow.
@@ -43,17 +49,31 @@ func NewHuntPathManager(hunt_id string) *HuntPathManager {
 	}
 }
 
-func (self HuntPathManager) Stats() api.DSPathSpec {
-	return self.path.AddChild("stats")
-}
-
 func (self HuntPathManager) HuntDirectory() api.DSPathSpec {
 	return HUNTS_ROOT
+}
+
+func (self HuntPathManager) HuntDataDirectory() api.FSPathSpec {
+	return HUNTS_ROOT.AddChild(self.hunt_id).AsFilestorePath()
+}
+
+func (self HuntPathManager) HuntParticipationIndexDirectory() api.DSPathSpec {
+	return HUNT_INDEX.AddChild(strings.ToLower(self.hunt_id))
+}
+
+func (self HuntPathManager) HuntIndex() api.FSPathSpec {
+	return HUNTS_ROOT.AddChild("index").AsFilestorePath()
 }
 
 // Get result set for storing participating clients.
 func (self HuntPathManager) Clients() api.FSPathSpec {
 	return HUNTS_ROOT.AddChild(self.hunt_id).AsFilestorePath()
+}
+
+// A frequently refreshed table that mirrors the Clients() table above
+// but include filterable/searchable fields.
+func (self HuntPathManager) EnrichedClients() api.FSPathSpec {
+	return HUNTS_ROOT.AddChild(self.hunt_id, "enriched").AsFilestorePath()
 }
 
 // Where to store client errors.

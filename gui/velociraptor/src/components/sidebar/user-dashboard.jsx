@@ -1,4 +1,5 @@
 import "./user-dashboard.css";
+import PropTypes from 'prop-types';
 
 import React from 'react';
 
@@ -10,20 +11,36 @@ import Dropdown from 'react-bootstrap/Dropdown';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import VeloReportViewer from "../artifacts/reporting.jsx";
 import T from '../i8n/i8n.jsx';
+import ToolTip from '../widgets/tooltip.jsx';
 
 import { withRouter }  from "react-router-dom";
 
 const ranges = [
-    {desc: "Last Hour", sec: 60*60, sample: 1, rows: 400},
-    {desc: "Last Day", sec: 60*60*24, sample: 6, rows: 2000},
-    {desc: "Last 2 days", sec: 60*60*24*2, sample: 10, rows: 2000},
-    {desc: "Last Week", sec: 60*60*24*7, sample: 40, rows: 2000},
+    // Samples are taken every 10 sec by default (6 samples per
+    // minute). Therefore the rows limit should be a fallback to
+    // prevent really huge data sets.
+
+    // Expected 6 * 60 = 360
+    {desc: T("Last Hour"), sec: 60*60, sample: 1, rows: 400},
+
+    // Expected 6 * 60 * 6 / 2 = 1080
+    {desc: T("Last 6 Hours"), sec: 60*60*6, sample: 2, rows: 2000},
+
+    // Expected 6 * 60 * 24 / 6 = 1440
+    {desc: T("Last Day"), sec: 60*60*24, sample: 6, rows: 2000},
+
+    // Expected 6 * 60 * 24 * 2 / 10 = 1728
+    {desc: T("Last 2 days"), sec: 60*60*24*2, sample: 10, rows: 2000},
+
+    // Expected 6 * 60 * 24 * 7 / 40 = 1512
+    {desc: T("Last Week"), sec: 60*60*24*7, sample: 40, rows: 2000},
   ];
 
 
 class UserDashboard extends React.Component {
     static propTypes = {
-
+        // React router props.
+        history: PropTypes.object,
     };
 
     constructor(props) {
@@ -65,25 +82,23 @@ class UserDashboard extends React.Component {
             <>
               <Navbar className="toolbar">
                 <ButtonGroup>
-                  <Button variant="default"
-                          data-position="right"
-                          className="btn-tooltip"
-                          data-tooltip={T("Redraw dashboard")}
-                          onClick={() => this.setState({
-                      version: this.state.version + 1,
-                  })} >
-                    <FontAwesomeIcon icon="sync"/>
-                  </Button>
-
-                  <Button variant="default"
-                          data-position="right"
-                          className="btn-tooltip"
-                          data-tooltip={T("Edit the dashboard")}
-                          onClick={() => {
-                      this.props.history.push("/artifacts/Server.Monitor.Health");
-                  }} >
-                    <FontAwesomeIcon icon="pencil-alt"/>
-                  </Button>
+                  <ToolTip tooltip={T("Redraw dashboard")}>
+                    <Button variant="default"
+                            onClick={() => this.setState({
+                                version: this.state.version + 1,
+                            })} >
+                      <FontAwesomeIcon icon="sync"/>
+                    </Button>
+                  </ToolTip>
+                  <ToolTip tooltip={T("Edit the dashboard")}>
+                    <Button variant="default"
+                            onClick={() => {
+                                this.props.history.push(
+                                    "/artifacts/Server.Monitor.Health/edit");
+                            }} >
+                      <FontAwesomeIcon icon="pencil-alt"/>
+                    </Button>
+                  </ToolTip>
                 </ButtonGroup>
                 <ButtonGroup className="float-right">
                   <Dropdown>
@@ -108,7 +123,8 @@ class UserDashboard extends React.Component {
                   type="SERVER_EVENT"
                   params={{start_time: this.state.start_time,
                            version: this.state.version,
-                           sample: this.state.sample}}
+                           parameters: [{name: "Sample",
+                                         "default": this.state.sample.toString()}]}}
                 />
               </div>
             </>

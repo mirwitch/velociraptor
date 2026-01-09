@@ -120,9 +120,12 @@ type MemcacheFileDataStore struct {
 
 	writer chan *Mutation
 	ctx    context.Context
-	cancel func()
 
 	started bool
+}
+
+func (self *MemcacheFileDataStore) Healthy() error {
+	return nil
 }
 
 func (self *MemcacheFileDataStore) Stats() *MemcacheStats {
@@ -133,11 +136,11 @@ func (self *MemcacheFileDataStore) invalidateDirCache(
 	config_obj *config_proto.Config, urn api.DSPathSpec) {
 
 	for len(urn.Components()) > 0 {
-		path := urn.AsDatastoreDirectory(config_obj)
+		path := AsDatastoreDirectory(self, config_obj, urn)
 		md, pres := self.cache.dir_cache.Get(path)
 		if pres && !md.IsFull() {
-			key_path := urn.AsDatastoreDirectory(config_obj)
-			self.cache.dir_cache.Remove(key_path)
+			key_path := AsDatastoreDirectory(self, config_obj, urn)
+			_ = self.cache.dir_cache.Remove(key_path)
 		}
 		urn = urn.Dir()
 	}
@@ -232,7 +235,11 @@ func (self *MemcacheFileDataStore) processMutation(mutation *Mutation) {
 	metricIdleWriters.Dec()
 	switch mutation.op {
 	case MUTATION_OP_SET_SUBJECT:
-		writeContentToFile(mutation.org_config_obj, mutation.urn, mutation.data)
+		err := writeContentToFile(self, mutation.org_config_obj, mutation.urn, mutation.data)
+		if err != nil {
+			logger := logging.GetLogger(mutation.org_config_obj, &logging.FrontendComponent)
+			logger.Error("MemcacheFileDataStore: processMutation: %v", err)
+		}
 		self.invalidateDirCache(mutation.org_config_obj, mutation.urn)
 
 		// Call the completion function once we hit
@@ -242,7 +249,12 @@ func (self *MemcacheFileDataStore) processMutation(mutation *Mutation) {
 		}
 
 	case MUTATION_OP_DEL_SUBJECT:
-		file_based_imp.DeleteSubject(mutation.org_config_obj, mutation.urn)
+		err := file_based_imp.DeleteSubject(mutation.org_config_obj, mutation.urn)
+		if err != nil {
+			logger := logging.GetLogger(mutation.org_config_obj, &logging.FrontendComponent)
+			logger.Error("MemcacheFileDataStore: processMutation: %v", err)
+		}
+
 		self.invalidateDirCache(mutation.org_config_obj, mutation.urn.Dir())
 
 		// Call the completion function once we hit
@@ -272,8 +284,7 @@ func (self *MemcacheFileDataStore) GetSubject(
 	if errors.Is(err, os.ErrNotExist) {
 		// The file is not in the cache, read it from the file system
 		// instead.
-		serialized_content, err := readContentFromFile(
-			config_obj, urn, true /* must exist */)
+		serialized_content, err := readContentFromFile(self, config_obj, urn)
 		if err != nil {
 			return err
 		}
@@ -281,7 +292,10 @@ func (self *MemcacheFileDataStore) GetSubject(
 		metricDataLRUMiss.Inc()
 
 		// Store it in the cache for next time.
-		self.cache.SetData(config_obj, urn, serialized_content)
+		err = self.cache.SetData(config_obj, urn, serialized_content)
+		if err != nil {
+			return err
+		}
 
 		// Unmarshal the data into the message.
 		return unmarshalData(serialized_content, urn, message)
@@ -405,7 +419,7 @@ func (self *MemcacheFileDataStore) SetSubject(
 		return err
 	}
 
-	err = writeContentToFile(config_obj, urn, serialized_content)
+	err = writeContentToFile(self, config_obj, urn, serialized_content)
 	if err != nil {
 		return err
 	}
@@ -460,9 +474,23 @@ func (self *MemcacheFileDataStore) DeleteSubjectWithCompletion(
 	urn api.DSPathSpec, completion func()) error {
 	defer Instrument("delete", "MemcacheFileDataStore", urn)()
 
+	mutation := &Mutation{
+		op:             MUTATION_OP_DEL_SUBJECT,
+		urn:            urn,
+		completion:     completion,
+		org_config_obj: config_obj,
+	}
+
+	// Delete inline - wait for the operation to complete before returning.
+	if utils.CompareFuncs(completion, utils.SyncCompleter) {
+		mutation.completion = nil
+		self.processMutation(mutation)
+		return self.cache.DeleteSubjectWithCompletion(config_obj, urn, completion)
+	}
+
 	// Remove immediately from the cache memcache as soon as the file
 	// is removed from disk.
-	__completion := func() {
+	mutation.completion = func() {
 		_ = self.cache.DeleteSubject(config_obj, urn)
 		if completion != nil {
 			completion()
@@ -480,14 +508,7 @@ func (self *MemcacheFileDataStore) DeleteSubjectWithCompletion(
 		}
 		break
 
-	case self.writer <- &Mutation{
-		op: MUTATION_OP_DEL_SUBJECT,
-
-		// When we complete make sure the cache is also invalidated to
-		// avoid racing with GetSubject().
-		completion:     __completion,
-		urn:            urn,
-		org_config_obj: config_obj}:
+	case self.writer <- mutation:
 	}
 
 	return nil
@@ -549,16 +570,15 @@ func (self *MemcacheFileDataStore) GetBuffer(
 		return bulk_data, err
 	}
 
-	bulk_data, err = readContentFromFile(
-		config_obj, urn, true /* must exist */)
+	bulk_data, err = readContentFromFile(self, config_obj, urn)
 	if err != nil {
 		return nil, err
 	}
 
 	metricDataLRUMiss.Inc()
-	self.cache.SetData(config_obj, urn, bulk_data)
+	err = self.cache.SetData(config_obj, urn, bulk_data)
 
-	return bulk_data, nil
+	return bulk_data, err
 }
 
 // Needed to support RawDataStore interface.
@@ -600,11 +620,11 @@ func (self *MemcacheFileDataStore) SetBuffer(
 // Recursively makes sure the directories are added to the cache.
 func get_file_dir_metadata(
 	dir_cache *DirectoryLRUCache,
-	config_obj *config_proto.Config, urn api.DSPathSpec) (
+	db DataStore, config_obj *config_proto.Config, urn api.DSPathSpec) (
 	*DirectoryMetadata, error) {
 
 	// Check if the top level directory contains metadata.
-	path := urn.AsDatastoreDirectory(config_obj)
+	path := AsDatastoreDirectory(db, config_obj, urn)
 
 	// Fast path - the directory exists in the cache. NOTE: We dont
 	// need to maintain the directories on the filesystem as the
@@ -628,11 +648,14 @@ func get_file_dir_metadata(
 	// perform a filesystem op and fill in the cache if needed.
 	urn = urn.Dir()
 	for len(urn.Components()) > 0 {
-		path := urn.AsDatastoreDirectory(config_obj)
+		path := AsDatastoreDirectory(db, config_obj, urn)
 		md, pres := dir_cache.Get(path)
 		if pres && !md.IsFull() {
-			key_path := urn.AsDatastoreDirectory(config_obj)
-			dir_cache.Remove(key_path)
+			key_path := AsDatastoreDirectory(db, config_obj, urn)
+			err := dir_cache.Remove(key_path)
+			if err != nil {
+				return nil, err
+			}
 		}
 		urn = urn.Dir()
 	}
@@ -640,7 +663,9 @@ func get_file_dir_metadata(
 	return nil, errorNoDirectoryMetadata
 }
 
-func NewMemcacheFileDataStore(config_obj *config_proto.Config) *MemcacheFileDataStore {
+func NewMemcacheFileDataStore(
+	ctx context.Context,
+	config_obj *config_proto.Config) *MemcacheFileDataStore {
 	data_max_size := 10000
 	if config_obj.Datastore != nil &&
 		config_obj.Datastore.MemcacheDatastoreMaxSize > 0 {
@@ -659,9 +684,9 @@ func NewMemcacheFileDataStore(config_obj *config_proto.Config) *MemcacheFileData
 
 	result := &MemcacheFileDataStore{
 		cache: &MemcacheDatastore{
-			data_cache: NewDataLRUCache(config_obj,
+			data_cache: NewDataLRUCache(ctx, config_obj,
 				data_max_size, data_max_item_size),
-			dir_cache: NewDirectoryLRUCache(config_obj,
+			dir_cache: NewDirectoryLRUCache(ctx, config_obj,
 				data_max_size, dir_max_item_size),
 			get_dir_metadata: get_file_dir_metadata,
 		},

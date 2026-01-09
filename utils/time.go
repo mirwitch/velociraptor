@@ -12,6 +12,13 @@ var (
 	loc = time.UTC
 )
 
+// Get the current approximate time - this is useful for code that
+// needs to check the time very frequently but does not care too much
+// about accuracy.
+func Now() time.Time {
+	return GetTime().Now()
+}
+
 func SetGlobalTimezone(timezone string) error {
 	var err error
 
@@ -45,7 +52,8 @@ func ParseTimeFromInt64(t int64) time.Time {
 
 func IsTime(a vfilter.Any) (time.Time, bool) {
 	switch t := a.(type) {
-
+	case *time.Time:
+		return *t, true
 	case time.Time:
 		return t, true
 	default:
@@ -65,6 +73,10 @@ func MarshalTimes(v interface{}, opts *json.EncOpts) ([]byte, error) {
 
 	}
 	return nil, json.EncoderCallbackSkip
+}
+
+func WinFileTime(in int64) time.Time {
+	return time.Unix((in/10000000)-11644473600, 0).UTC()
 }
 
 func init() {

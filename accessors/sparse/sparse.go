@@ -10,7 +10,6 @@ import (
 	"www.velocidex.com/golang/velociraptor/accessors/zip"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/uploads"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 )
 
@@ -64,8 +63,12 @@ func (self *SparseReader) readDistinctPages(buf []byte) (int, error) {
 		buf_end := buf_start + PAGE_SIZE
 
 		// Repeat the read with a single page at the time.
-		self.handle.Seek(self.offset, os.SEEK_SET)
-		_, err := self.handle.Read(buf[buf_start:buf_end])
+		_, err := self.handle.Seek(self.offset, os.SEEK_SET)
+		if err != nil {
+			return 0, err
+		}
+
+		_, err = self.handle.Read(buf[buf_start:buf_end])
 		if err != nil {
 			// Error occured reading a single page, zero
 			// it out and skip the page.
@@ -97,8 +100,12 @@ func (self *SparseReader) Read(buf []byte) (int, error) {
 			}
 		} else {
 			// Read memory from process at specified offset.
-			self.handle.Seek(self.offset, os.SEEK_SET)
-			_, err := self.handle.Read(buf[:to_read])
+			_, err := self.handle.Seek(self.offset, os.SEEK_SET)
+			if err != nil {
+				return 0, err
+			}
+
+			_, err = self.handle.Read(buf[:to_read])
 
 			// A read error occured - split the read into multiple page
 			// size reads to get as much data as we can out of the
@@ -179,11 +186,11 @@ func (self *SparseReader) Seek(offset int64, whence int) (int64, error) {
 	return int64(self.offset), nil
 }
 
-func (self SparseReader) Close() error {
+func (self *SparseReader) Close() error {
 	return self.handle.Close()
 }
 
-func (self SparseReader) LStat() (accessors.FileInfo, error) {
+func (self *SparseReader) LStat() (accessors.FileInfo, error) {
 	return &SparseFileInfo{size: self.size}, nil
 }
 
@@ -211,12 +218,6 @@ func GetSparseFile(full_path *accessors.OSPath, scope vfilter.Scope) (
 
 	pathspec := full_path.PathSpec()
 
-	err = vql_subsystem.CheckFilesystemAccess(scope, pathspec.DelegateAccessor)
-	if err != nil {
-		scope.Log("%v: DelegateAccessor denied", err)
-		return nil, err
-	}
-
 	accessor, err := accessors.GetAccessor(pathspec.DelegateAccessor, scope)
 	if err != nil {
 		scope.Log("%v: did you provide a URL or PathSpec?", err)
@@ -232,12 +233,7 @@ func GetSparseFile(full_path *accessors.OSPath, scope vfilter.Scope) (
 
 	// Devices can not be stat'ed
 	size := int64(0)
-	stat, err := accessor.Lstat(pathspec.GetDelegatePath())
-	if err == nil {
-		size = int64(stat.Size())
-	}
-
-	if size == 0 && len(ranges) > 0 {
+	if len(ranges) > 0 {
 		last := ranges[len(ranges)-1]
 		size = last.Offset + last.Length
 	}
@@ -250,16 +246,11 @@ func GetSparseFile(full_path *accessors.OSPath, scope vfilter.Scope) (
 }
 
 func init() {
-	accessors.Register("sparse", zip.NewGzipFileSystemAccessor(
-		accessors.MustNewPathspecOSPath(""), GetSparseFile),
-		`Allow reading another file by overlaying a sparse map on top of it.
-
-The map excludes reading from certain areas which are considered sparse.
-
-The resulting file is sparse (and therefore uploading it excludes the masked out regions). The filename is taken as a list of ranges. For example:
-
-FileName = pathspec(
-      DelegateAccessor="data", DelegatePath=MyData,
-      Path=[dict(Offset=0,Length=5), dict(Offset=10,Length=5)])
-`)
+	accessors.Register(accessors.DescribeAccessor(
+		zip.NewGzipFileSystemAccessor(
+			accessors.MustNewPathspecOSPath(""), GetSparseFile),
+		accessors.AccessorDescriptor{
+			Name:        "sparse",
+			Description: `Allows reading another file by overlaying a sparse map on top of it.`,
+		}))
 }

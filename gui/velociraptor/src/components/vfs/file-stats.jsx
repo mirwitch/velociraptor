@@ -6,22 +6,26 @@ import _ from 'lodash';
 
 import Button from 'react-bootstrap/Button';
 import VeloTimestamp from "../utils/time.jsx";
-import CardDeck from 'react-bootstrap/CardDeck';
+import Row from 'react-bootstrap/Row';
+import Col from 'react-bootstrap/Col';
 import Card from 'react-bootstrap/Card';
 import api from '../core/api-service.jsx';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import utils from './utils.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 import T from '../i8n/i8n.jsx';
-
-const POLL_TIME = 2000;
+import PreviewUpload from '../widgets/preview_uploads.jsx';
+import ToolTip from '../widgets/tooltip.jsx';
+import UserConfig from '../core/user.jsx';
 
 class VeloFileStats extends Component {
+    static contextType = UserConfig;
+
     static propTypes = {
         client: PropTypes.object,
 
         // The node in the tree for the current directory.
         node: PropTypes.object,
+        bumpVersion: PropTypes.func,
 
         // The current file selected in the file-list pane.
         selectedRow: PropTypes.object,
@@ -34,7 +38,7 @@ class VeloFileStats extends Component {
     }
 
     componentDidMount() {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
     }
 
     componentWillUnmount() {
@@ -52,14 +56,13 @@ class VeloFileStats extends Component {
     }
 
     updateFile = () => {
-        if (this.state.updateOperationFlowId) {
-            this.componentWillUnmount();
-        }
-
         let selectedRow = this.props.selectedRow;
-        if (!selectedRow || !selectedRow._FullPath || !selectedRow._Accessor) {
+        if (!selectedRow || !(selectedRow._OSPath || selectedRow._FullPath) || !selectedRow._Accessor) {
             return;
         }
+
+        this.source.cancel("unmounted");
+        this.source = CancelToken.source();
 
         let new_path = [...this.props.node.path];
 
@@ -69,53 +72,25 @@ class VeloFileStats extends Component {
         // Add the filename to the node.
         new_path.push(selectedRow.Name);
 
-        api.post("v1/CollectArtifact", {
-            urgent: true,
+        api.post("v1/VFSDownloadFile", {
             client_id: this.props.client.client_id,
-            artifacts: ["System.VFS.DownloadFile"],
-            specs: [{artifact: "System.VFS.DownloadFile",
-                     parameters: {
-                         env: [{key: "Path", value: selectedRow._FullPath},
-                               {key: "Components", value: JSON.stringify(new_path)},
-                               {key: "Accessor", value: accessor}],
-                     }}],
+            accessor: accessor,
+            components: new_path,
         }, this.source.token).then(response => {
             let flow_id = response.data.flow_id;
             this.setState({updateOperationFlowId: flow_id});
 
-            // Keep polling until the mtime changes.
-            this.source = axios.CancelToken.source();
-            this.interval = setInterval(() => {
-                api.get("v1/GetFlowDetails", {
-                    client_id: this.props.client.client_id,
-                    flow_id: flow_id,
-                }, this.source.token).then((response) => {
-                    if (response.data && response.data.context) {
-                        if (response.data.context.state !== "RUNNING") {
-                            this.source.cancel("unmounted");
-                            clearInterval(this.interval);
-
-                            // Force a tree refresh since this flow is done.
-                            let node = this.props.node;
-                            node.known = false;
-                            node.version = flow_id;
-                            this.props.updateCurrentNode(this.props.node);
-                            this.setState({
-                                updateOperationFlowId: undefined,
-                                current_upload_bytes: undefined});
-                        } else {
-                            let uploaded = response.data.context.total_uploaded_bytes || 0;
-                            this.setState({
-                                current_upload_bytes: uploaded / 1024 / 1024});
-                        }
-                    }
-                });
-            }, POLL_TIME);
+            if(!flow_id) {
+                return;
+            }
+            this.props.bumpVersion();
         });
     }
 
     render() {
         let selectedRow = this.props.selectedRow;
+        let inflight = selectedRow && selectedRow.Download &&
+            selectedRow.Download.in_flight;
 
         if (!selectedRow || !selectedRow.Name) {
             return (
@@ -128,10 +103,13 @@ class VeloFileStats extends Component {
         }
 
         let client_id = this.props.client && this.props.client.client_id;
+        let no_password = !this.context.traits.default_password;
+
         return (
-            <CardDeck>
+            <Row className="file-stats">
+              <Col sm="6">
               <Card>
-                <Card.Header>{selectedRow._FullPath || selectedRow.Name}</Card.Header>
+                <Card.Header>{selectedRow._OSPath || selectedRow._FullPath || selectedRow.Name}</Card.Header>
                 <Card.Body>
                     <dl className="row">
                       <dt className="col-4">{T("Size")}</dt>
@@ -168,18 +146,28 @@ class VeloFileStats extends Component {
                             {T("Last Collected")}
                           </dt>
                           <dd className="col-8">
-                            <VeloTimestamp usec={ selectedRow.Download.mtime / 1000 } />
-                            <Button variant="outline-default"
-                                    data-tooltip={T("Download")}
-                                    data-position="right"
-                                    className="btn-tooltip"
-                                    href={api.href("/api/v1/DownloadVFSFile", {
-                                        client_id: client_id,
-                                        fs_components: selectedRow.Download.components,
-                                        vfs_path: selectedRow.Name,
-                                    }, {arrayFormat: 'brackets'})}>
-                              <FontAwesomeIcon icon="download"/>
-                            </Button>
+                            { !_.isEmpty(selectedRow.Download.components) &&
+                              <ToolTip tooltip={T("Download")}>
+                                <Button variant="default"
+                                        href={api.href("/api/v1/DownloadVFSFile", {
+                                            client_id: client_id,
+                                            fs_components: selectedRow.Download.components,
+                                            vfs_path: selectedRow.Name,
+                                            zip: !no_password,
+                                        })}>
+                                  { !no_password &&
+                                    <div className="velo-icon">
+                                      <FontAwesomeIcon icon="lock" />
+                                    </div>}
+                                  <div className="velo-icon">
+                                    <FontAwesomeIcon icon="download"/>
+                                  </div>
+                                  <VeloTimestamp usec={
+                                      selectedRow.Download.mtime / 1000
+                                  } />
+                                </Button>
+                              </ToolTip>
+                            }
                           </dd>
                         </>
                       }
@@ -188,34 +176,24 @@ class VeloFileStats extends Component {
                         <>
                           <dt className="col-4">{T("Fetch from Client")}</dt>
                           <dd className="col-8">
-                        { this.state.updateOperationFlowId ?
-                          <Button data-tooltip={T("Currently refreshing from the client")}
-                                  data-position="right"
-                                  className="btn-tooltip"
-                                  onClick={this.cancelDownload}
-                                  variant="default">
-                            <FontAwesomeIcon icon="sync" spin/>
-                            <span className="button-label">{T("Downloaded")} {(
-                                this.state.current_upload_bytes || 0) + " Mbytes"}
-                            </span>
-                            <span className="button-label"><FontAwesomeIcon icon="stop"/></span>
-                          </Button> :
-                          <Button variant="default"
-                                  onClick={this.updateFile}>
-                            <FontAwesomeIcon icon="sync" />
-                            <span className="button-label">
-                              {selectedRow.Download &&
-                               !_.isEmpty(selectedRow.Download.components) ?
-                               T('Re-Collect from the client') :
-                               T('Collect from the client')}
-                            </span>
-                          </Button> }
+                            <Button variant="default"
+                                    onClick={this.updateFile}>
+                              <FontAwesomeIcon icon="sync" />
+                              <span className="button-label">
+                                {selectedRow.Download &&
+                                 !_.isEmpty(selectedRow.Download.components) ?
+                                 T('Re-Collect from the client') :
+                                 T('Collect from the client')}
+                              </span>
+                            </Button>
                           </dd>
                         </> }
                     </dl>
                 </Card.Body>
-              </Card>
-              <Card>
+            </Card>
+              </Col>
+            <Col sm="6">
+            <Card>
                 <Card.Header>{T("Properties")}</Card.Header>
                 <Card.Body>
                   { _.map(selectedRow._Data, function(v, k) {
@@ -238,9 +216,28 @@ class VeloFileStats extends Component {
                       <dt className="col-4">MD5</dt>
                       <dd className="col-8">{selectedRow.Download.MD5}</dd>
                     </div>}
+                  { selectedRow.Download && selectedRow.Download.error &&
+                    <div className="row">
+                      <dt className="col-4">{T("Download Error")}</dt>
+                      <dd className="col-8">{selectedRow.Download.error}</dd>
+                    </div>}
+                  { !inflight && !_.isEmpty(selectedRow.Download.components) &&
+                    <div className="row">
+                      <dt className="col-4">{T("Preview")}</dt>
+                      <dd className="col-8">
+                        <PreviewUpload
+                          env={{client_id: this.props.client.client_id,
+                                vfs_components: selectedRow.Download.components}}
+                          upload={{Components: selectedRow.Download.components,
+                                   Path: selectedRow._OSPath || selectedRow._FullPath,
+                                   Accessor: this.props.node.path[0],
+                                   Size: selectedRow.Size}} />
+                      </dd>
+                    </div>}
                 </Card.Body>
-              </Card>
-            </CardDeck>
+            </Card>
+            </Col>
+            </Row>
         );
     };
 }

@@ -5,7 +5,9 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/readers"
 	vfilter "www.velocidex.com/golang/vfilter"
@@ -26,25 +28,23 @@ type ParseBinaryFunction struct{}
 
 func (self ParseBinaryFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "parse_binary",
-		Doc:     "Parse a binary file into a datastructure using a profile.",
-		ArgType: type_map.AddType(scope, &ParseBinaryFunctionArg{}),
+		Name:     "parse_binary",
+		Doc:      "Parse a binary file into a datastructure using a profile.",
+		ArgType:  type_map.AddType(scope, &ParseBinaryFunctionArg{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
 func (self ParseBinaryFunction) Call(
 	ctx context.Context, scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "parse_binary", args)()
+
 	arg := &ParseBinaryFunctionArg{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
 		scope.Log("parse_binary: %v", err)
-		return &vfilter.Null{}
-	}
-
-	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-	if err != nil {
-		scope.Log("parse_binary: %s", err)
 		return &vfilter.Null{}
 	}
 
@@ -64,7 +64,7 @@ func (self ParseBinaryFunction) Call(
 	}
 
 	lru_size := vql_subsystem.GetIntFromRow(scope, scope, constants.BINARY_CACHE_SIZE)
-	paged_reader, err := readers.NewPagedReader(
+	paged_reader, err := readers.NewAccessorReader(
 		scope, arg.Accessor, arg.Filename, int(lru_size))
 	if err != nil {
 		scope.Log("parse_binary: %v", err)
@@ -81,8 +81,8 @@ func (self ParseBinaryFunction) Call(
 }
 
 func init() {
-	vql_subsystem.RegisterProtocol(&vtypes.StructAssociative{})
-	vql_subsystem.RegisterProtocol(&vtypes.ArrayAssociative{})
-	vql_subsystem.RegisterProtocol(&vtypes.ArrayIterator{})
+	for _, p := range vtypes.GetProtocols() {
+		vql_subsystem.RegisterProtocol(p)
+	}
 	vql_subsystem.RegisterFunction(&ParseBinaryFunction{})
 }

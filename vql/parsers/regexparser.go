@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package parsers
 
@@ -24,7 +24,9 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -49,12 +51,6 @@ func _ParseFile(
 	arg *_ParseFileWithRegexArgs,
 	output_chan chan vfilter.Row) {
 
-	err := vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-	if err != nil {
-		scope.Log("parse_records_with_regex: %s", err)
-		return
-	}
-
 	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		scope.Log("error: %v", err)
@@ -72,48 +68,66 @@ func _ParseFile(
 		arg.BufferSize = 64 * 1024
 	}
 
+	offset := 0
 	buffer := make([]byte, arg.BufferSize)
 
+next:
 	for {
-		n, _ := file.Read(buffer)
-		if n == 0 {
+		n, _ := file.Read(buffer[offset:])
+		if n == 0 && offset == 0 {
 			return
 		}
 
+		end := n + offset
+
 		for _, r := range arg.compiled_regexs {
-			match := r.FindAllSubmatch(buffer[:n], -1)
-			if match != nil {
-				names := r.SubexpNames()
-				for _, hit := range match {
-					row := ordereddict.NewDict().Set(
-						"FullPath", filename)
-					for _, name := range arg.capture_vars {
-						if name != "" {
-							row.Set(name, "")
-						}
-					}
-					for idx, submatch := range hit {
-						if idx == 0 {
-							continue
-						}
+			hits := r.FindSubmatchIndex(buffer[:end])
 
-						key := fmt.Sprintf("g%d", idx)
-						if names[idx] != "" {
-							key = names[idx]
-						}
+			// No matches in this buffer, try the next regex
+			if len(hits) < 2 {
+				continue
+			}
 
-						row.Set(key, string(submatch))
-					}
-					select {
-					case <-ctx.Done():
-						return
-
-					case output_chan <- row:
-					}
+			names := r.SubexpNames()
+			row := ordereddict.NewDict().Set("FullPath", filename)
+			for _, name := range arg.capture_vars {
+				if name != "" {
+					row.Set(name, "")
 				}
+			}
+
+			// Get all capture variables
+			if len(hits) >= 2 && len(hits)%2 == 0 {
+				for i := 2; i < len(hits); i += 2 {
+					start := hits[i]
+					end := hits[i+1]
+					if start < 0 || end < 0 {
+						continue
+					}
+
+					idx := i / 2
+					key := fmt.Sprintf("g%d", idx)
+					if names[idx] != "" {
+						key = names[idx]
+					}
+					row.Set(key, string(buffer[start:end]))
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+
+			case output_chan <- row:
+				// Slide the buffer for the next match
+				offset = slideBuffer(buffer, hits[1], end)
+				continue next
 			}
 		}
 
+		// If we get here none of the regex matched the buffer, wipe
+		// the buffer and start again
+		offset = 0
 	}
 
 }
@@ -123,6 +137,9 @@ func (self _ParseFileWithRegex) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) <-chan vfilter.Row {
 	output_chan := make(chan vfilter.Row)
+
+	defer vql_subsystem.RegisterMonitor(ctx, "parse_records_with_regex", args)()
+
 	arg := &_ParseFileWithRegexArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -152,6 +169,7 @@ func (self _ParseFileWithRegex) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "parse_records_with_regex", args)()
 
 		for _, filename := range arg.Filenames {
 			_ParseFile(ctx, filename, scope, arg, output_chan)
@@ -163,9 +181,10 @@ func (self _ParseFileWithRegex) Call(
 
 func (self _ParseFileWithRegex) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "parse_records_with_regex",
-		Doc:     "Parses a file with a set of regexp and yields matches as records.",
-		ArgType: type_map.AddType(scope, &_ParseFileWithRegexArgs{}),
+		Name:     "parse_records_with_regex",
+		Doc:      "Parses a file with a set of regexp and yields matches as records.",
+		ArgType:  type_map.AddType(scope, &_ParseFileWithRegexArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -179,6 +198,9 @@ type _ParseStringWithRegexFunction struct{}
 func (self *_ParseStringWithRegexFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) (result vfilter.Any) {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "parse_string_with_regex", args)()
+
 	arg := &_ParseStringWithRegexFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -250,6 +272,9 @@ func (self _RegexReplace) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "regex_replace", args)()
+
 	arg := &_RegexReplaceArg{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -317,6 +342,9 @@ func (self _RegexMap) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "regex_transform", args)()
+
 	arg := &_RegexMapArg{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -334,8 +362,9 @@ func (self _RegexMap) Call(
 	regex_map := vql_subsystem.CacheGet(scope, key)
 	if utils.IsNil(regex_map) {
 		// Make a new set of transforms
-		for _, search := range arg.Map.Keys() {
-			replace, _ := arg.Map.GetString(search)
+		for _, i := range arg.Map.Items() {
+			search := i.Key
+			replace := utils.ToString(i.Value)
 
 			re, err := regexp.Compile("(?i)" + search)
 			if err != nil {

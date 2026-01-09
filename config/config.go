@@ -1,31 +1,30 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package config
 
 import (
-	"io/ioutil"
-	"os"
 	"runtime"
 
-	"github.com/Velocidex/yaml/v2"
-	"github.com/go-errors/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	constants "www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 // Embed build time constants into here for reporting client version.
@@ -34,34 +33,23 @@ var (
 	build_time  string
 	commit_hash string
 	ci_run_url  string
+
+	versionCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "velociraptor_build",
+		Help: "Current version of running binary.",
+	}, []string{"commit_hash", "build_time"})
 )
-
-// Return the location of the writeback file.
-func WritebackLocation(self *config_proto.ClientConfig) (string, error) {
-	if self == nil {
-		return "", errors.New("Client not configured")
-	}
-
-	switch runtime.GOOS {
-	case "darwin":
-		return os.ExpandEnv(self.WritebackDarwin), nil
-	case "linux":
-		return os.ExpandEnv(self.WritebackLinux), nil
-	case "windows":
-		return os.ExpandEnv(self.WritebackWindows), nil
-	default:
-		return os.ExpandEnv(self.WritebackLinux), nil
-	}
-}
 
 func GetVersion() *config_proto.Version {
 	return &config_proto.Version{
-		Name:       "velociraptor",
-		Version:    constants.VERSION,
-		BuildTime:  build_time,
-		Commit:     commit_hash,
-		CiBuildUrl: ci_run_url,
-		Compiler:   runtime.Version(),
+		Name:         "velociraptor",
+		Version:      constants.VERSION,
+		BuildTime:    build_time,
+		Commit:       commit_hash,
+		CiBuildUrl:   ci_run_url,
+		Compiler:     runtime.Version(),
+		System:       runtime.GOOS,
+		Architecture: utils.GetArch(),
 	}
 }
 
@@ -73,11 +61,12 @@ func GetDefaultConfig() *config_proto.Config {
 			WritebackLinux:  "/etc/velociraptor.writeback.yaml",
 			WritebackWindows: "$ProgramFiles\\Velociraptor\\" +
 				"velociraptor.writeback.yaml",
-			TempdirWindows: "$ProgramFiles\\Velociraptor\\Tools",
-			MaxPoll:        60,
+			Level2WritebackSuffix: ".bak",
+			TempdirWindows:        "$ProgramFiles\\Velociraptor\\Tools",
+			MaxPoll:               60,
 
 			// By default restart the client if we are unable to
-			// contant the server within this long. (NOTE - even a
+			// contact the server within this long. (NOTE - even a
 			// failed connection will reset the counter, the nanny
 			// will only fire if the client has failed in some way -
 			// e.g. the communicator is stopped for some reason).
@@ -106,29 +95,24 @@ func GetDefaultConfig() *config_proto.Config {
 
 			DarwinInstaller: &config_proto.DarwinInstallerConfig{
 				ServiceName: "com.velocidex.velociraptor",
-				InstallPath: "/usr/local/sbin/velociraptor",
+				InstallPath: "/usr/local/bin/velociraptor",
 			},
 
-			// If set to true this will stop
-			// arbitrary code execution on the
-			// client.
-			PreventExecve:    false,
-			MaxUploadSize:    constants.MAX_MEMORY,
-			PinnedServerName: "VelociraptorServer",
+			MaxUploadSize: constants.MAX_POST_SIZE,
 		},
 		API: &config_proto.APIConfig{
 			// Bind port for gRPC endpoint - this should not
 			// normally be exposed.
-			BindAddress:  "127.0.0.1",
-			BindPort:     8001,
-			BindScheme:   "tcp",
-			PinnedGwName: "GRPC_GW",
+			BindAddress: "127.0.0.1",
+			BindPort:    8001,
+			BindScheme:  "tcp",
 		},
 		GUI: &config_proto.GUIConfig{
 			// Bind port for GUI. If you expose this on a
 			// reachable IP address you must enable TLS!
 			BindAddress:  "127.0.0.1",
 			BindPort:     8889,
+			PublicUrl:    "https://localhost:8889/app/index.html",
 			ReverseProxy: []*config_proto.ReverseProxyConfig{},
 			Authenticator: &config_proto.Authenticator{
 				Type: "Basic",
@@ -167,7 +151,6 @@ func GetDefaultConfig() *config_proto.Config {
 			GRPCPoolMaxSize: 100,
 			GRPCPoolMaxWait: 60,
 		},
-		Services: &config_proto.ServerServicesConfig{},
 		Datastore: &config_proto.DatastoreConfig{
 			Implementation: "FileBaseDataStore",
 
@@ -175,6 +158,10 @@ func GetDefaultConfig() *config_proto.Config {
 			// this to something more permanent.
 			Location:           "/var/tmp/velociraptor/",
 			FilestoreDirectory: "/var/tmp/velociraptor/",
+
+			// This is the default but we add it here for clarity. Set
+			// to none to disable.
+			Compression: "zlib",
 		},
 		Logging: &config_proto.LoggingConfig{
 			// Disable debug logging by default.
@@ -200,12 +187,19 @@ func GetDefaultConfig() *config_proto.Config {
 			HuntExpiryHours:        24 * 7,
 			NotebookCellTimeoutMin: 10,
 		},
+		Security: &config_proto.Security{},
 	}
 
 	// The client's version needs to keep in sync with the
 	// server's version.
-	result.Client.Version = GetVersion()
-	result.Version = result.Client.Version
+	result.Version = GetVersion()
+
+	// Only record some info about the server version.
+	result.Client.ServerVersion = &config_proto.Version{
+		Version:   result.Version.Version,
+		BuildTime: result.Version.BuildTime,
+		Commit:    result.Version.Commit,
+	}
 
 	// On windows we need slightly different defaults.
 	if runtime.GOOS == "windows" {
@@ -216,16 +210,9 @@ func GetDefaultConfig() *config_proto.Config {
 	return result
 }
 
-func WriteConfigToFile(filename string, config *config_proto.Config) error {
-	bytes, err := yaml.Marshal(config)
-	if err != nil {
-		return err
-	}
-	// Make sure the new file is only readable by root.
-	err = ioutil.WriteFile(filename, bytes, 0600)
-	if err != nil {
-		return errors.Wrap(err, 0)
-	}
-
-	return nil
+func init() {
+	// Tag the metrics with a build time. This is useful in a cluster
+	// to see if all nodes are upgraded.
+	versionCounter.With(prometheus.Labels{
+		"commit_hash": commit_hash, "build_time": build_time}).Inc()
 }

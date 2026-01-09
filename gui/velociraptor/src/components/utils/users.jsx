@@ -5,7 +5,7 @@ import React from 'react';
 import PropTypes from 'prop-types';
 
 import api from '../core/api-service.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 import Select from 'react-select';
 import T from '../i8n/i8n.jsx';
 
@@ -16,10 +16,11 @@ export default class UserForm extends React.Component {
     static propTypes = {
         value: PropTypes.array,
         onChange: PropTypes.func,
+        includeSuperuser: PropTypes.bool,
     };
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.loadUsers();
     }
 
@@ -40,14 +41,23 @@ export default class UserForm extends React.Component {
 
     loadUsers = () => {
         api.get("v1/GetUsers", {}, this.source.token).then((response) => {
+            if (response.cancel || _.isEmpty(response.data)) return;
+
+            let users = response.data.users || [];
+            if (this.props.includeSuperuser) {
+                users.push({name: "VelociraptorServer",
+                            desc: T(" (Server Event Runner)")});
+            }
+
             let names = [];
-            for(var i = 0; i<response.data.users.length; i++) {
-                var name = response.data.users[i].name;
+            for(var i = 0; i<users.length; i++) {
+                let name = users[i].name;
+                let desc = users[i].desc || "";
 
                 // Only add other users than the currently logged in
                 // user.
                 if (name !== username) {
-                    names.push({value: name, label: name});
+                    names.push({value: name, label: name + desc});
                 };
             }
             this.setState({options: names, initialized: true});

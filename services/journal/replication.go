@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io/ioutil"
 	"os"
 	"sync"
 	"time"
@@ -27,6 +26,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
+	utils_tempfile "www.velocidex.com/golang/velociraptor/utils/tempfile"
 )
 
 var (
@@ -75,8 +76,7 @@ type ReplicationService struct {
 	ctx        context.Context
 
 	// Locally connected watchers.
-	qm    api.QueueManager
-	Clock utils.Clock
+	qm api.QueueManager
 
 	sender chan *api_proto.PushEventRequest
 
@@ -115,10 +115,6 @@ func (self *ReplicationService) isEventRegistered(artifact string) bool {
 	return pres && ok
 }
 
-func (self *ReplicationService) SetClock(clock utils.Clock) {
-	self.qm.SetClock(clock)
-}
-
 func (self *ReplicationService) pumpEventFromBufferFile() error {
 	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 	frontend_manager, err := services.GetFrontendManager(self.config_obj)
@@ -135,7 +131,7 @@ func (self *ReplicationService) pumpEventFromBufferFile() error {
 			case <-self.ctx.Done():
 				return nil
 
-			case <-time.After(self.RetryDuration()):
+			case <-time.After(utils.Jitter(self.RetryDuration())):
 				continue
 			}
 		}
@@ -154,7 +150,10 @@ func (self *ReplicationService) pumpEventFromBufferFile() error {
 
 			_, err = api_client.PushEvents(self.ctx, event)
 			if err == nil {
-				closer()
+				err := closer()
+				if err != nil {
+					return err
+				}
 				break
 			}
 
@@ -162,15 +161,21 @@ func (self *ReplicationService) pumpEventFromBufferFile() error {
 			// try again later.
 			select {
 			case <-self.ctx.Done():
-				closer()
+				err := closer()
+				if err != nil {
+					return err
+				}
 				return nil
 
-			case <-time.After(self.RetryDuration()):
+			case <-time.After(utils.Jitter(self.RetryDuration())):
+				err := closer()
+				if err != nil {
+					logger.Error("<red>ReplicationService</> %v", err)
+				}
 			}
-			closer()
+
 		}
 	}
-	return nil
 }
 
 // Periodically flush the batches built up during
@@ -189,7 +194,7 @@ func (self *ReplicationService) startAsyncLoop(
 			case <-ctx.Done():
 				return
 
-			case <-time.After(200 * time.Millisecond):
+			case <-time.After(utils.Jitter(200 * time.Millisecond)):
 				// Work on the batch without a lock
 				self.mu.Lock()
 				todo := self.batch
@@ -199,7 +204,7 @@ func (self *ReplicationService) startAsyncLoop(
 				for k, v := range todo {
 					// Ignore errors since there is no way to report
 					// to the caller.
-					self.PushJsonlToArtifact(
+					_ = self.PushJsonlToArtifact(ctx,
 						config_obj, v.Bytes(), v.row_count, k,
 						"server", "")
 				}
@@ -228,17 +233,25 @@ func (self *ReplicationService) Start(
 	self.sender = make(chan *api_proto.PushEventRequest)
 	self.SetRetryDuration(5 * time.Second)
 
-	self.tmpfile, err = ioutil.TempFile("", "replication")
+	self.tmpfile, err = tempfile.TempFile("replication")
 	if err != nil {
 		return err
 	}
+	utils_tempfile.AddTmpFile(self.tmpfile.Name())
 
 	self.Buffer, err = NewBufferFile(self.config_obj, self.tmpfile)
 	if err != nil {
 		return err
 	}
 
-	go self.pumpEventFromBufferFile()
+	go func() {
+		err := self.pumpEventFromBufferFile()
+		if err != nil {
+			logger := logging.GetLogger(
+				self.config_obj, &logging.FrontendComponent)
+			logger.Error("<red>pumpEventFromBufferFile</>: %v", err)
+		}
+	}()
 
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
@@ -278,15 +291,8 @@ func (self *ReplicationService) Start(
 						// to the buffer file instead
 						// for later delivery.
 						_ = self.Buffer.Enqueue(request)
-
-						logger := logging.GetLogger(self.config_obj,
-							&logging.FrontendComponent)
-						logger.Error(
-							"<red>ReplicationService %v</> Error %v - will queue for later",
-							services.GetOrgName(self.config_obj), err)
-
 					}
-					closer()
+					_ = closer()
 				}
 			}
 		}()
@@ -396,7 +402,8 @@ func (self *ReplicationService) AppendJsonlToResultSet(
 func (self *ReplicationService) AppendToResultSet(
 	config_obj *config_proto.Config,
 	path api.FSPathSpec,
-	rows []*ordereddict.Dict) error {
+	rows []*ordereddict.Dict,
+	options services.JournalOptions) error {
 
 	// Key a lock to manage access to this file.
 	self.mu.Lock()
@@ -414,9 +421,14 @@ func (self *ReplicationService) AppendToResultSet(
 
 	file_store_factory := file_store.GetFileStore(config_obj)
 
+	sync := utils.BackgroundWriter
+	if options.Sync {
+		sync = utils.SyncCompleter
+	}
+
 	rs_writer, err := result_sets.NewResultSetWriter(file_store_factory,
 		path, json.DefaultEncOpts(),
-		utils.BackgroundWriter, result_sets.AppendMode)
+		sync, result_sets.AppendMode)
 	if err != nil {
 		return err
 	}
@@ -431,15 +443,15 @@ func (self *ReplicationService) AppendToResultSet(
 }
 
 func (self *ReplicationService) Broadcast(
-	config_obj *config_proto.Config, rows []*ordereddict.Dict,
-	artifact, client_id, flows_id string) error {
+	ctx context.Context, config_obj *config_proto.Config,
+	rows []*ordereddict.Dict, artifact, client_id, flows_id string) error {
 
 	return notInitializedError
 }
 
 func (self *ReplicationService) PushRowsToArtifactAsync(
-	config_obj *config_proto.Config, row *ordereddict.Dict,
-	artifact string) {
+	ctx context.Context, config_obj *config_proto.Config,
+	row *ordereddict.Dict, artifact string) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
@@ -457,15 +469,14 @@ func (self *ReplicationService) PushRowsToArtifactAsync(
 }
 
 func (self *ReplicationService) pushRowsToLocalQueueManager(
-	config_obj *config_proto.Config, rows []*ordereddict.Dict,
-	artifact, client_id, flows_id string) error {
+	ctx context.Context, config_obj *config_proto.Config,
+	rows []*ordereddict.Dict, artifact, client_id, flows_id string) error {
 
-	path_manager, err := artifacts.NewArtifactPathManager(
+	path_manager, err := artifacts.NewArtifactPathManager(ctx,
 		config_obj, client_id, flows_id, artifact)
 	if err != nil {
 		return err
 	}
-	path_manager.Clock = self.Clock
 
 	// Just a regular artifact, append to the existing result set.
 	if !path_manager.IsEvent() {
@@ -473,7 +484,8 @@ func (self *ReplicationService) pushRowsToLocalQueueManager(
 		if err != nil {
 			return err
 		}
-		return self.AppendToResultSet(config_obj, path, rows)
+		return self.AppendToResultSet(config_obj, path, rows,
+			services.JournalOptions{})
 	}
 
 	// The Queue manager will manage writing event artifacts to a
@@ -485,15 +497,14 @@ func (self *ReplicationService) pushRowsToLocalQueueManager(
 }
 
 func (self *ReplicationService) pushJsonlToLocalQueueManager(
-	config_obj *config_proto.Config, jsonl []byte, row_count int,
-	artifact, client_id, flows_id string) error {
+	ctx context.Context, config_obj *config_proto.Config,
+	jsonl []byte, row_count int, artifact, client_id, flows_id string) error {
 
-	path_manager, err := artifacts.NewArtifactPathManager(
+	path_manager, err := artifacts.NewArtifactPathManager(ctx,
 		config_obj, client_id, flows_id, artifact)
 	if err != nil {
 		return err
 	}
-	path_manager.Clock = self.Clock
 
 	// Just a regular artifact, append to the existing result set.
 	if !path_manager.IsEvent() {
@@ -513,10 +524,11 @@ func (self *ReplicationService) pushJsonlToLocalQueueManager(
 }
 
 func (self *ReplicationService) PushJsonlToArtifact(
-	config_obj *config_proto.Config, jsonl []byte, row_count int,
+	ctx context.Context, config_obj *config_proto.Config,
+	jsonl []byte, row_count int,
 	artifact, client_id, flow_id string) error {
 
-	err := self.pushJsonlToLocalQueueManager(
+	err := self.pushJsonlToLocalQueueManager(ctx,
 		config_obj, jsonl, row_count, artifact,
 		client_id, flow_id)
 	if err != nil {
@@ -555,7 +567,7 @@ func (self *ReplicationService) PushJsonlToArtifact(
 }
 
 func (self *ReplicationService) PushRowsToArtifact(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	rows []*ordereddict.Dict, artifact, client_id, flow_id string) error {
 
 	serialized, err := json.MarshalJsonl(rows)
@@ -564,7 +576,7 @@ func (self *ReplicationService) PushRowsToArtifact(
 	}
 	replicationItemSize.Observe(float64(len(serialized)))
 
-	err = self.pushRowsToLocalQueueManager(
+	err = self.pushRowsToLocalQueueManager(ctx,
 		config_obj, rows, artifact, client_id, flow_id)
 	if err != nil {
 		return err
@@ -611,17 +623,35 @@ func (self *ReplicationService) Watch(
 
 	go func() {
 		for {
+			in_chan := self.watchOnce(subctx, queue, watcher_name)
+
+		retry:
+			for {
+				select {
+				case event, ok := <-in_chan:
+					if !ok {
+						break retry
+					}
+					output_chan <- event
+				}
+			}
+
 			// Keep retrying to reconnect in case the
 			// connection dropped.
-			for event := range self.watchOnce(
-				subctx, queue, watcher_name) {
-				output_chan <- event
-			}
+			last_try := utils.GetTime().Now()
 
 			select {
 			case <-self.ctx.Done():
 				return
-			case <-time.After(self.RetryDuration()):
+
+			case <-time.After(utils.Jitter(self.RetryDuration())):
+
+				// Avoid retrying too quickly. This is mainly for
+				// tests where the time is mocked for the After(delay)
+				// above does not work.
+				if utils.GetTime().Now().Sub(last_try) < time.Minute {
+					utils.SleepWithCtx(ctx, time.Minute)
+				}
 			}
 
 			logger := logging.GetLogger(self.config_obj,
@@ -654,6 +684,7 @@ func (self *ReplicationService) watchOnce(
 		logger.Error("<red>ReplicationService %v</> Unable to connect %v",
 			services.GetOrgName(self.config_obj), err)
 		close(output_chan)
+		cancel()
 		return output_chan
 	}
 
@@ -662,6 +693,7 @@ func (self *ReplicationService) watchOnce(
 		logger.Error("<red>ReplicationService %v</> Unable to connect %v",
 			services.GetOrgName(self.config_obj), err)
 		close(output_chan)
+		cancel()
 		return output_chan
 	}
 
@@ -673,14 +705,17 @@ func (self *ReplicationService) watchOnce(
 	})
 	if err != nil {
 		close(output_chan)
-		closer()
+		_ = closer()
+		cancel()
 		return output_chan
 	}
 
 	go func() {
-		defer closer()
-		defer close(output_chan)
-		defer cancel()
+		defer func() {
+			cancel()
+			close(output_chan)
+			_ = closer()
+		}()
 
 		for {
 			event, err := stream.Recv()
@@ -711,7 +746,8 @@ func (self *ReplicationService) watchOnce(
 
 func (self *ReplicationService) Close() {
 	self.Buffer.Close()
-	os.Remove(self.tmpfile.Name()) // clean up file buffer
+	err := os.Remove(self.tmpfile.Name()) // clean up file buffer
+	utils_tempfile.RemoveTmpFile(self.tmpfile.Name(), err)
 }
 
 func NewReplicationService(
@@ -725,7 +761,6 @@ func NewReplicationService(
 		locks:               make(map[string]*sync.Mutex),
 		masterRegistrations: make(map[string]bool),
 		batch:               make(map[string]*jsonBatch),
-		Clock:               utils.RealClock{},
 	}
 
 	qm, err := file_store.GetQueueManager(config_obj)

@@ -28,6 +28,7 @@ package directory
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/Velocidex/ordereddict"
@@ -36,7 +37,10 @@ import (
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/result_sets"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/debug"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/vfilter"
 )
 
 // A Queue manages a set of registrations at a specific queue name
@@ -47,6 +51,21 @@ type QueuePool struct {
 	config_obj *config_proto.Config
 
 	registrations map[string][]*Listener
+}
+
+func (self *QueuePool) Stats() *ordereddict.Dict {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	res := ordereddict.NewDict()
+	for k, listeners := range self.registrations {
+		var stats []*ordereddict.Dict
+		for _, l := range listeners {
+			stats = append(stats, l.Stats())
+		}
+		res.Set(k, stats)
+	}
+	return res
 }
 
 func (self *QueuePool) GetWatchers() []string {
@@ -64,6 +83,7 @@ func (self *QueuePool) GetWatchers() []string {
 func (self *QueuePool) Register(
 	ctx context.Context, vfs_path string,
 	options api.QueueOptions) (<-chan *ordereddict.Dict, func()) {
+
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
@@ -74,7 +94,6 @@ func (self *QueuePool) Register(
 	if err != nil {
 		logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 		logger.Warn("Failed to register QueuePool for %s: %v", vfs_path, err)
-
 		cancel()
 		output_chan := make(chan *ordereddict.Dict)
 		close(output_chan)
@@ -186,11 +205,6 @@ type DirectoryQueueManager struct {
 	queue_pool *QueuePool
 	FileStore  api.FileStore
 	config_obj *config_proto.Config
-	Clock      utils.Clock
-}
-
-func (self *DirectoryQueueManager) SetClock(clock utils.Clock) {
-	self.Clock = clock
 }
 
 func (self *DirectoryQueueManager) Debug() *ordereddict.Dict {
@@ -202,7 +216,7 @@ func (self *DirectoryQueueManager) Broadcast(
 	path_manager api.PathManager, dict_rows []*ordereddict.Dict) {
 	for _, row := range dict_rows {
 		// Set a timestamp per event for easier querying.
-		row.Set("_ts", int(self.Clock.Now().Unix()))
+		row.Set("_ts", int(utils.GetTime().Now().Unix()))
 		self.queue_pool.Broadcast(path_manager.GetQueueName(), row)
 	}
 }
@@ -212,7 +226,8 @@ func (self *DirectoryQueueManager) PushEventRows(
 
 	// Writes are asyncronous.
 	rs_writer, err := result_sets.NewTimedResultSetWriter(
-		self.FileStore, path_manager, nil, nil)
+		self.config_obj, path_manager, json.DefaultEncOpts(),
+		utils.BackgroundWriter)
 	if err != nil {
 		return err
 	}
@@ -220,7 +235,7 @@ func (self *DirectoryQueueManager) PushEventRows(
 
 	for _, row := range dict_rows {
 		// Set a timestamp per event for easier querying.
-		row.Set("_ts", int(self.Clock.Now().Unix()))
+		row.Set("_ts", int(utils.GetTime().Now().Unix()))
 		rs_writer.Write(row)
 		self.queue_pool.Broadcast(path_manager.GetQueueName(), row)
 	}
@@ -232,14 +247,15 @@ func (self *DirectoryQueueManager) PushEventJsonl(
 
 	// Writes are asyncronous.
 	rs_writer, err := result_sets.NewTimedResultSetWriter(
-		self.FileStore, path_manager, json.DefaultEncOpts(),
+		self.config_obj, path_manager, json.DefaultEncOpts(),
 		utils.BackgroundWriter)
 	if err != nil {
 		return err
 	}
 	defer rs_writer.Close()
 
-	jsonl = json.AppendJsonlItem(jsonl, "_ts", int(self.Clock.Now().Unix()))
+	jsonl = json.AppendJsonlItem(jsonl, "_ts",
+		int(utils.GetTime().Now().Unix()))
 	rs_writer.WriteJSONL(jsonl, row_count)
 	self.queue_pool.BroadcastJsonl(path_manager.GetQueueName(), jsonl)
 
@@ -273,10 +289,35 @@ func (self *DirectoryQueueManager) Watch(
 
 func NewDirectoryQueueManager(config_obj *config_proto.Config,
 	file_store api.FileStore) api.QueueManager {
-	return &DirectoryQueueManager{
+
+	result := &DirectoryQueueManager{
 		FileStore:  file_store,
 		config_obj: config_obj,
 		queue_pool: NewQueuePool(config_obj),
-		Clock:      utils.RealClock{},
 	}
+
+	debug.RegisterProfileWriter(debug.ProfileWriterInfo{
+		Name:        "QueueManager " + services.GetOrgName(config_obj),
+		Categories:  []string{"Org", services.GetOrgName(config_obj), "Services"},
+		Description: "Report the current states of server artifact event queues.",
+		ProfileWriter: func(ctx context.Context,
+			scope vfilter.Scope, output_chan chan vfilter.Row) {
+
+			d := result.Debug()
+			items := d.Items()
+			sort.Slice(items, func(i, j int) bool {
+				return items[i].Key < items[j].Key
+			})
+
+			for _, i := range items {
+				output_chan <- ordereddict.NewDict().
+					Set("Type", "QueueManager").
+					Set("Org", services.GetOrgName(config_obj)).
+					Set("Name", i.Key).
+					Set("Listener", i.Value)
+			}
+		},
+	})
+
+	return result
 }

@@ -2,7 +2,6 @@ package common
 
 import (
 	"context"
-	"sort"
 	"sync"
 
 	"github.com/Velocidex/ordereddict"
@@ -22,7 +21,8 @@ func (self _ChainPlugin) Info(scope types.Scope, type_map *types.TypeMap) *types
 		Name: "chain",
 		Doc: "Chain the output of several queries into the same result set." +
 			"This plugin takes any args and chains them.",
-		ArgType: type_map.AddType(scope, &_ChainPluginArgs{}),
+		ArgType:      type_map.AddType(scope, &_ChainPluginArgs{}),
+		FreeFormArgs: true,
 	}
 }
 
@@ -33,11 +33,13 @@ func (self _ChainPlugin) Call(
 	output_chan := make(chan types.Row)
 
 	queries := []types.StoredQuery{}
+
+	// Retain the order of clauses according to their definition order
 	members := scope.GetMembers(args)
-	sort.Strings(members)
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "chain", args)()
 
 		var async bool
 

@@ -9,17 +9,28 @@ import Timeline, {
 } from 'react-calendar-timeline';
 import moment from 'moment';
 import 'moment-timezone';
-import axios from 'axios';
-import { PrepareData } from '../core/table.jsx';
+import {CancelToken} from 'axios';
 import api from '../core/api-service.jsx';
-import BootstrapTable from 'react-bootstrap-table-next';
 import VeloValueRenderer from '../utils/value.jsx';
 import Dropdown from 'react-bootstrap/Dropdown';
 import T from '../i8n/i8n.jsx';
+import ToolTip from '../widgets/tooltip.jsx';
+import Table from 'react-bootstrap/Table';
 
 import DeleteTimelineRanges from './delete.jsx';
 import Button from 'react-bootstrap/Button';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import UserConfig from '../core/user.jsx';
+import ColumnResizer from "../core/column-resizer.jsx";
+import ButtonGroup from 'react-bootstrap/ButtonGroup';
+
+import { ColumnToggle } from '../core/paged-table.jsx';
+
+import {
+    getFormatter,
+    PrepareData,
+} from '../core/table.jsx';
+
 
 // We want to work in UTC everywhere
 moment.tz.setDefault("Etc/UTC");
@@ -39,41 +50,276 @@ const normalizeTimestamp = (value) => {
     return value;
 };
 
+
 class EventTableRenderer  extends Component {
     static propTypes = {
         renderers: PropTypes.object,
         columns: PropTypes.array,
         rows: PropTypes.array,
+        toggles: PropTypes.object,
+        env: PropTypes.object,
+        name: PropTypes.string,
     }
 
     state = {
         download: false,
-        toggles: undefined,
+        column_widths: {},
+        compact_columns: {},
+        columns: [],
+        original_cols: [],
     }
 
     componentDidUpdate(prevProps, prevState, snapshot) {
-        // FIXME: For now we always hide _ columns. We need to expose
-        // the column selector. The _ts column is special as it
-        // represents the event time.
-        if(!_.isUndefined(this.props.columns)) {
-            let toggles = {};
-            _.each(this.props.columns, x=>{
-                if(_.isString(x) &&
-                   x.length>0 && x[0] === "_" && x !== "_ts") {
-                    toggles[x]=true;
-                } else {
-                    toggles[x]=false;
-                }
+        if(!_.isEqual(this.state.original_cols, this.props.columns)) {
+            this.setState({
+                original_cols: this.props.columns,
+                columns: this.mergeColumns(this.props.columns),
             });
-
-            if(!_.isEqual(this.state.toggles, toggles)) {
-                this.setState({toggles: toggles});
-            };
         }
+    }
+
+    // Merge new columns into the current table state in such a way
+    // that the existing column ordering will not be changed.
+    mergeColumns = columns=>{
+        let lookup = {};
+        _.each(columns, x=>{
+            lookup[x] = true;
+        });
+        let new_columns = [];
+        let new_lookup = {};
+
+        // Add the old columns only if they are also in the new set,
+        // preserving their order.
+        _.each(this.state.columns, c=>{
+            if(lookup[c]) {
+                new_columns.push(c);
+                new_lookup[c] = true;
+            }
+        });
+
+        // Add new columns if they were not already, preserving their
+        // order.
+        _.each(columns, c=>{
+            if(!new_lookup[c])  {
+                new_columns.push(c);
+            }
+        });
+
+        return new_columns;
     }
 
     defaultFormatter = (cell, row, rowIndex) => {
         return <VeloValueRenderer value={cell}/>;
+    }
+
+    activeColumns = ()=>{
+        let res = [];
+        _.each(this.state.columns, c=>{
+            if(!this.props.toggles[c]) {
+                res.push(c);
+            }
+        });
+        return res;
+    }
+
+    // Insert the to_col right before the from_col
+    swapColumns = (from_col, to_col)=>{
+        let new_columns = [];
+        let from_seen = false;
+
+        _.each(this.state.columns, x=>{
+            if(x === to_col) {
+                if (from_seen) {
+                    new_columns.push(to_col);
+                    new_columns.push(from_col);
+                } else {
+                    new_columns.push(from_col);
+                    new_columns.push(to_col);
+                }
+            }
+
+            if(x === from_col) {
+                from_seen = true;
+            }
+
+            if(x !== from_col && x !== to_col) {
+                new_columns.push(x);
+            }
+        });
+        this.setState({columns: new_columns});
+    }
+
+    renderHeader = (column, idx)=>{
+        let column_name = column;
+        if (column_name == "_ts") {
+            column_name = "Server Time";
+        }
+
+        let styles = {};
+        let col_width = this.state.column_widths[column];
+        if (col_width) {
+            styles = {
+                minWidth: col_width,
+                maxWidth: col_width,
+                width: col_width,
+            };
+        }
+
+        return <React.Fragment key={idx}>
+                 <th className=" paged-table-header"
+                     style={styles}
+                     onDragStart={e=>{
+                         e.dataTransfer.setData("column", column);
+                     }}
+                     onDrop={e=>{
+                         e.preventDefault();
+                         this.swapColumns(
+                             e.dataTransfer.getData("column"), column);
+                     }}
+                     onDragOver={e=>{
+                         e.preventDefault();
+                         e.dataTransfer.dropEffect = "move";
+                     }}
+                     draggable="true">
+                   <span className="column-name">
+                      { T(column_name) }
+                   </span>
+                   <span className="sort-element">
+                     <ButtonGroup className="hover-buttons">
+                       <Button
+                         size="sm"
+                         type="button"
+                         variant="outline-dark"
+                         className="hidden-edit"
+                         onClick={()=>{
+                             let compact_columns = Object.assign(
+                                 {}, this.state.compact_columns);
+                             compact_columns[column] = !compact_columns[column];
+                             this.setState({
+                                 compact_columns: compact_columns,
+                             });
+                         }}>
+                         { !this.state.compact_columns[column] ?
+                           <ToolTip tooltip={T("Compact Column")}>
+                             <FontAwesomeIcon icon="compress"/>
+                           </ToolTip> :
+                           <ToolTip tooltip={T("Expand Column")}>
+                             <FontAwesomeIcon icon="expand"/>
+                           </ToolTip>
+                         }
+                       </Button>
+                     </ButtonGroup>
+                   </span>
+                 </th>
+                 <ColumnResizer
+                   width={this.state.column_widths[column]}
+                   setWidth={x=>{
+                       let column_widths = Object.assign(
+                           {}, this.state.column_widths);
+                       column_widths[column] = x;
+                       this.setState({column_widths: column_widths});
+                   }}
+                 />
+               </React.Fragment>;
+    }
+
+    getColumnRenderer = column => {
+        if(this.props.renderers && this.props.renderers[column]) {
+            return this.props.renderers[column];
+        }
+
+        let column_types = this.state.column_types;
+        if (!_.isArray(column_types)) {
+            return this.defaultFormatter;
+        }
+
+        for (let i=0; i<column_types.length; i++) {
+            if (column === column_types[i].name) {
+                return getFormatter(column_types[i].type, column_types[i].name);
+            }
+        }
+        return this.defaultFormatter;
+    }
+
+    isCellCollapsed = (column, rowIdx) => {
+        let column_desc = this.state.compact_columns[column];
+        // True represents all the cells are collapsed
+        if (column_desc === true) {
+            return true;
+        }
+        // If we store an object here then the object represents only
+        // cells which are **not** collapsed.
+        if(_.isObject(column_desc)) {
+            if(column_desc[rowIdx.toString()]) {
+                return false;
+            }
+            return true;
+        };
+        return false;
+    }
+
+    renderCell = (column, row, rowIdx) => {
+        let t = this.props.toggles[column];
+        if(t) {return undefined;};
+
+        let cell = row[column];
+        let renderer = this.getColumnRenderer(column);
+        let is_collapsed = this.isCellCollapsed(column, rowIdx);
+        let clsname = is_collapsed ? "compact": "";
+
+        return <React.Fragment key={column}>
+                 <td key={column}
+                     className={clsname}
+                     onClick={()=>{
+                         // If the column is not collapsed no click handler!
+                         if(!is_collapsed) return;
+
+                         // The cell is collapsed, we need to expand it:
+
+                         // If the entire column is collapsed we need
+                         // to specify that only this row is expanded.
+                         let column_desc = this.state.compact_columns[column];
+                         if(column_desc === true) {
+                             column_desc = {};
+                         }
+                         column_desc[rowIdx.toString()]=true;
+                         let compact_columns = Object.assign(
+                             {}, this.state.compact_columns);
+                         compact_columns[column] = column_desc;
+                         this.setState({compact_columns: compact_columns});
+                     }}>
+
+                   { renderer(cell, row, this.props.env)}
+                 </td>
+                 <ColumnResizer
+                   width={this.state.column_widths[column]}
+                   setWidth={x=>{
+                       let column_widths = Object.assign(
+                           {}, this.state.column_widths);
+                       column_widths[column] = x;
+                       this.setState({column_widths: column_widths});
+                   }}
+                 />
+               </React.Fragment>;
+    };
+
+    selectRow = (row, idx)=>{
+        this.setState({selected_row: row, selected_row_idx: idx});
+    }
+
+    renderRow = (row, idx)=>{
+        let selected_cls = "row-selected";
+
+        if(this.state.selected_row_idx !== idx) {
+            selected_cls = "";
+        }
+
+        return (
+            <tr key={idx}
+                onClick={x=>this.selectRow(row, idx)}
+                className={selected_cls}>
+              {_.map(this.activeColumns(), c=>this.renderCell(c, row, idx))}
+            </tr>);
     }
 
     render() {
@@ -81,50 +327,25 @@ class EventTableRenderer  extends Component {
             return <div></div>;
         }
 
-        let rows = this.props.rows;
-        let columns = [{dataField: '_id', hidden: true}];
-        for(var i=0;i<this.props.columns.length;i++) {
-            var name = this.props.columns[i];
-            let definition ={ dataField: name, text: T(name)};
-            if (name === "_ts") {
-                definition.text = "Server Time";
-            }
-            if (this.props.renderers && this.props.renderers[name]) {
-                definition.formatter = this.props.renderers[name];
-            } else {
-                definition.formatter = this.defaultFormatter;
-            }
-
-            if (this.state.toggles &&
-                this.state.toggles[name]) {
-                definition["hidden"] = true;
-            }
-
-            columns.push(definition);
-        }
-
-        // Add an id field for react ordering.
-        for (var j=0; j<rows.length; j++) {
-            rows[j]["_id"] = j;
-        }
-
         return (
-            <div className="velo-table timeline-table">
-              <BootstrapTable
-                hover
-                condensed
-                data={rows}
-                columns={columns}
-                keyField="_id"
-                headerClasses="hidden-header"
-                bodyClasses="fixed-table-body"
-              />
-            </div>
-        );
+            <>
+              <Table className="paged-table">
+                <thead>
+                  <tr className="paged-table-header">
+                    {_.map(this.activeColumns(), this.renderHeader)}
+                  </tr>
+                </thead>
+                <tbody className="fixed-table-body">
+                  {_.map(this.props.rows, this.renderRow)}
+                </tbody>
+              </Table>
+            </>);
     }
 }
 
 export default class EventTimelineViewer extends React.Component {
+    static contextType = UserConfig;
+
     static propTypes = {
         // Render the toolbar buttons in our parent component.
         toolbar: PropTypes.func,
@@ -137,8 +358,8 @@ export default class EventTimelineViewer extends React.Component {
     };
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
-        this.ts_source = axios.CancelToken.source();
+        this.source = CancelToken.source();
+        this.ts_source = CancelToken.source();
         this.fetchAvailableTimes();
     }
 
@@ -177,7 +398,7 @@ export default class EventTimelineViewer extends React.Component {
 
     fetchAvailableTimes = () => {
         this.ts_source.cancel();
-        this.ts_source = axios.CancelToken.source();
+        this.ts_source = CancelToken.source();
 
         let client_id = this.props.client_id || "server";
 
@@ -195,7 +416,7 @@ export default class EventTimelineViewer extends React.Component {
             if (av_t && av_t.length > 0) {
                 let ts = av_t[av_t.length-1]*1000;
                 this.setState({
-                    start_time: ts,
+                    start_time: ts || 0,
                     table_start: ts,
                     end_time: ts + 60*60*24*1000,
                 });
@@ -204,6 +425,7 @@ export default class EventTimelineViewer extends React.Component {
             this.setState({
                 available_timestamps: resp.data.logs[0].row_timestamps || [],
                 available_log_timestamps: resp.data.logs[0].log_timestamps || [],
+                toggles: {},
             });
 
             this.fetchRows();
@@ -211,15 +433,12 @@ export default class EventTimelineViewer extends React.Component {
     }
 
     fetchRows = () => {
-        let url = this.props.url || "v1/GetTable";
+        let url = "v1/GetTable";
 
         this.source.cancel();
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
 
         this.setState({loading: true});
-
-        // Re-render the toolbar each time we fetch a new row.
-        this.props.toolbar(this.renderToolbar);
 
         let mode = "CLIENT_EVENT";
         if (this.props.mode === "Logs") {
@@ -265,6 +484,23 @@ export default class EventTimelineViewer extends React.Component {
                 columns: columns,
                 rows: pageData.rows,
             });
+
+            if(_.isEmpty(this.state.toggles)) {
+                let toggles = {};
+                _.each(columns, x=>{
+                    if(_.isString(x) &&
+                       x.length>0 && x[0] === "_" && x !== "_ts") {
+                        toggles[x]=true;
+                    } else {
+                        toggles[x]=false;
+                    }
+                });
+
+                this.setState({toggles: toggles});
+            }
+
+            // Re-render the toolbar each time we fetch a new row.
+            this.props.toolbar(this.renderToolbar);
         });
     };
 
@@ -272,7 +508,7 @@ export default class EventTimelineViewer extends React.Component {
         let options = [10, 20, 50, 100];
 
         return <Dropdown
-                 className="page-size-dropdown"
+                 className="page-size-dropdown btn-group"
 
                  onSelect={(value)=>{
                      this.setState({row_count: value});
@@ -306,13 +542,17 @@ export default class EventTimelineViewer extends React.Component {
             visibleTimeStart: visibleTimeStart,
             visibleTimeEnd: visibleTimeEnd,
         });
-        this.props.time_range_setter(visibleTimeStart, visibleTimeEnd);
+
+        // Set the time ranges in real UTC times
+        this.props.time_range_setter(
+            moment(visibleTimeStart).valueOf(),
+            moment(visibleTimeEnd).valueOf());
     }
 
     // Jump to the previous page.
     prevPage = ()=>{
         this.setState({
-            start_time: this.state.start_time - 60*60*24*1000,
+            start_time: (this.state.start_time - 60*60*24*1000) || 0,
         });
         this.fetchRows();
     }
@@ -321,7 +561,7 @@ export default class EventTimelineViewer extends React.Component {
         if (this.state.table_end > 0) {
             let page_size = this.state.visibleTimeEnd - this.state.visibleTimeStart;
             this.setState({
-                start_time: this.state.table_end + 1000,
+                start_time: (this.state.table_end + 1000) || 0,
             });
 
             // Only scroll the timeline once we go past the view port.
@@ -332,7 +572,9 @@ export default class EventTimelineViewer extends React.Component {
                     visibleTimeStart: visibleTimeStart,
                     visibleTimeEnd: visibleTimeEnd,
                 });
-                this.props.time_range_setter(visibleTimeStart, visibleTimeEnd);
+                this.props.time_range_setter(
+                    moment(visibleTimeStart).valueOf(),
+                    moment(visibleTimeEnd).valueOf());
             }
 
             this.fetchRows();
@@ -352,8 +594,10 @@ export default class EventTimelineViewer extends React.Component {
         let start_time = moment(this.state.visibleTimeStart).format();
         let end_time = moment(this.state.visibleTimeEnd).format();
         let basename = `${this.props.artifact}-${start_time}-${end_time}-${this.props.client_id}`;
+
+        // For JSON do not expand the columns - just pass them through
+        // as they are.
         let downloads_json = {
-            columns: this.state.columns,
             client_id: this.props.client_id,
             artifact: this.props.artifact,
             type: mode,
@@ -364,11 +608,25 @@ export default class EventTimelineViewer extends React.Component {
             download_filename: basename,
         };
 
+        // For CSV we want all the columns expanded. This is not ideal
+        // as it only includes the columns in this page.
         let downloads_csv = Object.assign({}, downloads_json);
         downloads_csv.download_format = "csv";
+        downloads_csv.columns = this.state.columns;
+
         return <>
+                 <ColumnToggle onToggle={(c)=>{
+                     // Do not make a copy here because set state is
+                     // not immediately visible and this will be called
+                     // for each column.
+                     let toggles = this.state.toggles;
+                     toggles[c] = !toggles[c];
+                     this.setState({toggles: toggles});
+                 }}
+                               columns={this.state.columns}
+                               toggles={this.state.toggles} />
                  {this.pageSizeSelector()}
-                 <Dropdown>
+                 <Dropdown className="btn-group">
                    <Dropdown.Toggle variant="default">
                      <FontAwesomeIcon icon="download"/>
                    </Dropdown.Toggle>
@@ -397,45 +655,37 @@ export default class EventTimelineViewer extends React.Component {
                      </Dropdown.Item>
                    </Dropdown.Menu>
                  </Dropdown>
-
-                 <Button data-tooltip="Delete"
-                         data-position="right"
-                         className="btn-tooltip"
-                         onClick={() => this.setState({showDeleteDialog: true})}
-                         variant="default">
-                   <FontAwesomeIcon icon="trash"/>
-                 </Button>
-
-                 <Button data-tooltip="Previous"
-                         data-position="right"
-                         className="btn-tooltip"
-                         onClick={() => this.prevPage()}
-                         variant="default">
-                   <FontAwesomeIcon icon="backward"/>
-                 </Button>
-
-                 <Button data-tooltip="Center"
-                         data-position="right"
-                         className="btn-tooltip"
-                         onClick={() => this.centerPage()}
-                         variant="default">
-                   <FontAwesomeIcon icon="crosshairs"/>
-                 </Button>
-
-                 <Button data-tooltip="Next"
-                         data-position="right"
-                         className="btn-tooltip"
-                         onClick={() => this.nextPage()}
-                         variant="default">
-                   <FontAwesomeIcon icon="forward"/>
-                 </Button>
+                 <ToolTip tooltip={T("Delete")}>
+                   <Button onClick={() => this.setState({showDeleteDialog: true})}
+                           variant="default">
+                     <FontAwesomeIcon icon="trash"/>
+                   </Button>
+                 </ToolTip>
+                 <ToolTip tooltip={T("Previous")}>
+                   <Button onClick={() => this.prevPage()}
+                           variant="default">
+                     <FontAwesomeIcon icon="backward"/>
+                   </Button>
+                 </ToolTip>
+                 <ToolTip tooltip={T("Center")}>
+                   <Button onClick={() => this.centerPage()}
+                           variant="default">
+                     <FontAwesomeIcon icon="crosshairs"/>
+                   </Button>
+                 </ToolTip>
+                 <ToolTip tooltip={T("Next")}>
+                   <Button onClick={() => this.nextPage()}
+                           variant="default">
+                     <FontAwesomeIcon icon="forward"/>
+                   </Button>
+                 </ToolTip>
                </>;
     }
 
     handleTimeChange = (visibleTimeStart, visibleTimeEnd) => {
         this.setState({
-            visibleTimeStart,
-            visibleTimeEnd,
+            visibleTimeStart: this.fromLocalTZ(visibleTimeStart),
+            visibleTimeEnd: this.fromLocalTZ(visibleTimeEnd),
             scrolling: true
         });
         this.props.time_range_setter(visibleTimeStart, visibleTimeEnd);
@@ -453,7 +703,29 @@ export default class EventTimelineViewer extends React.Component {
         available_log_timestamps: [],
 
         showDeleteDialog: false,
+
+        toggles: {},
     }
+
+    // Here Local TZ means the timezone the user chose in the GUI preferences.
+    toLocalTZ = ts=>{
+        let timezone = this.context.traits.timezone || "UTC";
+        let zone = moment.tz.zone(timezone);
+        if (!zone) {
+            return ts;
+        }
+        return moment.utc(ts).subtract(zone.utcOffset(ts), "minutes").valueOf();
+    }
+
+    fromLocalTZ = ts=>{
+        let timezone = this.context.traits.timezone || "UTC";
+        let zone = moment.tz.zone(timezone);
+        if (!zone) {
+            return moment(ts);
+        }
+        return moment.utc(ts).add(zone.utcOffset(ts), "minutes");
+    }
+
 
     render() {
         let groups =  [
@@ -473,8 +745,8 @@ export default class EventTimelineViewer extends React.Component {
 
         let items = [{
             id:-1, group: -1,
-            start_time: moment(this.state.table_start),
-            end_time: moment(this.state.table_end),
+            start_time: this.toLocalTZ(this.state.table_start),
+            end_time: this.toLocalTZ(this.state.table_end),
             canMove: false,
             canResize: false,
             canChangeGroup: false,
@@ -489,11 +761,12 @@ export default class EventTimelineViewer extends React.Component {
 
 
         let adder = (ts, group_id)=>{
+            ts = ts || 0;
             items.push({
                 id: items.length, group: group_id,
                 ts: ts,
-                start_time: ts * 1000,
-                end_time: (ts + 60*60*24)*1000,
+                start_time: this.toLocalTZ(ts * 1000),
+                end_time: this.toLocalTZ((ts + 60*60*24)*1000),
                 canMove: false,
                 canResize: false,
                 canChangeGroup: false,
@@ -510,9 +783,11 @@ export default class EventTimelineViewer extends React.Component {
         _.each(this.state.available_timestamps, x=>adder(x, 1));
         _.each(this.state.available_log_timestamps, x=>adder(x, 2));
 
-        let visible_start_time = this.state.visibleTimeStart;
-        let visible_end_time = this.state.visibleTimeEnd;
+        let visible_start_time = this.state.visibleTimeStart || 0;
+        let visible_end_time = this.state.visibleTimeEnd || 200000000;
 
+        // Disable buffer to prevent horizontal scroll. This seems to
+        // interact badly with MacOS trackpads.
         return <>
                  {this.state.showDeleteDialog &&
                   <DeleteTimelineRanges
@@ -534,29 +809,36 @@ export default class EventTimelineViewer extends React.Component {
                    defaultTimeStart={moment().add(-1, "day")}
                    defaultTimeEnd={moment().add(1, "day")}
                    itemTouchSendsClick={true}
-                   minZoom={5*60*1000}
+                   minZoom={60*1000}
                    dragSnap={1000}
                    onCanvasClick={(groupId, time, e) => {
-                       this.setState({start_time: time});
+                       if(time) {
+                           this.setState({start_time: this.fromLocalTZ(time)});
+                       }
                    }}
                    onItemSelect={(itemId, e, time) => {
-                       this.setState({start_time: time});
+                       if(time) {
+                           this.setState({start_time: this.fromLocalTZ(time)});
+                       }
                        return false;
                    }}
                    onItemClick={(itemId, e, time) => {
-                       this.setState({start_time: time});
+                       if(time) {
+                           this.setState({start_time: this.fromLocalTZ(time)});
+                       }
                        return false;
                    }}
-                   visibleTimeStart={this.state.visibleTimeStart}
-                   visibleTimeEnd={this.state.visibleTimeEnd}
+                   visibleTimeStart={this.toLocalTZ(this.state.visibleTimeStart)}
+                   visibleTimeEnd={this.toLocalTZ(this.state.visibleTimeEnd)}
                    onTimeChange={this.handleTimeChange}
                  >
                    <TimelineMarkers>
                      <CustomMarker
-                       date={this.state.start_time || Date.now()} >
+                       date={this.toLocalTZ(this.state.start_time || Date.now())} >
                        { ({ styles, date }) => {
                            styles.backgroundColor = undefined;
                            styles.width = undefined;
+                           styles.left = styles.left || 0;
                            return <div style={styles}
                                        className="timeline-marker"
                                   />;
@@ -566,6 +848,7 @@ export default class EventTimelineViewer extends React.Component {
                  </Timeline>
                  <EventTableRenderer
                    renderers={this.props.renderers}
+                   toggles={this.state.toggles}
                    rows={this.state.rows}
                    columns={this.state.columns}
                  />

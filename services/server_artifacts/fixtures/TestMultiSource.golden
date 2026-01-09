@@ -12,6 +12,7 @@
  "start_time": 10000000,
  "active_time": 10000000,
  "total_collected_rows": 2,
+ "total_logs": 7,
  "total_requests": 2,
  "state": 3,
  "status": "Oops\n",
@@ -42,5 +43,6 @@
    "log_rows": 4,
    "result_rows": 1
   }
- ]
+ ],
+ "user_notified": true
 }

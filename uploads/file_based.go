@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package uploads
 
@@ -80,8 +80,8 @@ func (self *FileBasedUploader) Upload(
 	atime time.Time,
 	ctime time.Time,
 	btime time.Time,
-	reader io.Reader) (
-	*UploadResponse, error) {
+	mode os.FileMode,
+	reader io.ReadSeeker) (*UploadResponse, error) {
 
 	if self.UploadDir == "" {
 		scope.Log("UploadDir is not set")
@@ -92,9 +92,10 @@ func (self *FileBasedUploader) Upload(
 		store_as_name = filename
 	}
 
-	cached, pres := DeduplicateUploads(scope, store_as_name)
-	if pres {
-		return cached, nil
+	result, closer := DeduplicateUploads(accessor, scope, store_as_name)
+	defer closer(result)
+	if result != nil {
+		return result, nil
 	}
 
 	file_path := self.sanitize_path(store_as_name.String())
@@ -105,11 +106,28 @@ func (self *FileBasedUploader) Upload(
 		return nil, err
 	}
 
+	// For directories just create them
+	if mode.IsDir() {
+		err := os.MkdirAll(file_path, 0700)
+		if err != nil {
+			scope.Log("Can not create dir: %s(%s) %s", store_as_name.String(),
+				file_path, err.Error())
+			return nil, err
+		}
+
+		result = &UploadResponse{
+			Path:       file_path,
+			Components: store_as_name.Components,
+		}
+		closer(result)
+		return result, nil
+	}
+
 	// Try to collect sparse files if possible
-	result, err := self.maybeCollectSparseFile(
+	result, err = self.maybeCollectSparseFile(
 		ctx, reader, store_as_name, file_path)
 	if err == nil {
-		CacheUploadResult(scope, store_as_name, result)
+		closer(result)
 		return result, nil
 	}
 
@@ -151,7 +169,10 @@ func (self *FileBasedUploader) Upload(
 	}
 
 	// It is not an error if we cant set the timestamps - best effort.
-	_ = setFileTimestamps(file_path, mtime, atime, ctime)
+	err = setFileTimestamps(file_path, mtime, atime, ctime)
+	if err != nil {
+		scope.Log("FileBasedUploader: %v", err)
+	}
 
 	scope.Log("Uploaded %v (%v bytes)", file_path, offset)
 	result = &UploadResponse{
@@ -161,8 +182,7 @@ func (self *FileBasedUploader) Upload(
 		Sha256:     hex.EncodeToString(sha_sum.Sum(nil)),
 		Md5:        hex.EncodeToString(md5_sum.Sum(nil)),
 	}
-
-	CacheUploadResult(scope, store_as_name, result)
+	closer(result)
 	return result, nil
 }
 
@@ -170,8 +190,7 @@ func (self *FileBasedUploader) maybeCollectSparseFile(
 	ctx context.Context,
 	reader io.Reader,
 	store_as_name *accessors.OSPath,
-	sanitized_name string) (
-	*UploadResponse, error) {
+	sanitized_name string) (*UploadResponse, error) {
 
 	// Can the reader produce ranges?
 	range_reader, ok := reader.(RangeReader)

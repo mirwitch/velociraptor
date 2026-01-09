@@ -2,21 +2,23 @@ package journal_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/alecthomas/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"www.velocidex.com/golang/velociraptor/config"
+	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 	"www.velocidex.com/golang/velociraptor/vtesting"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
 )
@@ -27,13 +29,17 @@ type JournalTestSuite struct {
 
 func (self *JournalTestSuite) SetupTest() {
 	var err error
-	os.Setenv("VELOCIRAPTOR_CONFIG", test_utils.SERVER_CONFIG)
+
+	file_store.ClearGlobalFilestore()
+
+	os.Setenv("VELOCIRAPTOR_LITERAL_CONFIG", test_utils.SERVER_CONFIG)
 	self.ConfigObj, err = new(config.Loader).
-		WithEnvLiteralLoader("VELOCIRAPTOR_CONFIG").WithRequiredFrontend().
+		WithEnvLiteralLoader(constants.VELOCIRAPTOR_LITERAL_CONFIG).
+		WithRequiredFrontend().
 		WithVerbose(true).LoadAndValidate()
 	require.NoError(self.T(), err)
 
-	dir, err := ioutil.TempDir("", "file_store_test")
+	dir, err := tempfile.TempDir("file_store_test")
 	assert.NoError(self.T(), err)
 
 	self.ConfigObj.Datastore.Implementation = "MemcacheFileDataStore"
@@ -41,7 +47,7 @@ func (self *JournalTestSuite) SetupTest() {
 	self.ConfigObj.Datastore.FilestoreDirectory = dir
 	self.ConfigObj.Datastore.Location = dir
 
-	self.LoadArtifacts([]string{`
+	self.LoadArtifactsIntoConfig([]string{`
 name: System.Flow.Completion
 type: CLIENT_EVENT
 `, `
@@ -62,7 +68,7 @@ func (self *JournalTestSuite) TestJournalWriting() {
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	clock := &utils.MockClock{}
+	clock := utils.NewMockClock(time.Time{})
 	start := clock.Now()
 
 	// Simulate a slow filesystem (70 ms per filesystem access).
@@ -72,8 +78,9 @@ func (self *JournalTestSuite) TestJournalWriting() {
 	snapshot := vtesting.GetMetrics(self.T(), ".")
 
 	// Write 10 rows in series
+	ctx := self.Ctx
 	for i := 0; i < 10; i++ {
-		err = journal.PushRowsToArtifact(self.ConfigObj,
+		err = journal.PushRowsToArtifact(ctx, self.ConfigObj,
 			[]*ordereddict.Dict{ordereddict.NewDict().
 				Set("Foo", "Bar").
 				Set("i", i),
@@ -114,7 +121,7 @@ func (self *JournalTestSuite) TestJournalJsonlWriting() {
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	clock := &utils.MockClock{}
+	clock := utils.NewMockClock(time.Time{})
 	start := clock.Now()
 
 	// Simulate a slow filesystem (70 ms per filesystem access).
@@ -125,7 +132,7 @@ func (self *JournalTestSuite) TestJournalJsonlWriting() {
 
 	// Write 10 rows in series
 	for i := 0; i < 10; i++ {
-		err = journal.PushJsonlToArtifact(self.ConfigObj,
+		err = journal.PushJsonlToArtifact(self.Ctx, self.ConfigObj,
 			[]byte(fmt.Sprintf("{\"For\":%q,\"i\":%d}\n", "Bar", i)), 1,
 			"System.Flow.Completion", "C.1234", "")
 		assert.NoError(self.T(), err)

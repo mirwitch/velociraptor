@@ -13,12 +13,14 @@ var (
 	ALL_ROLES = []string{"org_admin", "administrator", "reader",
 		"analyst", "investigator",
 		"artifact_writer", "api"}
+
 	ALL_PERMISSIONS = []string{
-		"ALL_QUERY",
 		"ANY_QUERY",
 		"READ_RESULTS",
 		"LABEL_CLIENT",
 		"COLLECT_CLIENT",
+		"COLLECT_BASIC",
+		"START_HUNT",
 		"COLLECT_SERVER",
 		"ARTIFACT_WRITER",
 		"SERVER_ARTIFACT_WRITER",
@@ -29,8 +31,10 @@ var (
 		"IMPERSONATION",
 		"FILESYSTEM_READ",
 		"FILESYSTEM_WRITE",
+		"NETWORK",
 		"MACHINE_STATE",
 		"PREPARE_RESULTS",
+		"DELETE_RESULTS",
 		"DATASTORE_ACCESS",
 	}
 )
@@ -41,9 +45,6 @@ func ValidateRole(role string) bool {
 
 func DescribePermissions(token *acl_proto.ApiClientACL) []string {
 	result := []string{}
-	if token.AllQuery {
-		result = append(result, "ALL_QUERY")
-	}
 	if token.AnyQuery {
 		result = append(result, "ANY_QUERY")
 	}
@@ -55,6 +56,12 @@ func DescribePermissions(token *acl_proto.ApiClientACL) []string {
 	}
 	if token.CollectClient {
 		result = append(result, "COLLECT_CLIENT")
+	}
+	if token.CollectBasic {
+		result = append(result, "COLLECT_BASIC")
+	}
+	if token.StartHunt {
+		result = append(result, "START_HUNT")
 	}
 	if token.CollectServer {
 		result = append(result, "COLLECT_SERVER")
@@ -88,12 +95,20 @@ func DescribePermissions(token *acl_proto.ApiClientACL) []string {
 		result = append(result, "FILESYSTEM_WRITE")
 	}
 
+	if token.Network {
+		result = append(result, "NETWORK")
+	}
+
 	if token.MachineState {
 		result = append(result, "MACHINE_STATE")
 	}
 
 	if token.PrepareResults {
 		result = append(result, "PREPARE_RESULTS")
+	}
+
+	if token.DeleteResults {
+		result = append(result, "DELETE_RESULTS")
 	}
 
 	if token.DatastoreAccess {
@@ -107,8 +122,6 @@ func SetTokenPermission(
 	token *acl_proto.ApiClientACL, permissions ...string) error {
 	for _, perm := range permissions {
 		switch strings.ToUpper(perm) {
-		case "ALL_QUERY":
-			token.AllQuery = true
 		case "ANY_QUERY":
 			token.AnyQuery = true
 		case "READ_RESULTS":
@@ -117,6 +130,10 @@ func SetTokenPermission(
 			token.LabelClients = true
 		case "COLLECT_CLIENT":
 			token.CollectClient = true
+		case "COLLECT_BASIC":
+			token.CollectBasic = true
+		case "START_HUNT":
+			token.StartHunt = true
 		case "COLLECT_SERVER":
 			token.CollectServer = true
 		case "ARTIFACT_WRITER":
@@ -137,10 +154,14 @@ func SetTokenPermission(
 			token.FilesystemRead = true
 		case "FILESYSTEM_WRITE":
 			token.FilesystemWrite = true
+		case "NETWORK":
+			token.Network = true
 		case "MACHINE_STATE":
 			token.MachineState = true
 		case "PREPARE_RESULTS":
 			token.PrepareResults = true
+		case "DELETE_RESULTS":
+			token.DeleteResults = true
 		case "DATASTORE_ACCESS":
 			token.DatastoreAccess = true
 
@@ -164,12 +185,13 @@ func GetRolePermissions(
 
 		// Admins get all query access
 		case "administrator":
-			result.AllQuery = true
 			result.AnyQuery = true
 			result.ReadResults = true
 			result.Impersonation = true
 			result.LabelClients = true
 			result.CollectClient = true
+			result.CollectBasic = true
+			result.StartHunt = true
 			result.CollectServer = true
 			result.ArtifactWriter = true
 			result.ServerArtifactWriter = true
@@ -178,8 +200,10 @@ func GetRolePermissions(
 			result.ServerAdmin = true
 			result.FilesystemRead = true
 			result.FilesystemWrite = true
+			result.Network = true
 			result.MachineState = true
 			result.PrepareResults = true
+			result.DeleteResults = true
 
 			// An administrator for the root org is allowed to
 			// manipulate orgs.
@@ -215,6 +239,7 @@ func GetRolePermissions(
 			result.ReadResults = true
 			result.NotebookEditor = true
 			result.CollectClient = true
+			result.StartHunt = true
 			result.LabelClients = true
 			result.AnyQuery = true
 			result.PrepareResults = true

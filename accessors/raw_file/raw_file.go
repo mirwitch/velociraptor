@@ -12,6 +12,7 @@ package raw_file
 
 import (
 	"errors"
+	"fmt"
 	"os"
 
 	ntfs "www.velocidex.com/golang/go-ntfs/parser"
@@ -19,11 +20,13 @@ import (
 	"www.velocidex.com/golang/velociraptor/accessors/file"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/utils"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/utils/files"
 	"www.velocidex.com/golang/vfilter"
 )
 
-type RawFileSystemAccessor struct{}
+type RawFileSystemAccessor struct {
+	scope vfilter.Scope
+}
 
 func (self RawFileSystemAccessor) ParsePath(path string) (*accessors.OSPath, error) {
 	return accessors.NewRawFilePath(path)
@@ -32,14 +35,28 @@ func (self RawFileSystemAccessor) ParsePath(path string) (*accessors.OSPath, err
 func (self RawFileSystemAccessor) New(scope vfilter.Scope) (
 	accessors.FileSystemAccessor, error) {
 
-	// Check we have permission to open files.
-	err := vql_subsystem.CheckAccess(scope, acls.FILESYSTEM_READ)
-	if err != nil {
-		return nil, err
+	result := &RawFileSystemAccessor{
+		scope: scope,
 	}
-
-	result := &RawFileSystemAccessor{}
 	return result, nil
+}
+
+func (self RawFileSystemAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name: "raw_file",
+		Description: `Access a device using aligned reads.
+
+On Windows device reads must be aligned to page size.
+
+This accessor ensures all reads are aligned.
+
+The accessor may be used on other files but:
+
+1. Reads will be aligned to page size (4096 bytes)
+2. The last page will be zero padded past the end of file.
+`,
+		Permissions: []acls.ACL_PERMISSION{acls.FILESYSTEM_READ},
+	}
 }
 
 func (self RawFileSystemAccessor) ReadDir(
@@ -61,15 +78,28 @@ func (self RawFileSystemAccessor) Open(filename string) (accessors.ReadSeekClose
 	// Treat the path as a raw OS path.
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("While opening %v: %v", filename, err)
 	}
+
+	files.Add(filename)
 
 	reader, err := ntfs.NewPagedReader(file, 0x1000, 10000)
 	if err != nil {
 		return nil, err
 	}
 
-	return utils.NewReadSeekReaderAdapter(reader), nil
+	res := utils.NewReadSeekReaderAdapter(reader, func() {
+		files.Remove(filename)
+	})
+
+	// Try to figure out the size - not necessary but in case we can
+	// we can limit readers to this size.
+	stat, err := os.Lstat(filename)
+	if err == nil {
+		res.SetSize(stat.Size())
+	}
+
+	return res, nil
 }
 
 func (self RawFileSystemAccessor) Lstat(path string) (accessors.FileInfo, error) {
@@ -79,6 +109,16 @@ func (self RawFileSystemAccessor) Lstat(path string) (accessors.FileInfo, error)
 	}
 
 	stat, err := os.Lstat(path)
+	if err != nil {
+		// On Windows it is not always possible to stat a device. In
+		// that case we need to return a fake object so it is not an
+		// error.
+		stat = &accessors.VirtualFileInfo{
+			Path:  full_path,
+			Size_: 1<<63 - 1,
+		}
+	}
+
 	return file.NewOSFileInfo(stat, full_path), err
 }
 
@@ -87,10 +127,19 @@ func (self RawFileSystemAccessor) LstatWithOSPath(
 
 	path := full_path.String()
 	stat, err := os.Lstat(path)
+	if err != nil {
+		// On Windows it is not always possible to stat a device. In
+		// that case we need to return a fake object so it is not an
+		// error.
+		stat = &accessors.VirtualFileInfo{
+			Path:  full_path,
+			Size_: 1<<63 - 1,
+		}
+	}
+
 	return file.NewOSFileInfo(stat, full_path), err
 }
 
 func init() {
-	accessors.Register("raw_file", &RawFileSystemAccessor{},
-		`Access the filesystem using the OS API.`)
+	accessors.Register(&RawFileSystemAccessor{})
 }

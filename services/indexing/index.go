@@ -14,47 +14,23 @@
 // In previous versions we indexed the client using the
 // filesystem. However this proved too slow for networked
 // filesystems. We therefore maintain a btree in memory of index
-// terms. We dump the btree into disk periodically called a
-// Snapshot. Reading and writing the snapshot is quite fast.
-
-// The master node is responsible for maintaining the snapshot in sync
-// - While the snapshot may be read by any node, the master is the
-// only node that is allowed to write it.
-
-// It is possible to rebuild the index but for large deplyments this
-// is recommended to be done by an external process due to the
-// additional load this generates on the master node. The command:
-
-// velociraptor index rebuild
-
-// Will create a timestamped snapshot by rescanning all client records
-// in the filestore (for > 100k clients on EFS, this can take a long
-// time!)
-
-// The master node will realize a new snapshot is present and reload
-// it.
+// terms. The index is rebuilt at runtime from the client info manager
+// which manage client information using a snapshot
 
 package indexing
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Velocidex/ordereddict"
 	"github.com/google/btree"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/file_store/api"
-	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/paths"
-	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
@@ -70,8 +46,6 @@ const (
 )
 
 var (
-	stopIteration = errors.New("stopIteration")
-
 	metricLRUTotalTerms = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "search_index_lru_total_terms",
@@ -109,11 +83,10 @@ type Indexer struct {
 	items int
 
 	ready bool
-	dirty bool
-
-	last_snapshot_read time.Time
 
 	config_obj *config_proto.Config
+
+	_verbs []string
 }
 
 func NewIndexer(config_obj *config_proto.Config) *Indexer {
@@ -135,84 +108,6 @@ func (self *Indexer) IsReady() bool {
 	defer self.mu.Unlock()
 
 	return self.ready
-}
-
-// Check for newer snapshot files we need to load.
-// You can create a new snapshot using "velociraptor index rebuild"
-func (self *Indexer) ScanForNewSnapshots(
-	ctx context.Context,
-	config_obj *config_proto.Config) error {
-	path_manager := paths.NewIndexPathManager()
-	file_store_factory := file_store.GetFileStore(config_obj)
-	children, err := file_store_factory.ListDirectory(
-		path_manager.SnapshotDirectory())
-	if err != nil {
-		return nil
-	}
-
-	for _, child := range children {
-		int_value, ok := utils.ToInt64(child.Name())
-		if !ok {
-			continue
-		}
-
-		timestamp := time.Unix(int_value, 0)
-		if timestamp.After(self.last_snapshot_read) {
-			// Reload the index.
-			logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-			logger.Info("Reloading index snapshot %v",
-				child.PathSpec().AsClientPath())
-			return self.LoadSnapshot(ctx, config_obj, child.PathSpec())
-		}
-	}
-	return nil
-}
-
-func (self *Indexer) WriteSnapshot(
-	config_obj *config_proto.Config, dest api.FSPathSpec) error {
-
-	// Check if we need to flush the index, if not we can skip it.
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	// Only write the snapshot if we need to.
-	if !self.dirty || self.btree.Len() == 0 {
-		return nil
-	}
-	self.dirty = false
-
-	now := time.Now()
-
-	defer func() {
-		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-		logger.Debug("<green>Indexing Service</>: Wrote index on %v in %v (%v entries)\n",
-			dest.AsFilestoreFilename(config_obj),
-			time.Now().Sub(now), self.btree.Len())
-	}()
-
-	// Write the snapshot syncronously to make sure it hits the
-	// disk. Usually it is pretty quick.
-	file_store_factory := file_store.GetFileStore(config_obj)
-	rs_writer, err := result_sets.NewResultSetWriter(
-		file_store_factory, dest, json.DefaultEncOpts(),
-		utils.SyncCompleter, result_sets.TruncateMode)
-	if err != nil {
-		return err
-	}
-	defer rs_writer.Close()
-
-	// Just write them all down.
-	self.btree.Ascend(func(i btree.Item) bool {
-		record := i.(Record)
-		row := ordereddict.NewDict().
-			Set("Entity", record.Entity).
-			Set("Term", record.Term)
-
-		rs_writer.Write(row)
-
-		return true
-	})
-	return nil
 }
 
 func (self *Indexer) Ready() bool {
@@ -244,133 +139,52 @@ func (self *Indexer) Ascend(iterator btree.ItemIterator) {
 	self.btree.Ascend(iterator)
 }
 
-// A much faster alternative - store all the client index in a single
-// file and read it at once.
-func (self *Indexer) LoadIndexFromSnapshot(
-	ctx context.Context,
-	config_obj *config_proto.Config) error {
-
-	path_manager := paths.NewIndexPathManager()
-	return self.LoadSnapshot(ctx, config_obj, path_manager.Snapshot())
-}
-
-func (self *Indexer) LoadSnapshot(
-	ctx context.Context,
-	config_obj *config_proto.Config,
-	pathspec api.FSPathSpec) error {
-
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	self.last_snapshot_read = time.Now()
-
-	file_store_factory := file_store.GetFileStore(config_obj)
-	rs_reader, err := result_sets.NewResultSetReader(
-		file_store_factory, pathspec)
-	if err != nil {
-		return err
-	}
-	defer rs_reader.Close()
-
-	clients := make(map[string]bool)
-
-	count := 0
-	for row := range rs_reader.Rows(ctx) {
-		entity, ok := row.GetString("Entity")
-		if !ok {
-			continue
-		}
-
-		// We only actually care about client index entries now.
-		if strings.HasPrefix(entity, "C.") {
-			clients[entity] = true
-		}
-
-		term, ok := row.GetString("Term")
-		if !ok {
-			continue
-		}
-
-		// We should be able to search for the client by client id
-		// directly.
-		self.setIndex(entity, entity)
-		self.setIndex(entity, term)
-		count++
-	}
-
-	if count == 0 {
-		return errors.New("No snapshot")
-	}
-
-	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("<green>Loaded index from snapshot</> in %v\n",
-		time.Now().Sub(self.last_snapshot_read))
-
-	self.ready = true
-	self.dirty = false
-
-	go func() {
-		for c := range clients {
-			// Get the full record to warm up all client attributes.
-			_, _ = self.FastGetApiClient(ctx, config_obj, c)
-		}
-	}()
-
-	return nil
-}
-
 func (self *Indexer) Start(
 	ctx context.Context, wg *sync.WaitGroup,
-	config_obj *config_proto.Config) {
+	config_obj *config_proto.Config) error {
 
-	// Loading from the snapshot is very fast, so we do this inline.
-	err := self.LoadIndexFromSnapshot(ctx, config_obj)
-	if err != nil {
-		// If the snapshot is missing, we load from the directory and
-		// this can be very slow on EFS so we do it in the background.
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			self.LoadIndexFromDatastore(ctx, config_obj)
-		}()
+	delay := 5 * time.Minute
+	if config_obj.Defaults != nil && config_obj.Defaults.ReindexPeriodSeconds > 0 {
+		delay = time.Duration(config_obj.Defaults.ReindexPeriodSeconds) * time.Second
 	}
 
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	snapshot_wait := 60 * time.Second
-	if config_obj.Frontend != nil &&
-		config_obj.Frontend.Resources != nil &&
-		config_obj.Frontend.Resources.IndexSnapshotFrequency > 0 {
-		snapshot_wait = time.Duration(config_obj.Frontend.Resources.
-			IndexSnapshotFrequency) * time.Second
-	}
+	logger.Info("<green>Starting</> Indexing Service for %v. Refreshing every %v",
+		services.GetOrgName(config_obj), delay)
 
-	// Check for newer snapshots periodically.
+	err := self.RebuildIndex(ctx, config_obj)
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 
-		for {
-			err := self.ScanForNewSnapshots(ctx, config_obj)
-			if err != nil {
-				logger.Error("ScanForNewSnapshots: %v", err)
-			}
+		last_run := utils.GetTime().Now()
 
+		for {
 			select {
 			case <-ctx.Done():
-				// When we are done, force a snapshot to be written.
-				self.WriteSnapshot(
-					config_obj, paths.NewIndexPathManager().Snapshot())
 				return
 
-			case <-time.After(snapshot_wait):
-				// Write the snapshot if needed (this is noop if the
-				// indexer is not dirty).
-				self.WriteSnapshot(
-					config_obj, paths.NewIndexPathManager().Snapshot())
+			case <-utils.GetTime().After(utils.Jitter(delay)):
+				// Avoid doing snapshots too quickly. This is mainly for
+				// tests where the time is mocked for the After(delay)
+				// above does not work.
+				if utils.GetTime().Now().Sub(last_run) < time.Minute {
+					utils.SleepWithCtx(ctx, time.Minute)
+					continue
+				}
+
+				err := self.RebuildIndex(ctx, config_obj)
+				if err != nil {
+					logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+					logger.Error("<red>Indexer RebuildIndex</>: %v", err)
+				}
+				last_run = utils.GetTime().Now()
 			}
 		}
 	}()
+
+	return err
 }
 
 // Set in memory indexer - it will be flushed later.
@@ -390,9 +204,19 @@ func (self *Indexer) setIndex(client_id, term string) error {
 	old := self.btree.ReplaceOrInsert(record)
 	if old == nil {
 		self.items++
-		self.dirty = true
 	}
 	metricLRUTotalTerms.Inc()
+	return nil
+}
+
+func (self *Indexer) setIndexTree(
+	client_id, term string, btree *btree.BTree) error {
+	record := NewRecord(&api_proto.IndexRecord{
+		Term:   term,
+		Entity: client_id,
+	})
+
+	btree.ReplaceOrInsert(record)
 	return nil
 }
 
@@ -461,12 +285,7 @@ func (self *Indexer) SearchIndexWithPrefix(
 func NewIndexingService(ctx context.Context, wg *sync.WaitGroup,
 	config_obj *config_proto.Config) (services.Indexer, error) {
 
-	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("<green>Starting</> Indexing Service for %v.",
-		services.GetOrgName(config_obj))
-
 	indexer := NewIndexer(config_obj)
-	indexer.Start(ctx, wg, config_obj)
 
-	return indexer, nil
+	return indexer, indexer.Start(ctx, wg, config_obj)
 }

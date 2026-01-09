@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/accessors/file"
 	"www.velocidex.com/golang/velociraptor/acls"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	"www.velocidex.com/golang/velociraptor/artifacts"
@@ -19,6 +20,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/functions"
 	"www.velocidex.com/golang/vfilter"
@@ -37,7 +39,7 @@ type CollectPluginArgs struct {
 	Password            string              `vfilter:"optional,field=password,doc=An optional password to encrypt the collection zip."`
 	Format              string              `vfilter:"optional,field=format,doc=Output format (csv, jsonl, csv_only)."`
 	ArtifactDefinitions vfilter.Any         `vfilter:"optional,field=artifact_definitions,doc=Optional additional custom artifacts."`
-	Template            string              `vfilter:"optional,field=template,doc=The name of a template artifact (i.e. one which has report of type HTML)."`
+	Template            string              `vfilter:"optional,field=template,doc=(Deprecated Ignored)."`
 	Level               int64               `vfilter:"optional,field=level,doc=Compression level between 0 (no compression) and 9."`
 	OpsPerSecond        int64               `vfilter:"optional,field=ops_per_sec,doc=Rate limiting for collections (deprecated)."`
 	CpuLimit            float64             `vfilter:"optional,field=cpu_limit,doc=Set query cpu_limit value"`
@@ -45,6 +47,8 @@ type CollectPluginArgs struct {
 	ProgressTimeout     float64             `vfilter:"optional,field=progress_timeout,doc=If no progress is detected in this many seconds, we terminate the query and output debugging information"`
 	Timeout             float64             `vfilter:"optional,field=timeout,doc=Total amount of time in seconds, this collection will take. Collection is cancelled when timeout is exceeded."`
 	Metadata            vfilter.StoredQuery `vfilter:"optional,field=metadata,doc=Metadata to store in the zip archive. Outputs to metadata.json in top level of zip file."`
+	Concurrency         int64               `vfilter:"optional,field=concurrency,doc=Number of concurrent collections."`
+	Remapping           string              `vfilter:"optional,field=remapping,doc=A Valid remapping configuration in YAML or JSON format."`
 }
 
 type CollectPlugin struct{}
@@ -57,6 +61,7 @@ func (self CollectPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "collect", args)()
 
 		// This plugin allows one to create files (for the output
 		// zip), It is very privileged.
@@ -79,10 +84,27 @@ func (self CollectPlugin) Call(
 		}
 
 		collection_manager := newCollectionManager(ctx, config_obj,
-			output_chan, scope)
-		defer collection_manager.Close()
+			output_chan, int(arg.Concurrency), scope)
 
-		request, err := self.configureCollection(collection_manager, arg)
+		collection_manager.remapping = arg.Remapping
+
+		// Make sure the Close() is called under any circumstances.
+		err = vql_subsystem.GetRootScope(scope).AddDestructor(func() {
+			collection_manager.Close()
+		})
+		if err != nil {
+			scope.Log("collect: %v", err)
+		}
+
+		defer func() {
+			err := collection_manager.Close()
+			if err != nil {
+				scope.Log("collect: While closing container: %v", err)
+			}
+		}()
+
+		request, err := self.configureCollection(
+			ctx, scope, collection_manager, arg)
 		if err != nil {
 			scope.Log("collect: %v", err)
 			return
@@ -101,8 +123,10 @@ func (self CollectPlugin) Call(
 
 // Configures the collection manager with the provided args.
 func (self CollectPlugin) configureCollection(
-	manager *collectionManager, arg *CollectPluginArgs) (
-	*flows_proto.ArtifactCollectorArgs, error) {
+	ctx context.Context,
+	scope vfilter.Scope,
+	manager *collectionManager,
+	arg *CollectPluginArgs) (*flows_proto.ArtifactCollectorArgs, error) {
 
 	format, err := reporting.GetContainerFormat(arg.Format)
 	if err != nil {
@@ -135,6 +159,12 @@ func (self CollectPlugin) configureCollection(
 	// If required create an output container
 	if arg.Output != "" {
 
+		// Make sure we are allowed to write there.
+		err = file.CheckPath(arg.Output)
+		if err != nil {
+			return nil, err
+		}
+
 		// Set any metadata for the container.
 		if !utils.IsNil(arg.Metadata) {
 			manager.SetMetadata(arg.Metadata)
@@ -150,23 +180,23 @@ func (self CollectPlugin) configureCollection(
 
 	// Compile the request into vql requests protobuf ready for
 	// acquisition.
-	return getArtifactCollectorArgs(
+	return getArtifactCollectorArgs(ctx,
 		manager.config_obj, manager.repository, manager.scope, arg)
 }
 
 func (self CollectPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name: "collect",
-		Doc:  "Collect artifacts into a local file.",
-		ArgType: type_map.AddType(scope,
-			&CollectPluginArgs{}),
+		Name:     "collect",
+		Doc:      "Collect artifacts into a local file.",
+		ArgType:  type_map.AddType(scope, &CollectPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_WRITE).Build(),
 	}
 }
 
 // Parse the plugin arg into an artifact collector arg that can be
 // compiled into VQL requests
 func getArtifactCollectorArgs(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	repository services.Repository,
 	scope vfilter.Scope,
 	arg *CollectPluginArgs) (*flows_proto.ArtifactCollectorArgs, error) {
@@ -175,7 +205,8 @@ func getArtifactCollectorArgs(
 		Artifacts: arg.Artifacts,
 	}
 
-	err := AddSpecProtobuf(config_obj, repository, scope, arg.Args, request)
+	err := AddSpecProtobuf(ctx, config_obj,
+		repository, scope, arg.Args, request)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +247,7 @@ func convertToArtifactSpecs(spec vfilter.Any) (*ordereddict.Dict, error) {
 // artifact parameters are always strings, encoded according to the
 // parameter type.
 func AddSpecProtobuf(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	repository services.Repository,
 	scope vfilter.Scope, spec vfilter.Any,
 	request *flows_proto.ArtifactCollectorArgs) error {
@@ -232,10 +263,10 @@ func AddSpecProtobuf(
 	}
 
 	for _, name := range scope.GetMembers(spec) {
-		artifact_definitions, pres := repository.Get(config_obj, name)
+		artifact_definitions, pres := repository.Get(ctx, config_obj, name)
 		if !pres {
 			// Artifact not known
-			return fmt.Errorf(`Parameter 'args' refers to an unknown artifact (%v). The 'args' parameter should be of the form {"Custom.Artifact.Name":{"arg":"value"}}`, name)
+			return fmt.Errorf(`Parameter refers to an unknown artifact (%v). The parameter should be of the form {"Custom.Artifact.Name":{"arg":"value"}}`, name)
 		}
 
 		// Check that we are allowed to collect this artifact
@@ -319,7 +350,7 @@ func AddSpecProtobuf(
 
 			case "timestamp":
 				if !is_str && !utils.IsNil(value_any) {
-					value_time, err := functions.TimeFromAny(scope, value_any)
+					value_time, err := functions.TimeFromAny(ctx, scope, value_any)
 					if err != nil {
 						scope.Log("Invalid timestamp for %v",
 							parameter_definition.Name)
@@ -379,7 +410,7 @@ func CheckArtifactModification(
 			return errors.New("Permission denied: ARTIFACT_WRITER")
 		}
 
-	case "SERVER", "SERVER_EVENT", "INTERNAL":
+	case "SERVER", "SERVER_EVENT", "NOTEBOOK", "INTERNAL":
 		ok, err = acl_manager.CheckAccess(acls.SERVER_ARTIFACT_WRITER)
 		if !ok {
 			return errors.New("Permission denied: SERVER_ARTIFACT_WRITER")
@@ -412,7 +443,7 @@ func CheckArtifactCollection(
 			return errors.New("Permission denied: COLLECT_CLIENT")
 		}
 
-	case "SERVER", "SERVER_EVENT", "INTERNAL":
+	case "SERVER", "SERVER_EVENT", "NOTEBOOK", "INTERNAL":
 		ok, err = acl_manager.CheckAccess(acls.COLLECT_SERVER)
 		if !ok {
 			return errors.New("Permission denied: COLLECT_SERVER")

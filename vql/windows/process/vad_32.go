@@ -1,3 +1,4 @@
+//go:build windows && 386 && cgo
 // +build windows,386,cgo
 
 package process
@@ -13,6 +14,7 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/windows"
 	"www.velocidex.com/golang/vfilter"
@@ -49,6 +51,7 @@ func (self ModulesPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "modules", args)()
 
 		err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
 		if err != nil {
@@ -88,9 +91,10 @@ func (self ModulesPlugin) Call(
 
 func (self ModulesPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "modules",
-		Doc:     "Enumerate Loaded DLLs.",
-		ArgType: type_map.AddType(scope, &PidArgs{}),
+		Name:     "modules",
+		Doc:      "Enumerate Loaded DLLs.",
+		ArgType:  type_map.AddType(scope, &PidArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 
@@ -107,8 +111,8 @@ func (self VADPlugin) Call(
 		defer close(output_chan)
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
-
-		defer vql_subsystem.CheckForPanic(scope, "module")
+		defer vql_subsystem.RegisterMonitor(ctx, "vad", args)()
+		defer vql_subsystem.CheckForPanic(scope, "vad")
 
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 		if err != nil {

@@ -12,6 +12,17 @@ export function serializeCSV(data, columns) {
 }
 
 
+export function validateCSV(data) {
+    try {
+        parse(data, {skip_empty_lines: false});
+        parse(data, {columns: true, skip_empty_lines: false});
+        return "";
+
+    } catch(e) {
+        return e;
+    }
+};
+
 export function parseCSV(data) {
     try {
         let records = parse(data, {skip_empty_lines: false});
@@ -22,7 +33,7 @@ export function parseCSV(data) {
         }
 
     } catch(e) {
-        _.each(api.hooks, h=>h("Error: " + e));
+        api.error("Error: " + e);
         return {columns: ["Column1"], data: []};
     }
 

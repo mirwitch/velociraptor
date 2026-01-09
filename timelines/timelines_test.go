@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/alecthomas/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"www.velocidex.com/golang/velociraptor/config"
@@ -16,8 +15,11 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/result_sets"
+	"www.velocidex.com/golang/velociraptor/services/notebook"
 	"www.velocidex.com/golang/velociraptor/timelines"
+	timelines_proto "www.velocidex.com/golang/velociraptor/timelines/proto"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
 )
 
 type TimelineTestSuite struct {
@@ -43,20 +45,25 @@ func (self *TimelineTestSuite) TearDownTest() {
 }
 
 func (self *TimelineTestSuite) TestSuperTimelineWriter() {
-	path_manager := &paths.SuperTimelinePathManager{
-		Name: "Test",
-		Root: paths.NewNotebookPathManager("N.1234").Path(),
-	}
-	super, err := timelines.NewSuperTimelineWriter(self.config_obj, path_manager)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	timeline_storer := notebook.NewTimelineStorer(self.config_obj)
+	super, err := (&timelines.SuperTimelineWriter{}).New(ctx, self.config_obj,
+		timeline_storer, "N.1234", "Test")
 	assert.NoError(self.T(), err)
 
-	timeline, err := super.AddChild("1")
+	timeline, err := super.AddChild(&timelines_proto.Timeline{
+		Id: "1",
+	}, utils.BackgroundWriter)
 	assert.NoError(self.T(), err)
 
-	timeline2, err := super.AddChild("2")
+	timeline2, err := super.AddChild(&timelines_proto.Timeline{
+		Id: "2",
+	}, utils.BackgroundWriter)
 	assert.NoError(self.T(), err)
 
-	for i := int64(0); i <= 10; i++ {
+	for i := int64(10); i <= 20; i++ {
 		// This timeline contains evens
 		timeline.Write(time.Unix(i*2, 0), ordereddict.NewDict().Set("Item", i*2))
 
@@ -65,10 +72,11 @@ func (self *TimelineTestSuite) TestSuperTimelineWriter() {
 	}
 	timeline.Close()
 	timeline2.Close()
-	super.Close()
+	super.Close(ctx)
 
 	// test_utils.GetMemoryFileStore(self.T(), self.config_obj).Debug()
-	reader, err := timelines.NewSuperTimelineReader(self.config_obj, path_manager, nil)
+	reader, err := timelines.SuperTimelineReader{}.New(ctx,
+		self.config_obj, timeline_storer, "N.1234", "Test", nil, nil)
 	assert.NoError(self.T(), err)
 	defer reader.Close()
 
@@ -98,9 +106,8 @@ func (self *TimelineTestSuite) TestTimelineWriter() {
 	path_manager := paths.NewNotebookPathManager("N.1234").
 		SuperTimeline("T.1234").GetChild("Test")
 
-	file_store_factory := file_store.GetFileStore(self.config_obj)
-	timeline, err := timelines.NewTimelineWriter(file_store_factory, path_manager,
-		utils.SyncCompleter, result_sets.TruncateMode)
+	timeline, err := timelines.NewTimelineWriter(self.config_obj,
+		path_manager, utils.SyncCompleter, result_sets.TruncateMode)
 	assert.NoError(self.T(), err)
 
 	total_rows := 0
@@ -118,7 +125,8 @@ func (self *TimelineTestSuite) TestTimelineWriter() {
 
 	//test_utils.GetMemoryFileStore(self.T(), self.config_obj).Debug()
 
-	reader, err := timelines.NewTimelineReader(file_store_factory, path_manager)
+	reader, err := timelines.TimelineReader{}.New(
+		self.config_obj, timelines.UnitTransformer, path_manager)
 	assert.NoError(self.T(), err)
 	defer reader.Close()
 

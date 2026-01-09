@@ -6,6 +6,7 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -13,7 +14,7 @@ import (
 
 type RemoveClientMonitoringFunctionArgs struct {
 	Artifact string `vfilter:"required,field=artifact,doc=The name of the artifact to remove from the event table"`
-	Label    string `vfilter:"optional,field=label,doc=Remove this artifact from this label group (default the 'all'  group)"`
+	Label    string `vfilter:"optional,field=label,doc=Remove the artifact from this label group (default the 'all'  group)"`
 }
 
 type RemoveClientMonitoringFunction struct{}
@@ -23,7 +24,7 @@ func (self RemoveClientMonitoringFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.COLLECT_CLIENT)
 	if err != nil {
 		scope.Log("rm_client_monitoring: %s", err)
 		return vfilter.Null{}
@@ -36,9 +37,15 @@ func (self RemoveClientMonitoringFunction) Call(
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("rm_client_monitoring: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("rm_client_monitoring: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -68,14 +75,15 @@ func (self RemoveClientMonitoringFunction) Call(
 
 func (self RemoveClientMonitoringFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "rm_client_monitoring",
-		Doc:     "Remove an artifact from the client monitoring table.",
-		ArgType: type_map.AddType(scope, &AddClientMonitoringFunctionArgs{}),
+		Name:     "rm_client_monitoring",
+		Doc:      "Remove an artifact from the client monitoring table.",
+		ArgType:  type_map.AddType(scope, &RemoveClientMonitoringFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_CLIENT).Build(),
 	}
 }
 
 type RemoveServerMonitoringFunctionArgs struct {
-	Artifact string `vfilter:"required,field=artifact,doc=The name of the artifact to add"`
+	Artifact string `vfilter:"required,field=artifact,doc=The name of the artifact to remove"`
 }
 
 type RemoveServerMonitoringFunction struct{}
@@ -85,7 +93,7 @@ func (self RemoveServerMonitoringFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.COLLECT_SERVER)
 	if err != nil {
 		scope.Log("rm_server_monitoring: %s", err)
 		return vfilter.Null{}
@@ -98,9 +106,15 @@ func (self RemoveServerMonitoringFunction) Call(
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("rm_server_monitoring: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("rm_server_monitoring: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -117,7 +131,7 @@ func (self RemoveServerMonitoringFunction) Call(
 
 	// Actually set the table
 	principal := vql_subsystem.GetPrincipal(scope)
-	err = server_manager.Update(config_obj, principal, event_config)
+	err = server_manager.Update(ctx, config_obj, principal, event_config)
 	if err != nil {
 		scope.Log("rm_server_monitoring: %v", err)
 		return vfilter.Null{}
@@ -128,9 +142,10 @@ func (self RemoveServerMonitoringFunction) Call(
 
 func (self RemoveServerMonitoringFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "rm_server_monitoring",
-		Doc:     "Remove an artifact from the server monitoring table.",
-		ArgType: type_map.AddType(scope, &AddServerMonitoringFunctionArgs{}),
+		Name:     "rm_server_monitoring",
+		Doc:      "Remove an artifact from the server monitoring table.",
+		ArgType:  type_map.AddType(scope, &RemoveServerMonitoringFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_SERVER).Build(),
 	}
 }
 

@@ -11,23 +11,25 @@ import (
 
 	"github.com/Velocidex/yaml/v2"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
-	"www.velocidex.com/golang/velociraptor/file_store"
+	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/startup"
 )
 
 var (
-	third_party           = app.Command("tools", "Manipulate third party binaries and tools")
-	third_party_show      = third_party.Command("show", "Upload a third party binary")
-	third_party_show_file = third_party_show.Arg("file", "Upload a third party binary").
+	third_party           = app.Command("tools", "View and manipulate stored third-party binaries and tools")
+	third_party_show      = third_party.Command("show", "Shows tools in the inventory")
+	third_party_show_file = third_party_show.Arg("file", "Tool name to show").
 				String()
-	third_party_rm      = third_party.Command("rm", "Remove a third party binary")
-	third_party_rm_name = third_party_rm.Arg("name", "The name to remove").
+	third_party_rm      = third_party.Command("rm", "Remove a third-party tool")
+	third_party_rm_name = third_party_rm.Arg("name", "Tool name to remove").
 				Required().String()
-	third_party_upload           = third_party.Command("upload", "Upload a third party binary")
-	third_party_upload_tool_name = third_party_upload.Flag("name", "Name of the tool").
+	third_party_upload           = third_party.Command("upload", "Upload a third-party tool")
+	third_party_upload_tool_name = third_party_upload.Flag("name", "Name to assign to the tool").
 					Required().String()
+	third_party_upload_tool_version = third_party_upload.Flag("tool_version", "The version of the tool").String()
+
 	third_party_upload_filename = third_party_upload.
 					Flag("filename", "Name of the tool executable on the endpoint").
 					String()
@@ -53,6 +55,8 @@ var (
 )
 
 func doThirdPartyShow() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().WithRequiredFrontend().
 		LoadAndValidate()
 	if err != nil {
@@ -62,6 +66,7 @@ func doThirdPartyShow() error {
 	ctx, cancel := install_sig_handler()
 	defer cancel()
 
+	config_obj.Services = services.GenericToolServices()
 	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
 
@@ -83,7 +88,8 @@ func doThirdPartyShow() error {
 		}
 		fmt.Println(string(serialized))
 	} else {
-		tool, err := inventory_manager.ProbeToolInfo(*third_party_show_file)
+		tool, err := inventory_manager.ProbeToolInfo(
+			ctx, config_obj, *third_party_show_file, "")
 		if err != nil {
 			return fmt.Errorf("Tool not found: %w", err)
 		}
@@ -98,6 +104,8 @@ func doThirdPartyShow() error {
 }
 
 func doThirdPartyRm() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().WithRequiredFrontend().
 		LoadAndValidate()
 	if err != nil {
@@ -107,6 +115,7 @@ func doThirdPartyRm() error {
 	ctx, cancel := install_sig_handler()
 	defer cancel()
 
+	config_obj.Services = services.GenericToolServices()
 	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
 
@@ -123,6 +132,8 @@ func doThirdPartyRm() error {
 }
 
 func doThirdPartyUpload() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().WithRequiredFrontend().
 		LoadAndValidate()
 	if err != nil {
@@ -132,6 +143,7 @@ func doThirdPartyUpload() error {
 	ctx, cancel := install_sig_handler()
 	defer cancel()
 
+	config_obj.Services = services.GenericToolServices()
 	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
 
@@ -146,6 +158,7 @@ func doThirdPartyUpload() error {
 
 	tool := &artifacts_proto.Tool{
 		Name:         *third_party_upload_tool_name,
+		Version:      *third_party_upload_tool_version,
 		Filename:     filename,
 		ServeLocally: !*third_party_upload_serve_remote,
 	}
@@ -163,8 +176,12 @@ func doThirdPartyUpload() error {
 	} else {
 		// Figure out where we need to store the tool.
 		path_manager := paths.NewInventoryPathManager(config_obj, tool)
-		file_store_factory := file_store.GetFileStore(config_obj)
-		writer, err := file_store_factory.WriteFile(path_manager.Path())
+		pathspec, file_store_factory, err := path_manager.Path()
+		if err != nil {
+			return err
+		}
+
+		writer, err := file_store_factory.WriteFile(pathspec)
 		if err != nil {
 			return fmt.Errorf("Unable to write to filestore: %w ", err)
 		}
@@ -197,7 +214,7 @@ func doThirdPartyUpload() error {
 		return err
 	}
 
-	err = inventory_manager.AddTool(
+	err = inventory_manager.AddTool(ctx,
 		config_obj, tool, services.ToolOptions{
 			AdminOverride: true,
 		})
@@ -205,8 +222,10 @@ func doThirdPartyUpload() error {
 		return fmt.Errorf("Adding tool %s: %w", tool.Name, err)
 	}
 
+	// Materialize the tool if required
 	if *third_party_upload_download {
-		_, err = inventory_manager.GetToolInfo(ctx, config_obj, tool.Name)
+		_, err = inventory_manager.GetToolInfo(
+			ctx, config_obj, tool.Name, tool.Version)
 		return err
 	}
 

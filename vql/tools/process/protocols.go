@@ -33,6 +33,11 @@ func (self ProcessTrackerUpdater) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "process_tracker_updates", args)()
+
+		if tracker == nil {
+			return
+		}
 
 		// First message is a full sync message.
 		update := ordereddict.NewDict()

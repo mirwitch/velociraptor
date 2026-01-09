@@ -40,8 +40,16 @@ func (self *OrgManager) NewOrgId() string {
 	}
 }
 
+var (
+	NonceForTest = ""
+)
+
 func NewNonce() string {
+	if NonceForTest != "" {
+		return NonceForTest
+	}
+
 	nonce := make([]byte, 8)
-	rand.Read(nonce)
+	_, _ = rand.Read(nonce)
 	return base64.StdEncoding.EncodeToString(nonce)
 }

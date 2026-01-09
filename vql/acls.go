@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"www.velocidex.com/golang/velociraptor/acls"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -21,6 +22,8 @@ type ACLManager interface {
 
 type OrgACLManager interface {
 	CheckAccessInOrg(org_id string, permission ...acls.ACL_PERMISSION) (bool, error)
+
+	SwitchDefaultOrg(config_obj *config_proto.Config)
 }
 
 type PrincipalACLManager interface {
@@ -36,17 +39,23 @@ type PrincipalACLManager interface {
 func CheckAccess(scope vfilter.Scope, permissions ...acls.ACL_PERMISSION) error {
 	manager_any, pres := scope.Resolve(ACL_MANAGER_VAR)
 	if !pres {
-		return fmt.Errorf("Permission denied: %v", permissions)
+		return fmt.Errorf("%w: Permission denied: %v",
+			acls.PermissionDenied, permissions)
 	}
 
 	manager, ok := manager_any.(ACLManager)
 	if !ok {
-		return fmt.Errorf("Permission denied: %v", permissions)
+		return fmt.Errorf("%w: Permission denied: %v",
+			acls.PermissionDenied, permissions)
 	}
 
 	perm, err := manager.CheckAccess(permissions...)
-	if !perm || err != nil {
-		return fmt.Errorf("Permission denied: %v", permissions)
+	if !perm {
+		if err == nil {
+			return fmt.Errorf("%w: Permission denied: %v",
+				acls.PermissionDenied, permissions)
+		}
+		return fmt.Errorf("%w: %v", err, permissions)
 	}
 
 	return nil
@@ -69,7 +78,10 @@ func CheckAccessInOrg(scope vfilter.Scope, org_id string, permissions ...acls.AC
 	}
 
 	perm, err := manager.CheckAccessInOrg(org_id, permissions...)
-	if !perm || err != nil {
+	if !perm {
+		if err != nil {
+			return fmt.Errorf("%v: %v", err, permissions)
+		}
 		return fmt.Errorf("Permission denied: %v", permissions)
 	}
 
@@ -89,28 +101,14 @@ func CheckAccessWithArgs(scope vfilter.Scope, permissions acls.ACL_PERMISSION,
 	}
 
 	perm, err := manager.CheckAccessWithArgs(permissions, args...)
-	if !perm || err != nil {
+	if !perm {
+		if err != nil {
+			return fmt.Errorf("%v: %v", err, permissions)
+		}
 		return fmt.Errorf("Permission denied: %v", permissions)
 	}
 
 	return nil
-}
-
-func CheckFilesystemAccess(scope vfilter.Scope, accessor string) error {
-	switch accessor {
-
-	// These accessor are OK to use at any time.
-	case "data":
-		return nil
-
-		// Direct filestore access only allowed for server
-		// admins.
-	case "filestore", "fs":
-		return CheckAccess(scope, acls.SERVER_ADMIN)
-
-	default:
-		return CheckAccess(scope, acls.FILESYSTEM_READ)
-	}
 }
 
 // Get the principal that is running the query if possible.

@@ -4,8 +4,8 @@ import (
 	"context"
 	"sort"
 
+	"github.com/Velocidex/grok"
 	"github.com/Velocidex/ordereddict"
-	"github.com/vjeantet/grok"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -31,6 +31,9 @@ func (self GrokParseFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMa
 func (self GrokParseFunction) Call(
 	ctx context.Context, scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "grok", args)()
+
 	arg := &GrokParseFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {

@@ -13,6 +13,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/glob"
 	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -25,7 +27,7 @@ func (self *Indexer) searchRecentsChan(
 	principal string) (
 	chan *api_proto.ApiClient, error) {
 
-	path_manager := &paths.UserPathManager{principal}
+	path_manager := &paths.UserPathManager{Name: principal}
 	db, err := datastore.GetDB(config_obj)
 	if err != nil {
 		return nil, err
@@ -68,14 +70,28 @@ func (self *Indexer) SearchClientsChan(
 	config_obj *config_proto.Config,
 	search_term string, principal string) (chan *api_proto.ApiClient, error) {
 
+	var custom_verbs []string
+	if config_obj.Defaults != nil {
+		custom_verbs = config_obj.Defaults.IndexedClientMetadata
+	}
+
 	operator, term := splitIntoOperatorAndTerms(search_term)
 	switch operator {
-	case "label", "host", "all", "mac":
+	case "label":
+		if term == "none" {
+			return self.searchUnlabeledClientsChan(ctx, config_obj)
+		}
 		// Include the operator in these search terms
+		return self.searchClientIndexChan(ctx, scope, config_obj, search_term)
+
+	case "host", "all", "mac":
 		return self.searchClientIndexChan(ctx, scope, config_obj, search_term)
 
 	case "client":
 		return self.searchClientIndexChan(ctx, scope, config_obj, term)
+
+	case "ip":
+		return self.searchLastIPChan(ctx, scope, config_obj, term)
 
 	case "":
 		return self.searchClientIndexChan(ctx, scope, config_obj, "host:"+term)
@@ -84,6 +100,10 @@ func (self *Indexer) SearchClientsChan(
 		return self.searchRecentsChan(ctx, scope, config_obj, principal)
 
 	default:
+		if utils.InString(custom_verbs, operator) {
+			return self.searchClientIndexChan(ctx, scope, config_obj, search_term)
+		}
+
 		return nil, errors.New("Invalid search operator " + operator)
 	}
 }
@@ -126,6 +146,43 @@ func (self *Indexer) searchClientIndexChan(
 				continue
 			}
 			seen[client_id] = true
+
+			api_client, err := self.FastGetApiClient(ctx, config_obj, client_id)
+			if err != nil {
+				continue
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case output_chan <- api_client:
+			}
+		}
+	}()
+
+	return output_chan, nil
+}
+
+func (self *Indexer) searchUnlabeledClientsChan(
+	ctx context.Context,
+	config_obj *config_proto.Config) (chan *api_proto.ApiClient, error) {
+
+	output_chan := make(chan *api_proto.ApiClient)
+
+	client_info_manager, err := services.GetClientInfoManager(config_obj)
+	if err != nil {
+		return nil, err
+	}
+
+	labeler := services.GetLabeler(config_obj)
+
+	go func() {
+		defer close(output_chan)
+
+		for client_id := range client_info_manager.ListClients(ctx) {
+			if len(labeler.GetClientLabels(ctx, config_obj, client_id)) > 0 {
+				continue
+			}
 
 			api_client, err := self.FastGetApiClient(ctx, config_obj, client_id)
 			if err != nil {

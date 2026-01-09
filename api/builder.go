@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,10 +14,13 @@ import (
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
+	"www.velocidex.com/golang/velociraptor/api/authenticators"
+	api_utils "www.velocidex.com/golang/velociraptor/api/utils"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/server"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
 )
@@ -54,7 +58,8 @@ func (self *Builder) StartServer(ctx context.Context, wg *sync.WaitGroup) error 
 		return err
 	}
 
-	// Start in autocert mode, only put the GUI behind autocert if the GUI port is 443.
+	// Start in autocert mode, only put the GUI behind autocert if the
+	// GUI port is 443.
 	if self.AutocertCertCache != "" && self.config_obj.GUI != nil &&
 		self.config_obj.GUI.BindPort == 443 {
 		return self.WithAutocertGUI(ctx, wg)
@@ -62,7 +67,8 @@ func (self *Builder) StartServer(ctx context.Context, wg *sync.WaitGroup) error 
 
 	// Start in autocert mode, but only sign the frontend.
 	if self.AutocertCertCache != "" {
-		return self.withAutoCertFrontendSelfSignedGUI(ctx, wg, self.config_obj, self.server_obj)
+		return self.withAutoCertFrontendSelfSignedGUI(
+			ctx, wg, self.config_obj, self.server_obj)
 	}
 
 	// All services are sharing the same port.
@@ -94,12 +100,6 @@ func NewServerBuilder(ctx context.Context,
 	return result, nil
 }
 
-func (self *Builder) Close() {
-	if self.server_obj != nil {
-		self.server_obj.Close()
-	}
-}
-
 func (self *Builder) WithAPIServer(ctx context.Context, wg *sync.WaitGroup) error {
 	return startAPIServer(ctx, wg, self.config_obj, self.server_obj)
 }
@@ -118,7 +118,7 @@ func (self *Builder) withAutoCertFrontendSelfSignedGUI(
 	logger.Info("Autocert is enabled but GUI port is not 443, starting Frontend with autocert and GUI with self signed.")
 
 	if config_obj.Services.GuiServer && config_obj.GUI != nil {
-		mux := http.NewServeMux()
+		mux := api_utils.NewServeMux()
 
 		router, err := PrepareGUIMux(ctx, config_obj, mux)
 		if err != nil {
@@ -141,10 +141,10 @@ func (self *Builder) withAutoCertFrontendSelfSignedGUI(
 	}
 
 	// Launch a server for the frontend.
-	mux := http.NewServeMux()
+	mux := api_utils.NewServeMux()
 
 	err := server.PrepareFrontendMux(
-		config_obj, server_obj, mux)
+		config_obj, server_obj, mux.ServeMux)
 	if err != nil {
 		return err
 	}
@@ -164,10 +164,11 @@ func (self *Builder) WithAutocertGUI(
 		return errors.New("Frontend not configured")
 	}
 
-	mux := http.NewServeMux()
+	mux := api_utils.NewServeMux()
 
 	if self.config_obj.Services.FrontendServer {
-		err := server.PrepareFrontendMux(self.config_obj, self.server_obj, mux)
+		err := server.PrepareFrontendMux(
+			self.config_obj, self.server_obj, mux.ServeMux)
 		if err != nil {
 			return err
 		}
@@ -190,14 +191,15 @@ func startSharedSelfSignedFrontend(
 	wg *sync.WaitGroup,
 	config_obj *config_proto.Config,
 	server_obj *server.Server) error {
-	mux := http.NewServeMux()
+	mux := api_utils.NewServeMux()
 
 	if config_obj.Frontend == nil || config_obj.GUI == nil {
 		return errors.New("Frontend not configured")
 	}
 
 	if config_obj.Services.FrontendServer {
-		err := server.PrepareFrontendMux(config_obj, server_obj, mux)
+		err := server.PrepareFrontendMux(
+			config_obj, server_obj, mux.ServeMux)
 		if err != nil {
 			return err
 		}
@@ -210,12 +212,30 @@ func startSharedSelfSignedFrontend(
 
 	// Combine both frontend and GUI on HTTP server.
 	if config_obj.GUI.UsePlainHttp && config_obj.Frontend.UsePlainHttp {
+		server_obj.Info("Frontend and GUI both share port with plain HTTP %v",
+			config_obj.Frontend.BindPort)
+
 		return StartFrontendPlainHttp(
 			ctx, wg, config_obj, server_obj, mux)
 	}
 
-	return StartFrontendHttps(ctx, wg,
-		config_obj, server_obj, router)
+	server_obj.Info("Frontend and GUI both share port %v",
+		config_obj.Frontend.BindPort)
+
+	auther, err := authenticators.NewAuthenticator(config_obj)
+	if err != nil {
+		return err
+	}
+
+	if config_obj.Frontend.RequireClientCertificates != auther.RequireClientCerts() {
+		return errors.New(
+			"When using configurations that place the Frontend and GUI on the same port and requiring mTLS client certificates, then the GUI must also use the client certificate authenticator. Either split the frotnend and GUI on different ports or use the ClientCertificate authenticator.")
+	}
+
+	if config_obj.Frontend.RequireClientCertificates {
+		server_obj.Info("Frontend and GUI will both require mTLS client side certificates!")
+	}
+	return StartFrontendHttps(ctx, wg, config_obj, server_obj, router)
 }
 
 // Start the Frontend and GUI on different ports using different
@@ -232,7 +252,7 @@ func startSelfSignedFrontend(
 
 	// Launch a new server for the GUI.
 	if config_obj.Services.GuiServer {
-		mux := http.NewServeMux()
+		mux := api_utils.NewServeMux()
 
 		router, err := PrepareGUIMux(ctx, config_obj, mux)
 		if err != nil {
@@ -255,10 +275,12 @@ func startSelfSignedFrontend(
 	}
 
 	// Launch a server for the frontend.
-	mux := http.NewServeMux()
+	mux := api_utils.NewServeMux()
 
-	server.PrepareFrontendMux(
-		config_obj, server_obj, mux)
+	err := server.PrepareFrontendMux(config_obj, server_obj, mux.ServeMux)
+	if err != nil {
+		return err
+	}
 
 	if config_obj.Frontend.UsePlainHttp {
 		return StartFrontendPlainHttp(
@@ -310,6 +332,14 @@ func StartFrontendHttps(
 		return err
 	}
 
+	if config_obj.Frontend.RequireClientCertificates {
+		err = addClientCerts(config_obj, tls_config)
+		if err != nil {
+			return err
+		}
+		server_obj.Info("Frontend will require mTLS client side certificates!")
+	}
+
 	listenAddr := fmt.Sprintf(
 		"%s:%d",
 		config_obj.Frontend.BindAddress,
@@ -342,7 +372,9 @@ func StartFrontendHttps(
 				server.Addr, err)
 			return
 		}
-		defer closer()
+		defer func() {
+			_ = closer()
+		}()
 
 		err = server.ServeTLS(listener, "", "")
 		if err != nil && err != http.ErrServerClosed {
@@ -359,8 +391,9 @@ func StartFrontendHttps(
 		server_obj.Info("<red>Shutting down</> frontend")
 		atomic.StoreInt32(&server_obj.Healthy, 0)
 
-		time_ctx, cancel := context.WithTimeout(
-			context.Background(), 10*time.Second)
+		time_ctx, cancel := utils.WithTimeoutCause(
+			context.Background(), 10*time.Second,
+			errors.New("Deadline exceeded shuttin down frontend"))
 		defer cancel()
 
 		server.SetKeepAlivesEnabled(false)
@@ -445,7 +478,7 @@ func StartFrontendWithAutocert(
 		return errors.New("Frontend server not configured")
 	}
 
-	logger := logging.Manager.GetLogger(config_obj, &logging.GUIComponent)
+	logger := logging.GetLogger(config_obj, &logging.GUIComponent)
 
 	// Autocert directory must be unique since it is usually kept in
 	// shared storage.
@@ -458,6 +491,7 @@ func StartFrontendWithAutocert(
 			return err
 		}
 	}
+
 	certManager := autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
 		HostPolicy: autocert.HostWhitelist(config_obj.Frontend.Hostname),
@@ -468,6 +502,28 @@ func StartFrontendWithAutocert(
 	err := getTLSConfig(config_obj, tls_config)
 	if err != nil {
 		return err
+	}
+
+	auther, err := authenticators.NewAuthenticator(config_obj)
+	if err != nil {
+		return err
+	}
+
+	// The frontend can not work with client certs required, so if we
+	// are in autocert mode we need either both frontend and gui to be
+	// configured with client cert or neither.
+	if config_obj.Frontend.RequireClientCertificates != auther.RequireClientCerts() {
+		return errors.New(
+			"When using configurations that place the Frontend and GUI on the same port and requiring mTLS client certificates, then the GUI must also use the client certificate authenticator. Either split the Frotnend and GUI on different ports or use the ClientCertificate authenticator.")
+	}
+
+	if auther.RequireClientCerts() {
+		err = addClientCerts(config_obj, tls_config)
+		if err != nil {
+			return err
+		}
+
+		server_obj.Info("Frontend and GUI will require mTLS client side certificates!")
 	}
 
 	// Autocert selects its own certificates by itself
@@ -494,7 +550,7 @@ func StartFrontendWithAutocert(
 	go func() {
 		err := http.ListenAndServe(":http", certManager.HTTPHandler(nil))
 		if err != nil {
-			logger := logging.Manager.GetLogger(config_obj, &logging.GUIComponent)
+			logger := logging.GetLogger(config_obj, &logging.GUIComponent)
 			logger.Error("Failed to bind to http server: %v", err)
 		}
 	}()
@@ -516,7 +572,9 @@ func StartFrontendWithAutocert(
 				server.Addr, err)
 			return
 		}
-		defer closer()
+		defer func() {
+			_ = closer()
+		}()
 
 		err = server.ServeTLS(listener, "", "")
 		if err != nil && err != http.ErrServerClosed {
@@ -533,8 +591,9 @@ func StartFrontendWithAutocert(
 		server_obj.Info("<red>Stopping Frontend Server")
 		atomic.StoreInt32(&server_obj.Healthy, 0)
 
-		timeout_ctx, cancel := context.WithTimeout(
-			context.Background(), 10*time.Second)
+		timeout_ctx, cancel := utils.WithTimeoutCause(
+			context.Background(), 10*time.Second,
+			errors.New("Deadline exceeded shuttin down frontend"))
 		defer cancel()
 
 		server.SetKeepAlivesEnabled(false)
@@ -557,7 +616,7 @@ func StartHTTPGUI(
 		return errors.New("GUI server not configured")
 	}
 
-	logger := logging.Manager.GetLogger(config_obj, &logging.GUIComponent)
+	logger := logging.GetLogger(config_obj, &logging.GUIComponent)
 
 	listenAddr := fmt.Sprintf("%s:%d",
 		config_obj.GUI.BindAddress,
@@ -594,8 +653,9 @@ func StartHTTPGUI(
 		<-ctx.Done()
 
 		logger.Info("<red>Stopping GUI Server")
-		timeout_ctx, cancel := context.WithTimeout(
-			context.Background(), 10*time.Second)
+		timeout_ctx, cancel := utils.WithTimeoutCause(
+			context.Background(), 10*time.Second,
+			errors.New("Deadline exceeded shuttin down GUI"))
 		defer cancel()
 
 		server.SetKeepAlivesEnabled(false)
@@ -612,7 +672,7 @@ func StartSelfSignedGUI(
 	ctx context.Context,
 	wg *sync.WaitGroup,
 	config_obj *config_proto.Config, mux http.Handler) error {
-	logger := logging.Manager.GetLogger(config_obj, &logging.GUIComponent)
+	logger := logging.GetLogger(config_obj, &logging.GUIComponent)
 	if config_obj.GUI == nil {
 		return errors.New("GUI server not configured")
 	}
@@ -621,6 +681,20 @@ func StartSelfSignedGUI(
 	err := getTLSConfig(config_obj, tls_config)
 	if err != nil {
 		return err
+	}
+
+	// If we are using an authenticator that requires client side
+	// certs, add the required TLS config here.
+	auther, err := authenticators.NewAuthenticator(config_obj)
+	if err != nil {
+		return err
+	}
+
+	if auther.RequireClientCerts() {
+		err = addClientCerts(config_obj, tls_config)
+		if err != nil {
+			return err
+		}
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d",
@@ -659,8 +733,9 @@ func StartSelfSignedGUI(
 		<-ctx.Done()
 
 		logger.Info("<red>Stopping GUI Server")
-		timeout_ctx, cancel := context.WithTimeout(
-			context.Background(), 10*time.Second)
+		timeout_ctx, cancel := utils.WithTimeoutCause(
+			context.Background(), 10*time.Second,
+			errors.New("Deadline exceeded shuttin down GUI"))
 		defer cancel()
 
 		server.SetKeepAlivesEnabled(false)
@@ -680,6 +755,31 @@ func get_hostname(fe_hostname, bind_addr string) string {
 	return bind_addr
 }
 
+func addClientCerts(config_obj *config_proto.Config, in *tls.Config) error {
+	// Require the browser to use client certificates
+	client_ca := x509.NewCertPool()
+	if config_obj.Client != nil {
+		client_ca.AppendCertsFromPEM([]byte(config_obj.Client.CaCertificate))
+
+		// Also trust any of our trusted root CAs.
+		if config_obj.Client.Crypto != nil &&
+			config_obj.Client.Crypto.RootCerts != "" {
+			if !client_ca.AppendCertsFromPEM(
+				[]byte(config_obj.Client.Crypto.RootCerts)) {
+				return errors.New(
+					"Unable to parse Crypto.root_certs in the config file.")
+			}
+		}
+	}
+
+	in.ClientAuth = tls.RequireAndVerifyClientCert
+	in.ClientCAs = client_ca
+
+	in.BuildNameToCertificate()
+
+	return nil
+}
+
 // Prepare a TLS config with correct cipher choices.
 func getTLSConfig(config_obj *config_proto.Config, in *tls.Config) error {
 	certs, err := getCertificates(config_obj)
@@ -687,11 +787,21 @@ func getTLSConfig(config_obj *config_proto.Config, in *tls.Config) error {
 		return err
 	}
 
-	expected_clients := int64(10000)
-	if config_obj.Frontend != nil &&
-		config_obj.Frontend.Resources != nil &&
-		config_obj.Frontend.Resources.ExpectedClients > 0 {
-		expected_clients = config_obj.Frontend.Resources.ExpectedClients
+	expected_clients := int64(20000)
+	if config_obj.Frontend != nil {
+		if config_obj.Frontend.Resources != nil &&
+			config_obj.Frontend.Resources.ExpectedClients > 0 {
+			expected_clients = config_obj.Frontend.Resources.ExpectedClients
+		}
+	}
+
+	in.Certificates = certs
+
+	// If the user requested it we loosen the TLS restrictions to
+	// accept default protocols.
+	if config_obj.Client != nil && config_obj.Client.Crypto != nil &&
+		config_obj.Client.Crypto.AllowWeakTlsServer {
+		return nil
 	}
 
 	in.MinVersion = tls.VersionTLS13
@@ -699,7 +809,7 @@ func getTLSConfig(config_obj *config_proto.Config, in *tls.Config) error {
 		tls.CurveP521, tls.CurveP384, tls.CurveP256}
 	in.ClientSessionCache = tls.NewLRUClientSessionCache(int(expected_clients))
 	in.PreferServerCipherSuites = true
-	in.Certificates = certs
+
 	in.CipherSuites = []uint16{
 		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
@@ -708,5 +818,6 @@ func getTLSConfig(config_obj *config_proto.Config, in *tls.Config) error {
 		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
 		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
 	}
+
 	return nil
 }

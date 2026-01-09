@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"regexp"
-	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -18,7 +16,6 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/services/notebook"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -63,15 +60,40 @@ func (self *SanityChecks) CheckRootOrg(
 		}
 	}
 
+	err := self.CheckForLockdown(ctx, config_obj)
+	if err != nil {
+		return err
+	}
+
+	err = self.CheckFrontendSettings(config_obj)
+	if err != nil {
+		return err
+	}
+
+	err = self.CheckDatastoreSettings(config_obj)
+	if err != nil {
+		return err
+	}
+
+	err = self.CheckSecuritySettings(config_obj)
+	if err != nil {
+		return err
+	}
+
+	err = self.CheckAPISettings(config_obj)
+	if err != nil {
+		return err
+	}
+
 	// Make sure our internal VelociraptorServer service account is
-	// properly created.
-	if config_obj.Client != nil && config_obj.Client.PinnedServerName != "" {
-		service_account_name := config_obj.Client.PinnedServerName
-		err := services.GrantRoles(
-			config_obj, service_account_name, []string{"administrator"})
-		if err != nil {
-			return err
-		}
+	// properly created. Default accounts are created with org admin
+	// so they can add new orgs as required.
+	service_account_name := utils.GetSuperuserName(config_obj)
+	err = services.GrantRoles(
+		config_obj, service_account_name,
+		[]string{"administrator", "org_admin"})
+	if err != nil {
+		return err
 	}
 
 	if config_obj.Frontend != nil {
@@ -108,6 +130,7 @@ func (self *SanityChecks) CheckRootOrg(
 
 func (self *SanityChecks) Check(
 	ctx context.Context, config_obj *config_proto.Config) error {
+
 	if utils.IsRootOrg(config_obj.OrgId) {
 		err := self.CheckRootOrg(ctx, config_obj)
 		if err != nil {
@@ -115,27 +138,7 @@ func (self *SanityChecks) Check(
 		}
 	}
 
-	// Reindex all the notebooks.
-	notebooks, err := notebook.GetAllNotebooks(config_obj)
-	if err != nil {
-		return err
-	}
-
-	notebook_manager, err := services.GetNotebookManager(config_obj)
-	if err != nil {
-		return err
-	}
-	for _, notebook := range notebooks {
-		if !strings.HasPrefix(notebook.NotebookId, "N.H.") &&
-			!strings.HasPrefix(notebook.NotebookId, "N.F.") {
-			err = notebook_manager.UpdateShareIndex(notebook)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	err = configServerMetadata(ctx, config_obj)
+	err := configServerMetadata(ctx, config_obj)
 	if err != nil {
 		return err
 	}
@@ -159,11 +162,7 @@ func configServerMetadata(
 	}
 
 	result := &api_proto.ClientMetadata{}
-	err = db.GetSubject(config_obj, client_path_manager.Metadata(), result)
-	if errors.Is(err, os.ErrNotExist) {
-		// Metadata not set, start with empty set.
-		err = nil
-	}
+	_ = db.GetSubject(config_obj, client_path_manager.Metadata(), result)
 
 	is_set := func(field string) bool {
 		for _, item := range result.Items {
@@ -211,7 +210,8 @@ func checkForServerUpgrade(
 		return errors.New("config_obj.Version not configured")
 	}
 
-	if utils.CompareVersions(state.Version, config_obj.Version.Version) < 0 {
+	if utils.CompareVersions("velociraptor",
+		state.Version, config_obj.Version.Version) < 0 {
 		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
 		logger.Info("Server upgrade detected %v -> %v... running upgrades.",
 			state.Version, config_obj.Version.Version)
@@ -247,7 +247,7 @@ func checkForServerUpgrade(
 		}
 
 		for _, name := range names {
-			artifact, pres := repository.Get(config_obj, name)
+			artifact, pres := repository.Get(ctx, config_obj, name)
 			if !pres {
 				continue
 			}
@@ -259,15 +259,20 @@ func checkForServerUpgrade(
 					continue
 				}
 
-				_, pres := seen[tool_definition.Name]
+				key := tool_definition.Name
+				if tool_definition.Version != "" {
+					key = tool_definition.Name + ":" + tool_definition.Version
+				}
+				_, pres := seen[key]
 				if !pres {
-					seen[tool_definition.Name] = true
+					seen[key] = true
 
 					// If the existing tool definition was overridden
 					// by the admin do not alter it.
-					tool, err := inventory.ProbeToolInfo(tool_definition.Name)
+					tool, err := inventory.ProbeToolInfo(
+						ctx, config_obj, tool_definition.Name, tool_definition.Version)
 					if err == nil && tool.AdminOverride {
-						logger.Info("<red>Skipping update</> of tool <green>%v</> because an admin manually overrode its definition.",
+						logger.Info("<yellow>Skipping update</> of tool <green>%v</> because an admin manually overrode its definition.",
 							tool_definition.Name)
 						continue
 					}
@@ -275,7 +280,7 @@ func checkForServerUpgrade(
 					// Log that the tool is upgraded.
 					logger.WithFields(logrus.Fields{
 						"Tool": tool_definition,
-					}).Info("Upgrading tool <red>" + tool_definition.Name)
+					}).Info("Upgrading tool <green>" + key)
 
 					tool_definition = proto.Clone(
 						tool_definition).(*artifacts_proto.Tool)
@@ -284,10 +289,11 @@ func checkForServerUpgrade(
 					// when the tool is used next.
 					tool_definition.Hash = ""
 
-					err = inventory.AddTool(
+					err = inventory.AddTool(ctx,
 						config_obj, tool_definition,
 						services.ToolOptions{
-							Upgrade: true,
+							Upgrade:            true,
+							ArtifactDefinition: true,
 						})
 					if err != nil {
 						// Errors are not fatal during upgrade.

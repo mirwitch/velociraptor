@@ -1,8 +1,15 @@
+import _ from 'lodash';
+import hex2a from "./utils";
+import api from '../core/api-service.jsx';
+
+import React from 'react';
 import Alert from 'react-bootstrap/Alert';
 import humanizeDuration from "humanize-duration";
 
+import automated from "./jp.json";
+
 const Japanese = {
-    SEARCH_CLIENTS: "クライアント検索",
+    "SEARCH_CLIENTS": "クライアント検索",
     "Quarantine description": (<>
           <p>このホストを隔離しようとしています。</p>
           <p>
@@ -93,6 +100,10 @@ const Japanese = {
     },
     "Create a new artifact": "新規アーティファクトを作成する",
     "Save": "保存",
+    "Search": "検索",
+    "Toggle Main Menu": "メインメニューの切り替え",
+    "Main Menu": "メインメニュー",
+    "Welcome": "いらっしゃいませ",
 
     // Keyboard navigation.
     "Global hotkeys": "グローバルホットキー",
@@ -168,8 +179,7 @@ const Japanese = {
     "Permanently delete collection": "コレクションを永久に削除する",
     "ArtifactDeletionDialog": (session_id, artifacts, total_bytes, total_rows)=>
     <>
-      アーティファクトコレクションを永久に削除しようとしています。
-      <b>{session_id}</b>.
+      アーティファクトコレクションを永久に削除しようとしています。<b>{session_id}</b>.
       <br/>
       コレクションのアーティファクト： <b className="wrapped-text">
          {artifacts}
@@ -237,7 +247,7 @@ const Japanese = {
     "Max Execution Time in Seconds":"最大実行時間(秒)",
     "Max Idle Time in Seconds":"最大アイドル時間(秒)",
     "If set collection will be terminated after this many seconds with no progress.":"設定された場合、収集はこの秒数後に何も進行していない状態で終了されます。",
-    "Max Mb Uploaded":"アップロード可能な最大Mb",
+    "Max bytes Uploaded":"アップロード可能な最大Mb",
     "Collection did not upload files":"コレクションがファイルをアップロードしていない",
 
     "Create Offline collector: Select artifacts to collect":"オフライン: 収集するアーティファクトを選択する",
@@ -364,9 +374,9 @@ const Japanese = {
     クライアントはそのツールを自分のディスクにキャッシュし、次に必要になったときにハッシュを比較します。
     ツールは、ハッシュが変更された場合のみダウンロードされます。
     </>,
-    "ServedFromURL": (base_path, url)=>
+    "ServedFromURL": (url)=>
     <>
-      クライアントは必要に応じて、<a href={base_path + url}>{url}</a> から直接ツールを取得します。
+      クライアントは必要に応じて、<a href={api.href(url)}>{url}</a> から直接ツールを取得します。
       もしハッシュが期待されるハッシュと一致しない場合、クライアントはそのファイルを拒否することに注意してください。
     </>,
     "ServedFromGithub": (github_project, github_asset_regex)=>
@@ -500,14 +510,14 @@ const Japanese = {
           return <>
                    In {humanizeDuration(difference, {
                        round: true,
-                       language: "jp",
+                       language: "ja",
                    })}
                  </>;
       }
       return <>
                {humanizeDuration(difference, {
                    round: true,
-                   language: "jp",
+                   language: "ja",
                })} 前
              </>;
     },
@@ -551,8 +561,6 @@ const Japanese = {
     "vfs_path":"VFSパス",
     "file_size":"ファイルサイズ",
     "uploaded_size":"アップロードサイズ",
-    "TablePagination": (from, to, size)=>
-    <>{ size }単位で{ from }から{ to }まで表示している</>,
 
     "Select a language":"言語を選択する",
     "Japanese": "日本語",
@@ -588,6 +596,59 @@ const Japanese = {
     "Show client monitoring tables":"クライアント監視テーブルの表示",
     "Urgent": "急",
     "Skip queues and run query urgently": "キューをスキップしてクエリを緊急に実行する",
+
+    // Below need verification
+    "Role_administrator" : "サーバー管理者",
+     "Role_org_admin" : "組織管理者",
+     "Role_reader" : "読み取り専用ユーザー",
+     "Role_analyst" : "アナリスト",
+     "Role_investigator" : "捜査官",
+     "Role_artifact_writer" : "アーティファクト ライター",
+     "Role_api" : "読み取り専用 API クライアント",
+
+     "Perm_ANY_QUERY": "任意のクエリ",
+     "Perm_PUBISH": "公開",
+     "Perm_READ_RESULTS": "結果の読み取り",
+     "Perm_LABEL_CLIENT": "ラベル クライアント",
+     "Perm_COLLECT_CLIENT": "収集クライアント",
+     "Perm_START_HUNT": "ハント開始",
+     "Perm_COLLECT_SERVER": "収集サーバー",
+     "Perm_ARTIFACT_WRITER": "アーティファクトライター",
+     "Perm_SERVER_ARTIFACT_WRITER": "サーバー アーティファクト ライター",
+     "Perm_EXECVE" : "EXECVE",
+     "Perm_NOTEBOOK_EDITOR": "ノートブックエディタ",
+     "Perm_SERVER_ADMIN": "サーバー管理者",
+     "Perm_ORG_ADMIN": "組織管理者",
+     "Perm_IMPERSONATION": "なりすまし",
+     "Perm_FILESYSTEM_READ": "ファイルシステムの読み取り",
+     "Perm_FILESYSTEM_WRITE": "ファイルシステム書き込み",
+     "Perm_MACHINE_STATE": "マシンの状態",
+     "Perm_PREPARE_RESULTS": "結果の準備",
+     "Perm_DATASTORE_ACCESS": "データストアアクセス",
+
+     "ToolPerm_ANY_QUERY": "すべてのクエリを発行します ",
+     "ToolPerm_PUBISH": "サーバー側のキューにイベントを発行します (通常は必要ありません)",
+     "ToolPerm_READ_RESULTS": "すでに実行されているハント、フロー、またはノートブックから結果を読み取る",
+     "ToolPerm_LABEL_CLIENT": "クライアントのラベルとメタデータを操作できます",
+     "ToolPerm_COLLECT_CLIENT": "クライアントでの新しいコレクションのスケジュールまたはキャンセル",
+     "ToolPerm_START_HUNT": "新しいハントを開始",
+     "ToolPerm_COLLECT_SERVER": "Velociraptor サーバーで新しいアーティファクト コレクションをスケジュールする",
+     "ToolPerm_ARTIFACT_WRITER": "サーバー上で実行されるカスタム アーティファクトを追加または編集する",
+     "ToolPerm_SERVER_ARTIFACT_WRITER": "サーバー上で実行されるカスタム アーティファクトを追加または編集する",
+     "ToolPerm_EXECVE": "クライアントでの任意のコマンドの実行を許可",
+     "ToolPerm_NOTEBOOK_EDITOR": "ノートブックとセルの変更を許可",
+     "ToolPerm_SERVER_ADMIN": "サーバー構成の管理を許可",
+     "ToolPerm_ORG_ADMIN": "組織の管理を許可",
+     "ToolPerm_IMPERSONATION": "ユーザーが query() プラグインに別のユーザー名を指定できるようにします",
+     "ToolPerm_FILESYSTEM_READ": "ファイルシステムから任意のファイルを読み取ることができます",
+     "ToolPerm_FILESYSTEM_WRITE": "ファイルシステムにファイルを作成することを許可",
+     "ToolPerm_MACHINE_STATE": "マシンから状態情報を収集することが許可されています (例: pslist())",
+     "ToolPerm_PREPARE_RESULTS": "zip ファイルの作成を許可",
+     "ToolPerm_DATASTORE_ACCESS": "生データストアへのアクセスを許可",
 };
+
+_.each(automated, (v, k)=>{
+    Japanese[hex2a(k)] = v;
+});
 
 export default Japanese;

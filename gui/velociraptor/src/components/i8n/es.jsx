@@ -1,8 +1,14 @@
+import _ from 'lodash';
+import hex2a from "./utils";
+import React from 'react';
 import Alert from 'react-bootstrap/Alert';
 import humanizeDuration from "humanize-duration";
+import api from '../core/api-service.jsx';
+
+import automated from "./es.json";
 
 const Spanish = {
-    SEARCH_CLIENTS: "Buscar Clientes",
+    "SEARCH_CLIENTS": "Buscar Clientes",
     "Quarantine description": (<>
           <p>Está a punto de poner en cuarentena este host.</p>
           <p>
@@ -95,6 +101,10 @@ const Spanish = {
     },
     "Create a new artifact": "Crear un nuevo artefacto",
     "Save": "Guardar",
+    "Search": "Buscar",
+    "Toggle Main Menu": "Alternar menú principal",
+    "Main Menu": "Menú principal",
+    "Welcome": "Bienvenido",
 
     // Keyboard navigation.
     "Global hotkeys": "Teclas de acceso directo globales",
@@ -170,8 +180,8 @@ const Spanish = {
     "Permanently delete collection": "Eliminar colección de forma permanente",
     "ArtifactDeletionDialog": (session_id, artifacts, total_bytes, total_rows)=>
     <>
-      Está a punto de eliminar de forma permanente la colección de artefactos
-      <b>{session_id}</b>.
+      Está a punto de eliminar de forma permanente la colección de
+      artefactos <b>{session_id}</b>.
       <br/>
       Esta colección comprende los artefactos <b className="wrapped-text">
          {artifacts}
@@ -371,19 +381,19 @@ const Spanish = {
     la próxima vez si es necesario. Las herramientas solo se descargarán si su
     hash ha cambiado.
     </>,
-    "ServedFromURL": (base_path, url)=>
+    "ServedFromURL": (url)=>
     <>
-    Los hosts descargarán la herramienta directamente de
-    <a href={base_path + url}>{url}</a> si es
+    Los hosts descargarán la herramienta directamente
+    de <a href={api.href(url)}>{url}</a> si es
     necesario. Tenga en cuenta que si el hash no coincide con el
     hash esperado, los hosts rechazarán el archivo.
     </>,
     "ServedFromGithub": (github_project, github_asset_regex)=>
     <>
     La URL de la herramienta será actualizada por
-    GitHub como la última versión del proyecto
-    <b>{github_project}</b>  que coincida con
-    <b>{github_asset_regex}</b>
+    GitHub como la última versión del
+    proyecto <b>{github_project}</b> que coincida
+    con <b>{github_asset_regex}</b>
     </>,
     "PlaceHolder":
     <>
@@ -491,10 +501,13 @@ const Spanish = {
     "Theme":"Tema",
     "Select a theme":"Seleccionar un tema",
     "Default Velociraptor":"Velociraptor predeterminado",
+    "Velociraptor Classic (light)": "Velociraptor Clásico (claro)",
     "Velociraptor (light)":"Velociraptor (claro)",
     "Ncurses (light)":"Ncurses (claro)",
+    "Ncurses (dark)":"Ncurses (oscuro)",
     "Velociraptor (dark)":"Velociraptor (oscuro)",
     "Github dimmed (dark)":"Github atenuado (oscuro)",
+    "Github (light)":"Github (claro)",
     "Cool Gray (dark)":"Gris frío (oscuro)",
     "Strawberry Milkshake (light)":"Batido de Fresa (claro)",
     "Downloads Password":"Contraseña de descarga",
@@ -570,8 +583,6 @@ const Spanish = {
     "vfs_path":"Ruta VFS",
     "file_size":"Tamaño del archivo",
     "uploaded_size":"Tamaño de la subida",
-    "TablePagination": (from, to, size)=>
-    <>Mostrar línea { from } a { to } de { size }</>,
 
     "Select a language":"Seleccione un idioma",
     "English":"Inglés",
@@ -607,6 +618,59 @@ const Spanish = {
     "Show client monitoring tables":"Mostrar tablas de monitorización de hosts",
     "Urgent": "Urgente",
     "Skip queues and run query urgently": "Omita las colas y ejecute la consulta con urgencia",
+
+    // Below need verification
+    "Role_administrator": "Administrador del servidor",
+     "Role_org_admin": "Administrador de la organización",
+     "Role_reader": "Usuario de solo lectura",
+     "Role_analyst": "Analista",
+     "Role_investigator": "Investigador",
+     "Role_artifact_writer": "Escritor de artefactos",
+     "Role_api": "Cliente API de solo lectura",
+
+     "Perm_ANY_QUERY" : "Cualquier consulta",
+     "Perm_PUBISH": "Publicar",
+     "Perm_READ_RESULTS": "Leer resultados",
+     "Perm_LABEL_CLIENT" : "Etiquetar Clientes",
+     "Perm_COLLECT_CLIENT": "Recopilar cliente",
+     "Perm_START_HUNT": "Iniciar búsqueda",
+     "Perm_COLLECT_SERVER": "Recopilar servidor",
+     "Perm_ARTIFACT_WRITER": "Escritor de artefactos",
+     "Perm_SERVER_ARTIFACT_WRITER": "Escritor de artefactos del servidor",
+     "Perm_EXECVE" : "EXECVE",
+     "Perm_NOTEBOOK_EDITOR": "Editor de cuadernos",
+     "Perm_SERVER_ADMIN": "Administrador del servidor",
+     "Perm_ORG_ADMIN": "Administrador de la organización",
+     "Perm_IMPERSONATION" : "Suplantación de identidad",
+     "Perm_FILESYSTEM_READ": "Lectura del sistema de archivos",
+     "Perm_FILESYSTEM_WRITE": "Escritura del sistema de archivos",
+     "Perm_MACHINE_STATE": "Estado de la máquina",
+     "Perm_PREPARE_RESULTS": "Preparar resultados",
+     "Perm_DATASTORE_ACCESS": "Acceso al almacén de datos",
+
+     "ToolPerm_ANY_QUERY": "Emitir cualquier consulta",
+     "ToolPerm_PUBISH": "Publicar eventos en las colas del lado del servidor (normalmente no es necesario)",
+     "ToolPerm_READ_RESULTS": "Leer resultados de búsquedas, flujos o cuadernos que ya se hayan ejecutado",
+     "ToolPerm_LABEL_CLIENT": "Puede manipular etiquetas y metadatos de clientes",
+     "ToolPerm_COLLECT_CLIENT": "Programar o cancelar nuevas colecciones en clientes",
+     "ToolPerm_START_HUNT": "Iniciar una nueva búsqueda",
+     "ToolPerm_COLLECT_SERVER": "Programar nuevas colecciones de artefactos en servidores Velociraptor",
+     "ToolPerm_ARTIFACT_WRITER": "Agregar o editar artefactos personalizados que se ejecutan en el servidor",
+     "ToolPerm_SERVER_ARTIFACT_WRITER": "Agregar o editar artefactos personalizados que se ejecutan en el servidor",
+     "ToolPerm_EXECVE": "Permitido ejecutar comandos arbitrarios en clientes",
+     "ToolPerm_NOTEBOOK_EDITOR": "Permitido cambiar cuadernos y celdas",
+     "ToolPerm_SERVER_ADMIN": "Permitido para administrar la configuración del servidor",
+     "ToolPerm_ORG_ADMIN": "Permitido para administrar organizaciones",
+     "ToolPerm_IMPERSONATION": "Permite al usuario especificar un nombre de usuario diferente para el complemento de consulta()",
+     "ToolPerm_FILESYSTEM_READ": "Permitido leer archivos arbitrarios del sistema de archivos",
+     "ToolPerm_FILESYSTEM_WRITE": "Permitido para crear archivos en el sistema de archivos",
+     "ToolPerm_MACHINE_STATE": "Permitido recopilar información de estado de las máquinas (por ejemplo, pslist())",
+     "ToolPerm_PREPARE_RESULTS": "Permitido para crear archivos zip",
+     "ToolPerm_DATASTORE_ACCESS": "Acceso permitido al almacén de datos sin procesar",
 };
+
+_.each(automated, (v, k)=>{
+    Spanish[hex2a(k)] = v;
+});
 
 export default Spanish;

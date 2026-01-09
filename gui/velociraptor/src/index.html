@@ -12,11 +12,24 @@
       };
       window.CsrfToken = "{{.CsrfToken}}";
       window.base_path = "{{.BasePath}}";
+      /// Support development
+      if (window.base_path.substring(0,2) === "\{\{") {
+          window.base_path = "/";
+          window.globals.base_path = window.base_path;
+      }
+
+      // Set the OrgId from the URL if possible.
+      let url = new URL(window.location.href)
+      if (url.searchParams.get("org_id")) {
+          window.globals.OrgId = url.searchParams.get("org_id");
+      }
+
     </script>
     <script type="text/javascript">
       // Used to launch the application in an error state - allows the
       // user to interact with the react web app without being logged in.
       window.ErrorState = {{ if .ErrState }}{{.ErrState}}{{else}}[]{{end}};
+
     </script>
 
     <title>Velociraptor Response and Monitoring</title>
@@ -24,6 +37,7 @@
   <body id="body" class="{{.UserTheme}}">
     <noscript>You need to enable JavaScript to run this app.</noscript>
     <div id="root"></div>
+    <!-- Note: magefile.go will mutate the vite geneated code to rebase on base_path -->
     <script type="module" src="./index.jsx"></script>
   </body>
 </html>

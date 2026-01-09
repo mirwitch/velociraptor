@@ -1,8 +1,14 @@
+import _ from 'lodash';
+import hex2a from "./utils";
+import React from 'react';
 import Alert from 'react-bootstrap/Alert';
 import humanizeDuration from "humanize-duration";
+import api from '../core/api-service.jsx';
+
+import automated from "./de.json";
 
 const Deutsch = {
-    SEARCH_CLIENTS: "Clients suchen",
+    "SEARCH_CLIENTS": "Clients suchen",
     "Quarantine description": (
         <>
           <p>Sie sind dabei, diesen Host unter Quarantäne zu stellen.</p>
@@ -94,6 +100,10 @@ const Deutsch = {
     },
     "Create a new artifact": "Erstellen eines neuen Artefakt",
     "Save": "Speichern",
+    "Search": "Suchen",
+    "Toggle Main Menu": "Hauptmenü umschalten",
+    "Main Menu": "Hauptmenü",
+    "Welcome": "Willkommen",
 
     // Keyboard navigation.
     "Global hotkeys": "Globale Hotkeys",
@@ -169,8 +179,8 @@ const Deutsch = {
     "Permanently delete collection": "Sammlung endgültig löschen",
     "ArtifactDeletionDialog": (session_id, artifacts, total_bytes, total_rows)=>
     <>
-      Sie sind im Begriff, die Artefaktsammlung endgültig zu löschen
-      <b>{session_id}</b>.
+      Sie sind im Begriff, die Artefaktsammlung endgültig zu
+      löschen <b>{session_id}</b>.
       <br/>
       Diese Sammlung hatte die Artefakte <b className="wrapped-text">
          {artifacts}
@@ -242,7 +252,7 @@ const Deutsch = {
     "Max Execution Time in Seconds":"Max. Ausführungszeit in Sekunden",
     "Max Idle Time in Seconds":"Maximale Leerlaufzeit in Sekunden",
     "If set collection will be terminated after this many seconds with no progress.":"Wenn die Satzsammlung nach so vielen Sekunden ohne Fortschritt beendet wird.",
-    "Max Mb Uploaded":"Max. MB hochgeladen",
+    "Max bytes Uploaded":"Max. MB hochgeladen",
     "Collection did not upload files":"Sammlung hat keine Dateien hochgeladen",
 
     "Create Offline collector: Select artifacts to collect":"Offline-Collector erstellen: Zu sammelnde Artefakte auswählen",
@@ -371,17 +381,18 @@ const Deutsch = {
     benötigt wird. Die Tools werden nur heruntergeladen, wenn sich ihr
     Hash geändert hat.
     </>,
-    "ServedFromURL": (base_path, url)=>
+    "ServedFromURL": (url)=>
     <>
-    Die Clients rufen das Tool bei Bedarf direkt von
-    <a href={base_path + url}>{url}</a> ab. Wenn der Hashwert nicht mit dem
+    Die Clients rufen das Tool bei Bedarf direkt
+    von <a href={api.href(url)}>{url}</a> ab. Wenn der Hashwert nicht mit dem
     erwarteten Hashwert übereinstimmt, weisen die Clients die Datei zurück.
     </>,
     "ServedFromGithub": (github_project, github_asset_regex)=>
     <>
-    Die Tool-URL wird von GitHub als die neueste Version des Projekts
-    <b>{github_project}</b>, die mit <b>{github_asset_regex}</b>
-    übereinstimmt, aktualisiert.
+    Die Tool-URL wird von GitHub als die neueste Version des
+    Projekts <b>{github_project}</b>, die
+    mit <b>{github_asset_regex}</b> übereinstimmt,
+    aktualisiert.
     </>,
     "PlaceHolder":
     <>
@@ -490,9 +501,12 @@ const Deutsch = {
     "Theme":"Theme",
     "Select a theme":"Wählen Sie ein Theme aus",
     "Default Velociraptor":"Standard-Velociraptor",
+    "Velociraptor Classic (light)": "Velociraptor-Klassiker (hell)",
     "Velociraptor (light)":"Velociraptor (hell)",
     "Velociraptor (dark)":"Velociraptor (dunkel)",
     "Github dimmed (dark)":"Github gedimmt (dunkel)",
+    "Github (light)": "Github (hell)",
+    "Ncurses (dark)": "Ncurses (dunkel)",
     "Ncurses (light)":"Ncurses (hell)",
     "Cool Gray (dark)":"Cool Grey (dunkel)",
     "Strawberry Milkshake (light)":"Erdbeer-Milchshake (hell)",
@@ -569,9 +583,6 @@ const Deutsch = {
     "vfs_path":"VFS Pfad",
     "file_size":"Dateigröße",
     "uploaded_size":"Hochgeladene Größe",
-    "TablePagination": (from, to, size)=>
-    <>Zeigt Zeile { from } bis { to } von { size }</>,
-
     "Select a language":"Sprache auswählen",
     "English":"Englisch",
     "Deutsch":"Deutsch",
@@ -611,6 +622,61 @@ const Deutsch = {
     "Delete Events": "Ereignisse löschen",
     "Urgent": "Dringend",
     "Skip queues and run query urgently": "Warteschlangen überspringen und Abfrage dringend ausführen",
+
+    // Below need verification
+    "Role_administrator": "Server-Administrator",
+     "Role_org_admin": "Organisationsadministrator",
+     "Role_reader": "Nur-Lese-Benutzer",
+     "Role_analyst": "Analyst",
+     "Role_investigator": "Ermittler",
+     "Role_artifact_writer": "Artefaktschreiber",
+     "Role_api": "Schreibgeschützter API-Client",
+
+     "Perm_ANY_QUERY": "Jede Abfrage",
+     "Perm_PUBISH": "Veröffentlichen",
+     "Perm_READ_RESULTS" : "Ergebnisse lesen",
+     "Perm_LABEL_CLIENT": "Label-Clients",
+     "Perm_COLLECT_CLIENT": "Kunden sammeln",
+     "Perm_START_HUNT": "Jagd starten",
+     "Perm_COLLECT_SERVER": "Server sammeln",
+     "Perm_ARTIFACT_WRITER": "Artefaktschreiber",
+     "Perm_SERVER_ARTIFACT_WRITER": "Serverartefakt-Schreiber",
+     "Perm_EXECVE": "EXECVE",
+     "Perm_NOTEBOOK_EDITOR": "Notizbuch-Editor",
+     "Perm_SERVER_ADMIN": "Server-Admin",
+     "Perm_ORG_ADMIN": "Org-Admin",
+     "Perm_IMPERSONATION": "Identitätswechsel",
+     "Perm_FILESYSTEM_READ": "Dateisystem lesen",
+     "Perm_FILESYSTEM_WRITE": "Dateisystem schreiben",
+     "Perm_MACHINE_STATE": "Maschinenstatus",
+     "Perm_PREPARE_RESULTS": "Ergebnisse vorbereiten",
+     "Perm_DATASTORE_ACCESS": "Datenspeicherzugriff",
+
+
+     "ToolPerm_ANY_QUERY": "Jede Abfrage überhaupt ausgeben",
+     "ToolPerm_PUBISH": "Ereignisse in serverseitigen Warteschlangen veröffentlichen (normalerweise nicht erforderlich)",
+     "ToolPerm_READ_RESULTS": "Ergebnisse von bereits ausgeführten Jagden, Flows oder Notizbüchern lesen",
+     "ToolPerm_LABEL_CLIENT": "Kann Client-Labels und Metadaten manipulieren",
+     "ToolPerm_COLLECT_CLIENT": "Planen oder stornieren Sie neue Sammlungen für Kunden",
+     "ToolPerm_START_HUNT": "Neue Jagd starten",
+     "ToolPerm_COLLECT_SERVER": "Neue Artefaktsammlungen auf Velociraptor-Servern planen",
+     "ToolPerm_ARTIFACT_WRITER": "Benutzerdefinierte Artefakte hinzufügen oder bearbeiten, die auf dem Server ausgeführt werden",
+     "ToolPerm_SERVER_ARTIFACT_WRITER": "Benutzerdefinierte Artefakte hinzufügen oder bearbeiten, die auf dem Server ausgeführt werden",
+     "ToolPerm_EXECVE": "Dürfen beliebige Befehle auf Clients ausführen",
+     "ToolPerm_NOTEBOOK_EDITOR": "Erlaubt, Notizbücher und Zellen zu ändern",
+     "ToolPerm_SERVER_ADMIN": "Zur Verwaltung der Serverkonfiguration berechtigt",
+     "ToolPerm_ORG_ADMIN" : "Zur Verwaltung von Organisationen berechtigt",
+     "ToolPerm_IMPERSONATION": "Erlaubt dem Benutzer, einen anderen Benutzernamen für das query()-Plugin anzugeben",
+     "ToolPerm_FILESYSTEM_READ": "Erlaubt, beliebige Dateien aus dem Dateisystem zu lesen",
+     "ToolPerm_FILESYSTEM_WRITE": "Darf Dateien im Dateisystem erstellen",
+     "ToolPerm_MACHINE_STATE": "Erlaubt, Zustandsinformationen von Maschinen zu sammeln (z. B. pslist())",
+     "ToolPerm_PREPARE_RESULTS": "Darf ZIP-Dateien erstellen",
+     "ToolPerm_DATASTORE_ACCESS": "Zugriff auf Rohdatenspeicher erlaubt",
+
 };
+
+_.each(automated, (v, k)=>{
+    Deutsch[hex2a(k)] = v;
+});
 
 export default Deutsch;

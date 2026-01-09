@@ -10,6 +10,7 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -41,6 +42,9 @@ func (self *VirtualFileInfo) IsDir() bool {
 }
 
 func (self *VirtualFileInfo) OSPath() *OSPath {
+	if self.Path == nil {
+		return MustNewGenericOSPath("")
+	}
 	return self.Path
 }
 
@@ -167,7 +171,14 @@ type VirtualFilesystemAccessor struct {
 
 func (self VirtualFilesystemAccessor) New(scope vfilter.Scope) (
 	FileSystemAccessor, error) {
-	return VirtualFilesystemAccessor{}, nil
+	return self, nil
+}
+
+func (self VirtualFilesystemAccessor) Describe() *AccessorDescriptor {
+	return &AccessorDescriptor{
+		Name:        "virtual",
+		Description: "An accessor for virtual mapped filesystems",
+	}
 }
 
 func (self VirtualFilesystemAccessor) ParsePath(path string) (*OSPath, error) {
@@ -232,7 +243,7 @@ func (self VirtualFilesystemAccessor) OpenWithOSPath(path *OSPath) (
 	ReadSeekCloser, error) {
 	node, err := self.getNode(path)
 	if err != nil {
-		return nil, os.ErrNotExist
+		return nil, utils.NotFoundError
 	}
 
 	return VirtualReadSeekCloser{
@@ -248,7 +259,7 @@ func (self VirtualFilesystemAccessor) getNode(path *OSPath) (*directory_node, er
 			next_node := node.GetChild(c)
 			if next_node == nil {
 				return nil, fmt.Errorf("While finding %v: Can not find %v: %w",
-					path, c, os.ErrNotExist)
+					path, c, utils.NotFoundError)
 			}
 			node = next_node
 		}
@@ -284,6 +295,7 @@ func (self *VirtualFilesystemAccessor) SetVirtualFileInfo(
 
 func NewVirtualFilesystemAccessor(root_path *OSPath) *VirtualFilesystemAccessor {
 	return &VirtualFilesystemAccessor{
+		root_path: root_path,
 		root: directory_node{
 			file_info: &VirtualFileInfo{
 				Path:   root_path,

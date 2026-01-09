@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -49,93 +49,149 @@ var (
 
 // Used when we deliberately want to override a registered plugin.
 func OverridePlugin(plugin vfilter.PluginGeneratorInterface) {
+	mu.Lock()
+	defer mu.Unlock()
+
 	name := plugin.Info(nil, nil).Name
 	exportedPlugins[name] = plugin
 
-	ResetGlobalScopeCache()
+	resetGlobalScopeCache()
 }
 
 // Used when we deliberately want to override a registered function.
 func OverrideFunction(function vfilter.FunctionInterface) {
+	mu.Lock()
+	defer mu.Unlock()
+
 	name := function.Info(nil, nil).Name
 	exportedFunctions[name] = function
 
-	ResetGlobalScopeCache()
+	resetGlobalScopeCache()
 }
 
 func RegisterPlugin(plugin vfilter.PluginGeneratorInterface) {
+	mu.Lock()
+	defer mu.Unlock()
+
 	name := plugin.Info(nil, nil).Name
 	_, pres := exportedPlugins[name]
 	if pres {
-		panic("Multiple plugins defined")
+		panic(fmt.Sprintf("Multiple plugins defined: %v", name))
 	}
 
 	exportedPlugins[name] = plugin
 
-	ResetGlobalScopeCache()
+	resetGlobalScopeCache()
 }
 
 func RegisterFunction(plugin vfilter.FunctionInterface) {
+	mu.Lock()
+	defer mu.Unlock()
+
 	name := plugin.Info(nil, nil).Name
 	_, pres := exportedFunctions[name]
 	if pres {
-		panic("Multiple plugins defined")
+		panic(fmt.Sprintf("Multiple vql functions defined: %v", name))
 	}
 
 	exportedFunctions[name] = plugin
 
-	ResetGlobalScopeCache()
+	resetGlobalScopeCache()
 }
 
 func RegisterProtocol(plugin vfilter.Any) {
+	mu.Lock()
+	defer mu.Unlock()
+
 	exportedProtocolImpl = append(exportedProtocolImpl, plugin)
 
-	ResetGlobalScopeCache()
-}
-
-func GetFunction(name string) (vfilter.FunctionInterface, bool) {
-	res, pres := exportedFunctions[name]
-	return res, pres
+	resetGlobalScopeCache()
 }
 
 func EnforceVQLAllowList(
-	allowed_plugins []string, allowed_functions []string) error {
+	allowed_plugins []string, allowed_functions []string,
+	deny_plugins []string, deny_functions []string) error {
 
 	mu.Lock()
 	defer mu.Unlock()
 
 	base_scope := vfilter.NewScope()
 
-	exported_plugins := exportedPlugins
-	exportedPlugins = make(map[string]vfilter.PluginGeneratorInterface)
-	for _, plugin_name := range allowed_plugins {
-		impl, ok := exported_plugins[plugin_name]
-		if !ok {
-			// Maybe this is provided by the base scope.
-			impl, ok = base_scope.GetPlugin(plugin_name)
+	if len(allowed_plugins) > 0 {
+		new_exported_plugins := make(map[string]vfilter.PluginGeneratorInterface)
+		for _, plugin_name := range allowed_plugins {
+			impl, ok := exportedPlugins[plugin_name]
 			if !ok {
-				return fmt.Errorf("Unknown plugin %v", plugin_name)
+				// Maybe this is provided by the base scope.
+				impl, ok = base_scope.GetPlugin(plugin_name)
+				if !ok {
+					// Cant add it - just insert a stub
+					impl = NewRejectedPlugin(plugin_name)
+				}
 			}
+			new_exported_plugins[plugin_name] = impl
 		}
-		exportedPlugins[plugin_name] = impl
+
+		// Now install rejected plugins in place of all the existing
+		// plugins so we can emit the correct error message.
+		for k, v := range exportedPlugins {
+			_, pres := new_exported_plugins[k]
+			if pres {
+				continue
+			}
+
+			_, pres = v.(*UnimplementedPlugin)
+			if pres {
+				continue
+			}
+			new_exported_plugins[k] = NewRejectedPlugin(k)
+		}
+
+		exportedPlugins = new_exported_plugins
 	}
 
-	exported_functions := exportedFunctions
-	exportedFunctions = make(map[string]vfilter.FunctionInterface)
-	for _, func_name := range allowed_functions {
-		impl, ok := exported_functions[func_name]
-		if !ok {
-			// Maybe this is provided by the base scope.
-			impl, ok = base_scope.GetFunction(func_name)
+	for _, deny := range deny_plugins {
+		exportedPlugins[deny] = NewRejectedPlugin(deny)
+	}
+
+	if len(allowed_functions) > 0 {
+		new_exported_functions := make(map[string]vfilter.FunctionInterface)
+		for _, func_name := range allowed_functions {
+			impl, ok := exportedFunctions[func_name]
 			if !ok {
-				return fmt.Errorf("Unknown VQL Function %v", func_name)
+				// Maybe this is provided by the base scope.
+				impl, ok = base_scope.GetFunction(func_name)
+				if !ok {
+					impl = NewRejectedFunction(func_name)
+				}
 			}
+			new_exported_functions[func_name] = impl
 		}
-		exportedFunctions[func_name] = impl
+
+		// Now install rejected plugins in place of all the existing
+		// plugins so we can emit the correct error message.
+		for k, v := range exportedFunctions {
+			_, pres := new_exported_functions[k]
+			if pres {
+				continue
+			}
+
+			_, pres = v.(*UnimplementedFunction)
+			if pres {
+				continue
+			}
+			new_exported_functions[k] = NewRejectedFunction(k)
+		}
+
+		exportedFunctions = new_exported_functions
+	}
+
+	for _, deny := range deny_functions {
+		exportedFunctions[deny] = NewRejectedFunction(deny)
 	}
 
 	// Reset the global scope so we will be forced to recreate it.
-	globalScope = nil
+	resetGlobalScopeCache()
 
 	return nil
 }
@@ -148,19 +204,19 @@ var (
 	globalScope vfilter.Scope
 )
 
-func _makeRootScope() vfilter.Scope {
+func MakeScope() vfilter.Scope {
 	mu.Lock()
 	defer mu.Unlock()
 
+	return _makeRootScope()
+}
+
+func _makeRootScope() vfilter.Scope {
 	if globalScope == nil {
-		globalScope = MakeNewScope()
+		globalScope = _MakeNewScope()
 	}
 
 	return globalScope.NewScope()
-}
-
-func MakeScope() vfilter.Scope {
-	return _makeRootScope()
 }
 
 func GetRootScope(scope vfilter.Scope) vfilter.Scope {
@@ -177,6 +233,13 @@ func GetRootScope(scope vfilter.Scope) vfilter.Scope {
 // MakeNewScope makes a new scope from scratch. You do not need to use
 // this! use MakeScope() above which is much faster.
 func MakeNewScope() vfilter.Scope {
+	mu.Lock()
+	defer mu.Unlock()
+
+	return _MakeNewScope()
+}
+
+func _MakeNewScope() vfilter.Scope {
 	scopeCounter.Inc()
 
 	result := vfilter.NewScope()
@@ -195,9 +258,15 @@ func MakeNewScope() vfilter.Scope {
 	return result
 }
 
-// Used in tests to flush the global scope - needed **after** .
+// Used in tests to flush the global scope - needed **after**
+// overriding plugins with OverridePlugin, OverrideFunction etc.
 func ResetGlobalScopeCache() {
 	mu.Lock()
 	defer mu.Unlock()
+
+	globalScope = nil
+}
+
+func resetGlobalScopeCache() {
 	globalScope = nil
 }

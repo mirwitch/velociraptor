@@ -20,6 +20,9 @@ type CommandlineToArgvFunction struct{}
 func (self *CommandlineToArgvFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "commandline", args)()
+
 	arg := &CommandlineToArgvArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -36,7 +39,7 @@ func (self *CommandlineToArgvFunction) Call(ctx context.Context,
 		return res
 	}
 
-	return commandLineToArgv(arg.Command)
+	return CommandLineToArgv(arg.Command)
 }
 
 func (self CommandlineToArgvFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
@@ -104,7 +107,7 @@ func readNextArg(cmd string) (arg []byte, rest string) {
 // commandLineToArgv splits a command line into individual argument
 // strings, following the Windows conventions documented
 // at http://daviddeley.com/autohotkey/parameters/parameters.htm#WINARGV
-func commandLineToArgv(cmd string) []string {
+func CommandLineToArgv(cmd string) []string {
 	var args []string
 	for len(cmd) > 0 {
 		if cmd[0] == ' ' || cmd[0] == '\t' {

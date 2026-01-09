@@ -3,12 +3,14 @@ package users
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
 	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
@@ -17,24 +19,61 @@ import (
 )
 
 func (self UserManager) GetUserFromContext(ctx context.Context) (
-	*api_proto.VelociraptorUser, *config_proto.Config, error) {
+	user_record *api_proto.VelociraptorUser, org_config_obj *config_proto.Config, err error) {
 
 	grpc_user_info := GetGRPCUserInfo(self.config_obj, ctx, self.ca_pool)
-	user_record, err := self.GetUser(ctx, grpc_user_info.Name)
-	if err != nil {
-		return nil, nil, err
+
+	// If the call comes from the super user we allow it.
+	if grpc_user_info.Name == utils.GetSuperuserName(org_config_obj) {
+		user_record = &api_proto.VelociraptorUser{
+			Name: grpc_user_info.Name,
+		}
+
+	} else {
+		user_record, err = self.storage.GetUserWithHashes(ctx, grpc_user_info.Name)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		self.normalizeOrgList(ctx, user_record)
 	}
 
 	user_record.CurrentOrg = grpc_user_info.CurrentOrg
+	user_record.PasswordSalt = nil
+	user_record.PasswordHash = nil
 
-	// Fetch the appropriate config file fro the org manager.
+	// Fetch the appropriate config file from the org manager.
 	org_manager, err := services.GetOrgManager()
 	if err != nil {
 		return nil, nil, err
 	}
 
-	org_config_obj, err := org_manager.GetOrgConfig(user_record.CurrentOrg)
+	org_config_obj, err = org_manager.GetOrgConfig(user_record.CurrentOrg)
 	return user_record, org_config_obj, err
+}
+
+// Used for direct HTTP connections. User context was added by the
+// authenticator.
+func (self UserManager) GetUserFromHTTPContext(ctx context.Context) (
+	user_record *api_proto.VelociraptorUser, err error) {
+
+	user_info := &api_proto.VelociraptorUser{}
+	serialized_any := ctx.Value(constants.GRPC_USER_CONTEXT)
+	if serialized_any == nil {
+		return nil, errors.New("Unauthenticated request")
+	}
+
+	serialized, ok := serialized_any.(string)
+	if !ok {
+		return nil, errors.New("Unauthenticated request")
+	}
+
+	err = json.Unmarshal([]byte(serialized), user_info)
+	if err != nil {
+		return nil, errors.New("Unauthenticated request")
+	}
+
+	return user_info, err
 }
 
 // GetGRPCUserInfo: Extracts user information from GRPC context.
@@ -69,12 +108,14 @@ func GetGRPCUserInfo(
 				// convert web side authentication to a valid
 				// user name which it may pass in the call
 				// context.
-				if result.Name == config_obj.API.PinnedGwName {
+				if result.Name == utils.GetGatewayName(config_obj) {
 					md, ok := metadata.FromIncomingContext(ctx)
 					if ok {
 						userinfo := md.Get("USER")
 						if len(userinfo) > 0 {
-							data := []byte(userinfo[0])
+							// gRPC metadata can only contain ASCII so
+							// we recover the UTF8 string from there.
+							data := []byte(utils.UnQuote(userinfo[0]))
 							err := json.Unmarshal(data, result)
 							if err != nil {
 								logger := logging.GetLogger(config_obj,

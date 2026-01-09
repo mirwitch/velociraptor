@@ -16,7 +16,6 @@ import (
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/services/client_monitoring"
-	"www.velocidex.com/golang/velociraptor/services/labels"
 	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 
@@ -62,7 +61,7 @@ func (self *ClientMonitoringTestSuite) SetupTest() {
 	self.ConfigObj = self.TestSuite.LoadConfig()
 	self.ConfigObj.Services.ClientMonitoring = true
 
-	self.LoadArtifacts(mock_definitions)
+	self.LoadArtifactsIntoConfig(mock_definitions)
 
 	self.TestSuite.SetupTest()
 	self.client_id = "C.12312"
@@ -78,7 +77,9 @@ name: TestArtifact
 sources:
 - query:
     SELECT * FROM info()
-`, true, false)
+`, services.ArtifactOptions{
+		ValidateArtifact:  true,
+		ArtifactIsBuiltIn: false})
 
 	assert.NoError(self.T(), err)
 	_, err = repository.LoadYaml(`
@@ -86,18 +87,30 @@ name: SomethingElse
 sources:
 - query:
     SELECT * FROM info()
-`, true, false)
+`, services.ArtifactOptions{
+		ValidateArtifact:  true,
+		ArtifactIsBuiltIn: false})
+
 	assert.NoError(self.T(), err)
 
+	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	client_info_manager.Set(self.Ctx, &services.ClientInfo{
+		ClientInfo: &actions_proto.ClientInfo{
+			ClientId: self.client_id,
+		},
+	})
 }
 
 // Check that monitoring tables eventually follow when artifact
 // definitions are updated.
 func (self *ClientMonitoringTestSuite) TestUpdatingArtifacts() {
-	current_clock := &utils.IncClock{NowTime: 10}
+	closer := utils.MockTime(&utils.IncClock{NowTime: 10})
+	defer closer()
 
 	manager, err := services.ClientEventManager(self.ConfigObj)
-	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
+	assert.NoError(self.T(), err)
 
 	err = manager.SetClientMonitoringState(
 		context.Background(), self.ConfigObj, "",
@@ -118,7 +131,9 @@ func (self *ClientMonitoringTestSuite) TestUpdatingArtifacts() {
 	repository_manager, err := services.GetRepositoryManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	_, err = repository_manager.SetArtifactFile(self.ConfigObj, "", `
+	ctx := self.Ctx
+	_, err = repository_manager.SetArtifactFile(ctx,
+		self.ConfigObj, "", `
 name: TestArtifact
 sources:
 - query:
@@ -147,7 +162,8 @@ sources:
 	table_version = new_table_message.UpdateEventTable.Version
 
 	// Now delete the artifact completely
-	repository_manager.DeleteArtifactFile(self.ConfigObj, "", "TestArtifact")
+	repository_manager.DeleteArtifactFile(
+		ctx, self.ConfigObj, "", "TestArtifact")
 
 	// The table should magically be updated!
 	table_json := ""
@@ -170,10 +186,11 @@ sources:
 }
 
 func (self *ClientMonitoringTestSuite) TestUpdatingClientTable() {
-	current_clock := &utils.IncClock{NowTime: 10}
+	closer := utils.MockTime(&utils.IncClock{NowTime: 10})
+	defer closer()
 
 	repository_manager, _ := services.GetRepositoryManager(self.ConfigObj)
-	repository_manager.SetArtifactFile(self.ConfigObj, "", `
+	repository_manager.SetArtifactFile(self.Ctx, self.ConfigObj, "", `
 name: TestArtifact
 sources:
 - query:
@@ -182,8 +199,6 @@ sources:
 
 	manager, err := services.ClientEventManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
-
-	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	// Set the initial table.
 	err = manager.SetClientMonitoringState(
@@ -219,10 +234,11 @@ sources:
 }
 
 func (self *ClientMonitoringTestSuite) TestUpdatingClientTableMultiFrontend() {
-	current_clock := &utils.IncClock{NowTime: 10}
+	closer := utils.MockTime(&utils.IncClock{NowTime: 10})
+	defer closer()
 
 	repository_manager, _ := services.GetRepositoryManager(self.ConfigObj)
-	repository_manager.SetArtifactFile(self.ConfigObj, "", `
+	repository_manager.SetArtifactFile(self.Ctx, self.ConfigObj, "", `
 name: TestArtifact
 sources:
 - query:
@@ -231,8 +247,6 @@ sources:
 
 	manager1, err := services.ClientEventManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
-
-	manager1.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	// Set the initial table.
 	err = manager1.SetClientMonitoringState(
@@ -252,8 +266,6 @@ sources:
 	manager2, err := client_monitoring.NewClientMonitoringService(
 		self.Ctx, self.Wg, self.ConfigObj)
 	assert.NoError(self.T(), err)
-
-	manager2.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	// Now update the monitoring state
 	err = manager2.SetClientMonitoringState(
@@ -277,15 +289,14 @@ sources:
 func (self *ClientMonitoringTestSuite) TestClientMonitoringCompiling() {
 	// Every time the clock gives time.Now() it is forced to
 	// increment.
-	current_clock := &utils.IncClock{NowTime: 10}
-
-	labeler := services.GetLabeler(self.ConfigObj)
-	labeler.(*labels.Labeler).SetClock(current_clock)
+	closer := utils.MockTime(&utils.IncClock{NowTime: 10})
+	defer closer()
 
 	// If no table exists, we will get a default table.
 	manager, err := services.ClientEventManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
-	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
+
+	labeler := services.GetLabeler(self.ConfigObj)
 
 	// Install an initial monitoring table: Everyone gets ServiceCreation.
 	manager.SetClientMonitoringState(
@@ -405,16 +416,12 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoringCompiling() {
 // SELECT and never reach the second SELECT. This test checks for this
 // condition.
 func (self *ClientMonitoringTestSuite) TestClientMonitoringCompilingMultipleArtifacts() {
-	current_clock := &utils.IncClock{NowTime: 10}
-
-	labeler := services.GetLabeler(self.ConfigObj)
-	labeler.(*labels.Labeler).SetClock(current_clock)
+	closer := utils.MockTime(&utils.IncClock{NowTime: 10})
+	defer closer()
 
 	// If no table exists, we will get a default table.
 	manager, err := services.ClientEventManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
-
-	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	// Install an initial monitoring table: Everyone gets ServiceCreation.
 	manager.SetClientMonitoringState(
@@ -462,15 +469,12 @@ func extractArtifacts(args *actions_proto.VQLEventTable) []string {
 
 // Check that labels are properly populated from the index.
 func (self *ClientMonitoringTestSuite) TestClientMonitoring() {
-	current_clock := &utils.MockClock{MockNow: time.Unix(10, 0)}
-
-	labeler := services.GetLabeler(self.ConfigObj)
-	labeler.(*labels.Labeler).SetClock(current_clock)
+	closer := utils.MockTime(utils.NewMockClock(time.Unix(10, 0)))
+	defer closer()
 
 	// If no table exists, we will get a default table.
 	manager, err := services.ClientEventManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
-	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	test_utils.GetMemoryDataStore(self.T(), self.ConfigObj).Clear()
 	assert.NoError(self.T(),
@@ -495,13 +499,16 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoring() {
 		self.client_id, uint64(10000000000)))
 
 	// Some time later we label the client.
-	current_clock.MockNow = time.Unix(20, 0)
-	labeler.SetClientLabel(context.Background(), self.ConfigObj, self.client_id, "Foobar")
+	closer = utils.MockTime(utils.NewMockClock(time.Unix(20, 0)))
+	defer closer()
+
+	labeler := services.GetLabeler(self.ConfigObj)
+	labeler.SetClientLabel(self.Ctx, self.ConfigObj, self.client_id, "Foobar")
 
 	// Client will now be required to update its event table to
 	// make sure the new label does not apply.
 	assert.True(self.T(), manager.CheckClientEventsVersion(
-		context.Background(), self.ConfigObj,
+		self.Ctx, self.ConfigObj,
 		self.client_id, uint64(10000000000)))
 
 }

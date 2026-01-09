@@ -1,31 +1,31 @@
 name: Windows.Detection.Yara.NTFS
 author: Matt Green - @mgreen27
 description: |
-  This artifact searches the MFT, returns a list of target files then runs Yara
+  This artifact searches the MFT, returns a list of target files then runs YARA
   over the target list.
 
-  There are 3 kinds of Yara rules that can be deployed:
+  There are 3 kinds of YARA rules that can be deployed:
 
-  1. Url link to a yara rule.
-  2. Shorthand yara in the format `wide nocase ascii:string1,string2,string3`.
-  3. or a Standard Yara rule attached as a parameter.
+  1. URL link to a YARA rule.
+  2. Shorthand YARA in the format `wide nocase ascii:string1,string2,string3`.
+  3. or a Standard YARA rule attached as a parameter.
 
-  Only one method of Yara will be applied and search order is as above.
+  Only one method of YARA will be applied and search order is as above.
 
-  The artifact leverages Windows.NTFS.MFT so similar regex filters can be applied
+  The artifact uses Windows.NTFS.MFT so similar regex filters can be applied
   including Path, Size and date. The artifact also has an option to search across
-  all attached drives and upload any files with Yara hits.
+  all attached drives and upload any files with YARA hits.
 
   Some examples of path regex may include:
 
   * Extension at a path: `C:\\Windows\\System32\\.+\.dll$`
   * More wildcards: `Windows\\.+\\.+\.dll$`
   * Specific file: `Windows\\System32\\kernel32\.dll$`
-  * Multiple extentions: `\.(php|aspx|resx|asmx)$`
+  * Multiple extensions: `\.(php|aspx|resx|asmx)$`
 
   Note: no drive and forward slashes - these expressions are for paths
   relative to the root of the filesystem.
-  If upload is selected NumberOfHits is redundant and not advised as hits are 
+  If upload is selected NumberOfHits is redundant and not advised as hits are
   grouped by path to ensure files only downloaded once.
 
 type: CLIENT
@@ -35,7 +35,7 @@ parameters:
     default: ^kernel32\.dll$
   - name: PathRegex
     description: Only paths that match this regular expression will be scanned.
-    default: ^C:\\Windows\\System32\\
+    default: C:\\Windows\\System32\\
   - name: DriveLetter
     description: "Target drive. Default is a C:"
     default: "C:"
@@ -80,8 +80,8 @@ parameters:
     description: Include this amount of bytes around hit as context.
     default: 0
     type: int
-    
-    
+
+
 sources:
   - precondition:
       SELECT OS From info() where OS = 'windows'
@@ -95,21 +95,22 @@ sources:
             OSPath, IsDir
         FROM Artifact.Windows.NTFS.MFT(
             MFTDrive=DriveLetter, AllDrives=AllDrives,
-            FileRegex=FileNameRegex,PathRegex=PathRegex, 
+            FileRegex=FileNameRegex,PathRegex=PathRegex,
             SizeMax=SizeMax, SizeMin=SizeMin)
         WHERE NOT IsDir
-          AND if(condition=EarliestSILastChanged,
-            then= LastRecordChange0x10 > EarliestSILastChanged,
-            else= True)
-          AND if(condition=LatestSILastChanged,
-            then= LastRecordChange0x10 < LatestSILastChanged,
-            else= True)
-          AND if(condition=EarliestFNCreated,
-            then= Created0x30 > EarliestFNCreation,
-            else= True)
-          AND if(condition=LatestFNCreated,
-            then= Created0x30 < LatestFNCreation,
-            else= True)
+            AND NOT OSPath =~ '''\\\\.\\.:\\<Err>\\'''
+            AND if(condition=EarliestSILastChanged,
+                then= LastRecordChange0x10 > EarliestSILastChanged,
+                else= True)
+            AND if(condition=LatestSILastChanged,
+                then= LastRecordChange0x10 < LatestSILastChanged,
+                else= True)
+            AND if(condition=EarliestFNCreated,
+                then= Created0x30 > EarliestFNCreation,
+                else= True)
+            AND if(condition=LatestFNCreated,
+                then= Created0x30 < LatestFNCreation,
+                else= True)
 
       -- scan files and only report a single hit.
       LET hits = SELECT * FROM foreach(row=files,
@@ -119,9 +120,24 @@ sources:
                     File.Size AS Size,
                     File.ModTime AS ModTime,
                     Rule, Tags, Meta,
-                    str(str=String.Data) AS HitContext,
-                    String.Offset AS HitOffset
-                FROM yara(rules=yara_rules, files=OSPath, context=ContextBytes,number=NumberOfHits)
+                    String.Name as YaraString,
+                    String.Offset as HitOffset,
+                    if(condition=String.Data,
+                       then=upload(
+                            accessor='scope',
+                            file='String.Data',
+                            name=format(format="%v-%v-%v",
+                            args=[
+                                OSPath,
+                                if(condition= String.Offset - ContextBytes < 0,
+                                    then= 0,
+                                    else= String.Offset - ContextBytes),
+                                if(condition= String.Offset + ContextBytes > File.Size,
+                                    then= File.Size,
+                                    else= String.Offset + ContextBytes) ]
+                            ))) as HitContext
+                FROM yara(rules=yara_rules,
+                   files=OSPath, context=ContextBytes, number=NumberOfHits)
             })
 
       -- upload files that have hit
@@ -134,3 +150,7 @@ sources:
       SELECT * FROM if(condition=UploadHits,
         then={ SELECT * FROM upload_hits},
         else={ SELECT * FROM hits})
+
+column_types:
+  - name: HitContext
+    type: preview_upload

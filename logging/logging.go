@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package logging
 
@@ -55,9 +55,11 @@ var (
 	Audit = "VelociraptorAudit"
 
 	// Lock for log manager.
-	mu        sync.Mutex
-	Manager   *LogManager
-	node_name = ""
+	mu      sync.Mutex
+	manager *LogManager
+
+	disable_log_to_files bool
+	node_name            = ""
 
 	// Lock for memory logs and prelogs.
 	memory_log_mu sync.Mutex
@@ -68,6 +70,13 @@ var (
 	closing_tag_regex = regexp.MustCompile("</>")
 )
 
+func Manager() *LogManager {
+	mu.Lock()
+	defer mu.Unlock()
+
+	return manager
+}
+
 func SetNodeName(name string) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -75,23 +84,46 @@ func SetNodeName(name string) {
 	node_name = name
 }
 
-func InitLogging(config_obj *config_proto.Config) error {
+// Turn off logging to files from now on. This is needed for commands
+// that manipulate the config file and we dont want to attempt to
+// write to random log files.
+func DisableLogging() {
 	mu.Lock()
-	Manager = &LogManager{
+	disable_log_to_files = true
+	mu.Unlock()
+}
+
+func InitLogging(config_obj *config_proto.Config) error {
+	new_manager := &LogManager{
 		contexts: make(map[*string]*LogContext),
 	}
 
-	for _, component := range []*string{&GenericComponent,
-		&FrontendComponent, &ClientComponent,
-		&GUIComponent, &ToolComponent, &APICmponent, &Audit} {
+	components := []*string{
+		&GenericComponent, &FrontendComponent, &ClientComponent,
+		&GUIComponent, &ToolComponent, &APICmponent, &Audit}
 
-		logger, err := Manager.makeNewComponent(config_obj, component)
+	// User asked for all components to go in the same log.
+	if config_obj.Logging != nil &&
+		!config_obj.Logging.SeparateLogsPerComponent {
+		components = []*string{&GenericComponent}
+	}
+
+	for _, component := range components {
+		logger, err := new_manager.makeNewComponent(config_obj, component)
 		if err != nil {
 			mu.Unlock()
 			return err
 		}
-		Manager.contexts[component] = logger
+		new_manager.contexts[component] = logger
 	}
+
+	err := maybeAddRemoteSyslog(config_obj, new_manager)
+	if err != nil {
+		return err
+	}
+
+	mu.Lock()
+	manager = new_manager
 	mu.Unlock()
 
 	FlushPrelogs(config_obj)
@@ -136,37 +168,99 @@ func FlushPrelogs(config_obj *config_proto.Config) {
 	memory_log_mu.Unlock()
 
 	for _, msg := range lprelogs {
-		logger.Info(msg)
+		logger.Info("%s", msg)
 	}
 	prelogs = make([]string, 0)
 }
 
 type LogContext struct {
 	*logrus.Logger
+
+	mu      sync.Mutex
+	enabled map[string]bool
+
+	listeners map[uint64]chan string
+	component string
+}
+
+func (self *LogContext) AddListener(c chan string) func() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self.listeners == nil {
+		self.listeners = make(map[uint64]chan string, 10)
+	}
+
+	id := utils.GetId()
+	self.listeners[id] = c
+
+	return func() {
+		self.mu.Lock()
+		defer self.mu.Unlock()
+
+		delete(self.listeners, id)
+	}
+}
+
+func (self *LogContext) forwardMessage(level, msg string) {
+	// Avoid deadlocks by taking a copy
+	self.mu.Lock()
+	var listeners []chan string
+	for _, c := range self.listeners {
+		listeners = append(listeners, c)
+	}
+	self.mu.Unlock()
+
+	for _, c := range listeners {
+		msg = strings.TrimSpace(msg)
+
+		line := json.Format(`{"time":%q,"level":%q,"msg":%q}`,
+			utils.GetTime().Now().UTC().Format(time.RFC3339), level, msg)
+
+		select {
+		case c <- line:
+		default:
+		}
+	}
 }
 
 func (self *LogContext) Debug(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
 	if self.Logger != nil {
-		self.Logger.Debug(fmt.Sprintf(format, v...))
+		self.Logger.Debug(msg)
 	}
+	self.forwardMessage(DEBUG, msg)
 }
 
 func (self *LogContext) Info(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
 	if self.Logger != nil {
-		self.Logger.Info(fmt.Sprintf(format, v...))
+		self.Logger.Info(msg)
 	}
+	self.forwardMessage(INFO, msg)
 }
 
 func (self *LogContext) Warn(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
 	if self.Logger != nil {
-		self.Logger.Warn(fmt.Sprintf(format, v...))
+		self.Logger.Warn(msg)
 	}
+	self.forwardMessage(WARN, msg)
 }
 
 func (self *LogContext) Error(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
 	if self.Logger != nil {
-		self.Logger.Error(fmt.Sprintf(format, v...))
+		self.Logger.Error(msg)
 	}
+	self.forwardMessage(ERROR, msg)
+}
+
+func (self *LogContext) IsEnabled(level string) bool {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	ok, _ := self.enabled[level]
+	return ok
 }
 
 func (self *LogContext) LogWithLevel(level string, format string, v ...interface{}) {
@@ -187,6 +281,16 @@ func (self *LogContext) LogWithLevel(level string, format string, v ...interface
 type LogManager struct {
 	mu       sync.Mutex
 	contexts map[*string]*LogContext
+}
+
+func (self *LogManager) AddHook(hook logrus.Hook, component *string) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	v, pres := self.contexts[component]
+	if pres {
+		v.Logger.Hooks.Add(hook)
+	}
 }
 
 // Get the logger from cache - creating it if it needs to.
@@ -214,6 +318,8 @@ func (self *LogManager) GetLogger(
 				Hooks:     make(logrus.LevelHooks),
 				Level:     logrus.DebugLevel,
 			},
+			component: *component,
+			enabled:   make(map[string]bool),
 		}
 	}
 	return ctx
@@ -227,15 +333,18 @@ func (self *LogManager) Reset() {
 }
 
 func Reset() {
-	if Manager != nil {
-		Manager.Reset()
+	mu.Lock()
+	defer mu.Unlock()
+
+	if manager != nil {
+		manager.Reset()
 	}
 }
 
 func getRotator(
 	config_obj *config_proto.Config,
 	rotator_config *config_proto.LoggingRetentionConfig,
-	base_path string) (io.Writer, error) {
+	base_path string) (io.Writer, error, bool) {
 
 	if rotator_config == nil {
 		rotator_config = &config_proto.LoggingRetentionConfig{
@@ -245,7 +354,7 @@ func getRotator(
 	}
 
 	if rotator_config.Disabled {
-		return ioutil.Discard, nil
+		return ioutil.Discard, nil, false
 	}
 
 	max_age := rotator_config.MaxAge
@@ -267,7 +376,7 @@ func getRotator(
 		rotatelogs.WithRotationTime(time.Duration(rotation)*time.Second),
 	)
 	if err != nil {
-		return nil, err
+		return nil, err, false
 	}
 
 	// Make sure to write one message to confirm that we can actually
@@ -275,22 +384,29 @@ func getRotator(
 	now := utils.GetTime().Now().UTC()
 	_, err = result.Write([]byte(json.Format(
 		"{\"level\": \"info\", \"msg\": \"Starting...\", \"time\": %q}\n", now)))
-	return result, err
+	return result, err, true
 }
 
 func (self *LogManager) makeNewComponent(
 	config_obj *config_proto.Config,
 	component *string) (*LogContext, error) {
 
-	Log := logrus.New()
-	Log.Out = inMemoryLogWriter{}
-	Log.Level = logrus.DebugLevel
+	enabled := make(map[string]bool)
 
-	if config_obj != nil && config_obj.Logging != nil &&
+	Log := logrus.New()
+	Log.Out = newInMemoryLogWriter()
+	Log.Level = logrus.DebugLevel
+	Log.Formatter = &logrus.JSONFormatter{
+		DisableHTMLEscape: true,
+	}
+
+	if !disable_log_to_files &&
+		config_obj != nil &&
+		config_obj.Logging != nil &&
 		config_obj.Logging.OutputDirectory != "" {
 
-		base_directory := filepath.Join(
-			config_obj.Logging.OutputDirectory, node_name)
+		output_directory := utils.ExpandEnv(config_obj.Logging.OutputDirectory)
+		base_directory := filepath.Join(output_directory, node_name)
 		err := os.MkdirAll(base_directory, 0700)
 		if err != nil {
 			return nil, errors.New("Unable to create logging directory.")
@@ -301,29 +417,32 @@ func (self *LogManager) makeNewComponent(
 
 		Prelog("Initializing logging for %v\n", base_filename)
 
-		rotator, err := getRotator(
+		rotator, err, enable := getRotator(
 			config_obj, config_obj.Logging.Debug,
 			base_filename+"_debug.log")
 		if err != nil {
 			return nil, err
 		}
 		pathMap[logrus.DebugLevel] = rotator
+		enabled[DEBUG] = enable
 
-		rotator, err = getRotator(
+		rotator, err, enable = getRotator(
 			config_obj, config_obj.Logging.Info,
 			base_filename+"_info.log")
 		if err != nil {
 			return nil, err
 		}
 		pathMap[logrus.InfoLevel] = rotator
+		enabled[INFO] = enable
 
-		rotator, err = getRotator(
+		rotator, err, enable = getRotator(
 			config_obj, config_obj.Logging.Error,
 			base_filename+"_error.log")
 		if err != nil {
 			return nil, err
 		}
 		pathMap[logrus.ErrorLevel] = rotator
+		enabled[ERROR] = enable
 
 		hook := lfshook.NewHook(
 			pathMap,
@@ -351,7 +470,11 @@ func (self *LogManager) makeNewComponent(
 		NoColor = true
 	}
 
-	return &LogContext{Log}, nil
+	return &LogContext{
+		Logger:    Log,
+		enabled:   enabled,
+		component: *component,
+	}, nil
 }
 
 func AddLogFile(filename string) error {
@@ -368,7 +491,7 @@ func AddLogFile(filename string) error {
 		logrus.WarnLevel:  fd,
 	}
 
-	for _, log := range Manager.contexts {
+	for _, log := range Manager().contexts {
 		log.Hooks.Add(lfshook.NewHook(
 			writer_map, &JSONFormatter{&logrus.JSONFormatter{
 				DisableHTMLEscape: true,
@@ -383,7 +506,7 @@ func SplitIntoLevelAndLog(b []byte) (level, message string) {
 	if len(parts) == 2 {
 		level := strings.ToUpper(parts[0])
 		switch level {
-		case DEFAULT, ERROR, INFO, WARNING, DEBUG:
+		case DEFAULT, ERROR, INFO, WARNING, DEBUG, ALERT:
 			return level, parts[1]
 		}
 	}
@@ -414,17 +537,16 @@ func NewPlainLogger(
 }
 
 func GetLogger(config_obj *config_proto.Config, component *string) *LogContext {
-	mu.Lock()
-	lManager := Manager
-	mu.Unlock()
-
+	lManager := Manager()
 	if lManager == nil {
 		err := InitLogging(config_obj)
 		if err != nil {
 			panic(err)
 		}
+		lManager = Manager()
+
 	}
-	return Manager.GetLogger(config_obj, component)
+	return lManager.GetLogger(config_obj, component)
 }
 
 type stackTracer interface {
@@ -458,4 +580,8 @@ func (self inMemoryLogWriter) Write(p []byte) (n int, err error) {
 	memory_logs = append(memory_logs, string(p))
 
 	return len(p), nil
+}
+
+func newInMemoryLogWriter() *inMemoryLogWriter {
+	return &inMemoryLogWriter{}
 }

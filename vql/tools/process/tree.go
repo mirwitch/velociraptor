@@ -7,6 +7,7 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/functions"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 	"www.velocidex.com/golang/vfilter/types"
@@ -25,18 +26,24 @@ type node struct {
 type getProcessTreeArgs struct {
 	Id           string          `vfilter:"optional,field=id,doc=Process ID."`
 	DataCallback *vfilter.Lambda `vfilter:"optional,field=data_callback,doc=A VQL Lambda function to that receives a ProcessEntry and returns the data node for each process."`
+	MaxItems     int64           `vfilter:"optional,field=max_items,doc=The maximum number of process entries to return (default 1000)"`
 }
 
 type getProcessTree struct{}
 
 func (self getProcessTree) Call(ctx context.Context,
 	scope types.Scope, args *ordereddict.Dict) types.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "process_tracker_tree", args)()
 
 	arg := &getProcessTreeArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
 		scope.Log("process_tracker_tree: %v", err)
 		return vfilter.Null{}
+	}
+
+	if arg.MaxItems == 0 {
+		arg.MaxItems = 1000
 	}
 
 	tracker := GetGlobalTracker()
@@ -50,6 +57,7 @@ func (self getProcessTree) Call(ctx context.Context,
 		return &vfilter.Null{}
 	}
 
+	arg.MaxItems--
 	new_node := &node{
 		Id:        entry.Id,
 		Name:      getEntryName(entry),
@@ -59,7 +67,8 @@ func (self getProcessTree) Call(ctx context.Context,
 
 	seen := make(map[string]bool)
 	depth := 0
-	getTreeChildren(ctx, scope, new_node, seen, tracker, depth)
+	getTreeChildren(ctx, scope, new_node, seen, tracker,
+		depth, &arg.MaxItems)
 
 	return new_node
 }
@@ -77,12 +86,13 @@ func getEntryName(entry *ProcessEntry) string {
 
 func getTreeChildren(
 	ctx context.Context, scope vfilter.Scope,
-	n *node, seen map[string]bool, tracker IProcessTracker, depth int) {
+	n *node, seen map[string]bool, tracker IProcessTracker,
+	depth int, max_items *int64) {
 	if depth > 20 {
 		return
 	}
 
-	for _, e := range tracker.Children(ctx, scope, n.Id) {
+	for _, e := range tracker.Children(ctx, scope, n.Id, *max_items) {
 		_, pres := seen[e.Id]
 		if pres {
 			continue
@@ -93,6 +103,13 @@ func getTreeChildren(
 		e.Data.Update("StartTime", e.StartTime)
 		e.Data.Update("EndTime", e.EndTime)
 
+		*max_items--
+		if *max_items < 0 {
+			functions.DeduplicatedLog(ctx, scope,
+				"process_tracker_tree: Exceeding number of items in tree output. Truncating output")
+			return
+		}
+
 		new_node := &node{
 			Id:        e.Id,
 			Name:      getEntryName(e),
@@ -100,7 +117,8 @@ func getTreeChildren(
 			Data:      e.Data,
 		}
 		n.Children = append(n.Children, new_node)
-		getTreeChildren(ctx, scope, new_node, seen, tracker, depth+1)
+		getTreeChildren(ctx, scope, new_node, seen, tracker,
+			depth+1, max_items)
 	}
 
 	// Sort the children by start time

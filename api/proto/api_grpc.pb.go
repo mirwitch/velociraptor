@@ -27,9 +27,12 @@ type APIClient interface {
 	// Returns an estimate of the number of clients that might be
 	// affected by a hunt.
 	EstimateHunt(ctx context.Context, in *HuntEstimateRequest, opts ...grpc.CallOption) (*HuntStats, error)
+	GetHuntTable(ctx context.Context, in *GetTableRequest, opts ...grpc.CallOption) (*GetTableResponse, error)
+	// Deprecated - hunts are now listed with GetHuntTable()
 	ListHunts(ctx context.Context, in *ListHuntsRequest, opts ...grpc.CallOption) (*ListHuntsResponse, error)
 	GetHunt(ctx context.Context, in *GetHuntRequest, opts ...grpc.CallOption) (*Hunt, error)
-	ModifyHunt(ctx context.Context, in *Hunt, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	GetHuntTags(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HuntTags, error)
+	ModifyHunt(ctx context.Context, in *HuntMutation, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	GetHuntFlows(ctx context.Context, in *GetTableRequest, opts ...grpc.CallOption) (*GetTableResponse, error)
 	GetHuntResults(ctx context.Context, in *GetHuntResultsRequest, opts ...grpc.CallOption) (*GetTableResponse, error)
 	// Clients.
@@ -38,11 +41,11 @@ type APIClient interface {
 	ListClients(ctx context.Context, in *SearchClientsRequest, opts ...grpc.CallOption) (*SearchClientsResponse, error)
 	GetClient(ctx context.Context, in *GetClientRequest, opts ...grpc.CallOption) (*ApiClient, error)
 	GetClientMetadata(ctx context.Context, in *GetClientRequest, opts ...grpc.CallOption) (*ClientMetadata, error)
-	SetClientMetadata(ctx context.Context, in *ClientMetadata, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	GetClientFlows(ctx context.Context, in *ApiFlowRequest, opts ...grpc.CallOption) (*ApiFlowResponse, error)
+	SetClientMetadata(ctx context.Context, in *SetClientMetadataRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	GetClientFlows(ctx context.Context, in *GetTableRequest, opts ...grpc.CallOption) (*GetTableResponse, error)
 	// Users
 	GetUserUITraits(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ApiUser, error)
-	SetGUIOptions(ctx context.Context, in *SetGUIOptionsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	SetGUIOptions(ctx context.Context, in *SetGUIOptionsRequest, opts ...grpc.CallOption) (*SetGUIOptionsResponse, error)
 	// List all the GUI users known on this server.
 	GetUsers(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*Users, error)
 	// List all the GUI users in orgs in which we are a member
@@ -59,10 +62,14 @@ type APIClient interface {
 	VFSRefreshDirectory(ctx context.Context, in *VFSRefreshDirectoryRequest, opts ...grpc.CallOption) (*proto.ArtifactCollectorResponse, error)
 	VFSStatDirectory(ctx context.Context, in *VFSListRequest, opts ...grpc.CallOption) (*VFSListResponse, error)
 	VFSStatDownload(ctx context.Context, in *VFSStatDownloadRequest, opts ...grpc.CallOption) (*proto.VFSDownloadInfo, error)
+	VFSDownloadFile(ctx context.Context, in *VFSStatDownloadRequest, opts ...grpc.CallOption) (*StartFlowResponse, error)
 	GetTable(ctx context.Context, in *GetTableRequest, opts ...grpc.CallOption) (*GetTableResponse, error)
+	// Facilitate the HexEditor search API
+	SearchFile(ctx context.Context, in *SearchFileRequest, opts ...grpc.CallOption) (*SearchFileResponse, error)
 	// Flows
 	CollectArtifact(ctx context.Context, in *proto.ArtifactCollectorArgs, opts ...grpc.CallOption) (*proto.ArtifactCollectorResponse, error)
 	CancelFlow(ctx context.Context, in *ApiFlowRequest, opts ...grpc.CallOption) (*StartFlowResponse, error)
+	ResumeFlow(ctx context.Context, in *ApiFlowRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	GetFlowDetails(ctx context.Context, in *ApiFlowRequest, opts ...grpc.CallOption) (*FlowDetails, error)
 	GetFlowRequests(ctx context.Context, in *ApiFlowRequest, opts ...grpc.CallOption) (*ApiFlowRequestDetails, error)
 	// VQL assistance
@@ -71,8 +78,8 @@ type APIClient interface {
 	// Artifacts
 	GetArtifacts(ctx context.Context, in *GetArtifactsRequest, opts ...grpc.CallOption) (*proto1.ArtifactDescriptors, error)
 	GetArtifactFile(ctx context.Context, in *GetArtifactRequest, opts ...grpc.CallOption) (*GetArtifactResponse, error)
-	SetArtifactFile(ctx context.Context, in *SetArtifactRequest, opts ...grpc.CallOption) (*APIResponse, error)
-	LoadArtifactPack(ctx context.Context, in *VFSFileBuffer, opts ...grpc.CallOption) (*LoadArtifactPackResponse, error)
+	SetArtifactFile(ctx context.Context, in *SetArtifactRequest, opts ...grpc.CallOption) (*SetArtifactResponse, error)
+	LoadArtifactPack(ctx context.Context, in *LoadArtifactPackRequest, opts ...grpc.CallOption) (*LoadArtifactPackResponse, error)
 	// Tools
 	GetToolInfo(ctx context.Context, in *proto1.Tool, opts ...grpc.CallOption) (*proto1.Tool, error)
 	SetToolInfo(ctx context.Context, in *proto1.Tool, opts ...grpc.CallOption) (*proto1.Tool, error)
@@ -97,12 +104,23 @@ type APIClient interface {
 	GetNotebooks(ctx context.Context, in *NotebookCellRequest, opts ...grpc.CallOption) (*Notebooks, error)
 	NewNotebook(ctx context.Context, in *NotebookMetadata, opts ...grpc.CallOption) (*NotebookMetadata, error)
 	UpdateNotebook(ctx context.Context, in *NotebookMetadata, opts ...grpc.CallOption) (*NotebookMetadata, error)
+	DeleteNotebook(ctx context.Context, in *NotebookMetadata, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	NewNotebookCell(ctx context.Context, in *NotebookCellRequest, opts ...grpc.CallOption) (*NotebookMetadata, error)
 	GetNotebookCell(ctx context.Context, in *NotebookCellRequest, opts ...grpc.CallOption) (*NotebookCell, error)
 	UpdateNotebookCell(ctx context.Context, in *NotebookCellRequest, opts ...grpc.CallOption) (*NotebookCell, error)
+	RevertNotebookCell(ctx context.Context, in *NotebookCellRequest, opts ...grpc.CallOption) (*NotebookCell, error)
 	CancelNotebookCell(ctx context.Context, in *NotebookCellRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CreateNotebookDownloadFile(ctx context.Context, in *NotebookExportRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	UploadNotebookAttachment(ctx context.Context, in *NotebookFileUploadRequest, opts ...grpc.CallOption) (*NotebookFileUploadResponse, error)
+	// Remove a notebook attachment.
+	RemoveNotebookAttachment(ctx context.Context, in *NotebookFileUploadRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	AnnotateTimeline(ctx context.Context, in *AnnotationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Secret management
+	GetSecretDefinitions(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*SecretDefinitionList, error)
+	AddSecret(ctx context.Context, in *Secret, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ModifySecret(ctx context.Context, in *ModifySecretRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Returns a redacted version of the secret.
+	GetSecret(ctx context.Context, in *Secret, opts ...grpc.CallOption) (*Secret, error)
 	// This can be used by API clients to fetch file content.
 	VFSGetBuffer(ctx context.Context, in *VFSFileBuffer, opts ...grpc.CallOption) (*VFSFileBuffer, error)
 	// Streaming free form VQL.
@@ -113,6 +131,8 @@ type APIClient interface {
 	PushEvents(ctx context.Context, in *PushEventRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Push monitoring event to the server.
 	WriteEvent(ctx context.Context, in *proto2.VQLResponse, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Scheduler endpoint for minion scheduling
+	Scheduler(ctx context.Context, opts ...grpc.CallOption) (API_SchedulerClient, error)
 	// Remote data store access.
 	GetSubject(ctx context.Context, in *DataRequest, opts ...grpc.CallOption) (*DataResponse, error)
 	SetSubject(ctx context.Context, in *DataRequest, opts ...grpc.CallOption) (*DataResponse, error)
@@ -148,6 +168,15 @@ func (c *aPIClient) EstimateHunt(ctx context.Context, in *HuntEstimateRequest, o
 	return out, nil
 }
 
+func (c *aPIClient) GetHuntTable(ctx context.Context, in *GetTableRequest, opts ...grpc.CallOption) (*GetTableResponse, error) {
+	out := new(GetTableResponse)
+	err := c.cc.Invoke(ctx, "/proto.API/GetHuntTable", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *aPIClient) ListHunts(ctx context.Context, in *ListHuntsRequest, opts ...grpc.CallOption) (*ListHuntsResponse, error) {
 	out := new(ListHuntsResponse)
 	err := c.cc.Invoke(ctx, "/proto.API/ListHunts", in, out, opts...)
@@ -166,7 +195,16 @@ func (c *aPIClient) GetHunt(ctx context.Context, in *GetHuntRequest, opts ...grp
 	return out, nil
 }
 
-func (c *aPIClient) ModifyHunt(ctx context.Context, in *Hunt, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *aPIClient) GetHuntTags(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HuntTags, error) {
+	out := new(HuntTags)
+	err := c.cc.Invoke(ctx, "/proto.API/GetHuntTags", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) ModifyHunt(ctx context.Context, in *HuntMutation, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, "/proto.API/ModifyHunt", in, out, opts...)
 	if err != nil {
@@ -238,7 +276,7 @@ func (c *aPIClient) GetClientMetadata(ctx context.Context, in *GetClientRequest,
 	return out, nil
 }
 
-func (c *aPIClient) SetClientMetadata(ctx context.Context, in *ClientMetadata, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *aPIClient) SetClientMetadata(ctx context.Context, in *SetClientMetadataRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, "/proto.API/SetClientMetadata", in, out, opts...)
 	if err != nil {
@@ -247,8 +285,8 @@ func (c *aPIClient) SetClientMetadata(ctx context.Context, in *ClientMetadata, o
 	return out, nil
 }
 
-func (c *aPIClient) GetClientFlows(ctx context.Context, in *ApiFlowRequest, opts ...grpc.CallOption) (*ApiFlowResponse, error) {
-	out := new(ApiFlowResponse)
+func (c *aPIClient) GetClientFlows(ctx context.Context, in *GetTableRequest, opts ...grpc.CallOption) (*GetTableResponse, error) {
+	out := new(GetTableResponse)
 	err := c.cc.Invoke(ctx, "/proto.API/GetClientFlows", in, out, opts...)
 	if err != nil {
 		return nil, err
@@ -265,8 +303,8 @@ func (c *aPIClient) GetUserUITraits(ctx context.Context, in *emptypb.Empty, opts
 	return out, nil
 }
 
-func (c *aPIClient) SetGUIOptions(ctx context.Context, in *SetGUIOptionsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
-	out := new(emptypb.Empty)
+func (c *aPIClient) SetGUIOptions(ctx context.Context, in *SetGUIOptionsRequest, opts ...grpc.CallOption) (*SetGUIOptionsResponse, error) {
+	out := new(SetGUIOptionsResponse)
 	err := c.cc.Invoke(ctx, "/proto.API/SetGUIOptions", in, out, opts...)
 	if err != nil {
 		return nil, err
@@ -391,9 +429,27 @@ func (c *aPIClient) VFSStatDownload(ctx context.Context, in *VFSStatDownloadRequ
 	return out, nil
 }
 
+func (c *aPIClient) VFSDownloadFile(ctx context.Context, in *VFSStatDownloadRequest, opts ...grpc.CallOption) (*StartFlowResponse, error) {
+	out := new(StartFlowResponse)
+	err := c.cc.Invoke(ctx, "/proto.API/VFSDownloadFile", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *aPIClient) GetTable(ctx context.Context, in *GetTableRequest, opts ...grpc.CallOption) (*GetTableResponse, error) {
 	out := new(GetTableResponse)
 	err := c.cc.Invoke(ctx, "/proto.API/GetTable", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) SearchFile(ctx context.Context, in *SearchFileRequest, opts ...grpc.CallOption) (*SearchFileResponse, error) {
+	out := new(SearchFileResponse)
+	err := c.cc.Invoke(ctx, "/proto.API/SearchFile", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -412,6 +468,15 @@ func (c *aPIClient) CollectArtifact(ctx context.Context, in *proto.ArtifactColle
 func (c *aPIClient) CancelFlow(ctx context.Context, in *ApiFlowRequest, opts ...grpc.CallOption) (*StartFlowResponse, error) {
 	out := new(StartFlowResponse)
 	err := c.cc.Invoke(ctx, "/proto.API/CancelFlow", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) ResumeFlow(ctx context.Context, in *ApiFlowRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/proto.API/ResumeFlow", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -472,8 +537,8 @@ func (c *aPIClient) GetArtifactFile(ctx context.Context, in *GetArtifactRequest,
 	return out, nil
 }
 
-func (c *aPIClient) SetArtifactFile(ctx context.Context, in *SetArtifactRequest, opts ...grpc.CallOption) (*APIResponse, error) {
-	out := new(APIResponse)
+func (c *aPIClient) SetArtifactFile(ctx context.Context, in *SetArtifactRequest, opts ...grpc.CallOption) (*SetArtifactResponse, error) {
+	out := new(SetArtifactResponse)
 	err := c.cc.Invoke(ctx, "/proto.API/SetArtifactFile", in, out, opts...)
 	if err != nil {
 		return nil, err
@@ -481,7 +546,7 @@ func (c *aPIClient) SetArtifactFile(ctx context.Context, in *SetArtifactRequest,
 	return out, nil
 }
 
-func (c *aPIClient) LoadArtifactPack(ctx context.Context, in *VFSFileBuffer, opts ...grpc.CallOption) (*LoadArtifactPackResponse, error) {
+func (c *aPIClient) LoadArtifactPack(ctx context.Context, in *LoadArtifactPackRequest, opts ...grpc.CallOption) (*LoadArtifactPackResponse, error) {
 	out := new(LoadArtifactPackResponse)
 	err := c.cc.Invoke(ctx, "/proto.API/LoadArtifactPack", in, out, opts...)
 	if err != nil {
@@ -598,6 +663,15 @@ func (c *aPIClient) UpdateNotebook(ctx context.Context, in *NotebookMetadata, op
 	return out, nil
 }
 
+func (c *aPIClient) DeleteNotebook(ctx context.Context, in *NotebookMetadata, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/proto.API/DeleteNotebook", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *aPIClient) NewNotebookCell(ctx context.Context, in *NotebookCellRequest, opts ...grpc.CallOption) (*NotebookMetadata, error) {
 	out := new(NotebookMetadata)
 	err := c.cc.Invoke(ctx, "/proto.API/NewNotebookCell", in, out, opts...)
@@ -625,6 +699,15 @@ func (c *aPIClient) UpdateNotebookCell(ctx context.Context, in *NotebookCellRequ
 	return out, nil
 }
 
+func (c *aPIClient) RevertNotebookCell(ctx context.Context, in *NotebookCellRequest, opts ...grpc.CallOption) (*NotebookCell, error) {
+	out := new(NotebookCell)
+	err := c.cc.Invoke(ctx, "/proto.API/RevertNotebookCell", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *aPIClient) CancelNotebookCell(ctx context.Context, in *NotebookCellRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, "/proto.API/CancelNotebookCell", in, out, opts...)
@@ -646,6 +729,60 @@ func (c *aPIClient) CreateNotebookDownloadFile(ctx context.Context, in *Notebook
 func (c *aPIClient) UploadNotebookAttachment(ctx context.Context, in *NotebookFileUploadRequest, opts ...grpc.CallOption) (*NotebookFileUploadResponse, error) {
 	out := new(NotebookFileUploadResponse)
 	err := c.cc.Invoke(ctx, "/proto.API/UploadNotebookAttachment", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) RemoveNotebookAttachment(ctx context.Context, in *NotebookFileUploadRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/proto.API/RemoveNotebookAttachment", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) AnnotateTimeline(ctx context.Context, in *AnnotationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/proto.API/AnnotateTimeline", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) GetSecretDefinitions(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*SecretDefinitionList, error) {
+	out := new(SecretDefinitionList)
+	err := c.cc.Invoke(ctx, "/proto.API/GetSecretDefinitions", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) AddSecret(ctx context.Context, in *Secret, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/proto.API/AddSecret", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) ModifySecret(ctx context.Context, in *ModifySecretRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/proto.API/ModifySecret", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) GetSecret(ctx context.Context, in *Secret, opts ...grpc.CallOption) (*Secret, error) {
+	out := new(Secret)
+	err := c.cc.Invoke(ctx, "/proto.API/GetSecret", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -743,6 +880,37 @@ func (c *aPIClient) WriteEvent(ctx context.Context, in *proto2.VQLResponse, opts
 	return out, nil
 }
 
+func (c *aPIClient) Scheduler(ctx context.Context, opts ...grpc.CallOption) (API_SchedulerClient, error) {
+	stream, err := c.cc.NewStream(ctx, &API_ServiceDesc.Streams[2], "/proto.API/Scheduler", opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &aPISchedulerClient{stream}
+	return x, nil
+}
+
+type API_SchedulerClient interface {
+	Send(*ScheduleRequest) error
+	Recv() (*ScheduleResponse, error)
+	grpc.ClientStream
+}
+
+type aPISchedulerClient struct {
+	grpc.ClientStream
+}
+
+func (x *aPISchedulerClient) Send(m *ScheduleRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *aPISchedulerClient) Recv() (*ScheduleResponse, error) {
+	m := new(ScheduleResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func (c *aPIClient) GetSubject(ctx context.Context, in *DataRequest, opts ...grpc.CallOption) (*DataResponse, error) {
 	out := new(DataResponse)
 	err := c.cc.Invoke(ctx, "/proto.API/GetSubject", in, out, opts...)
@@ -797,9 +965,12 @@ type APIServer interface {
 	// Returns an estimate of the number of clients that might be
 	// affected by a hunt.
 	EstimateHunt(context.Context, *HuntEstimateRequest) (*HuntStats, error)
+	GetHuntTable(context.Context, *GetTableRequest) (*GetTableResponse, error)
+	// Deprecated - hunts are now listed with GetHuntTable()
 	ListHunts(context.Context, *ListHuntsRequest) (*ListHuntsResponse, error)
 	GetHunt(context.Context, *GetHuntRequest) (*Hunt, error)
-	ModifyHunt(context.Context, *Hunt) (*emptypb.Empty, error)
+	GetHuntTags(context.Context, *emptypb.Empty) (*HuntTags, error)
+	ModifyHunt(context.Context, *HuntMutation) (*emptypb.Empty, error)
 	GetHuntFlows(context.Context, *GetTableRequest) (*GetTableResponse, error)
 	GetHuntResults(context.Context, *GetHuntResultsRequest) (*GetTableResponse, error)
 	// Clients.
@@ -808,11 +979,11 @@ type APIServer interface {
 	ListClients(context.Context, *SearchClientsRequest) (*SearchClientsResponse, error)
 	GetClient(context.Context, *GetClientRequest) (*ApiClient, error)
 	GetClientMetadata(context.Context, *GetClientRequest) (*ClientMetadata, error)
-	SetClientMetadata(context.Context, *ClientMetadata) (*emptypb.Empty, error)
-	GetClientFlows(context.Context, *ApiFlowRequest) (*ApiFlowResponse, error)
+	SetClientMetadata(context.Context, *SetClientMetadataRequest) (*emptypb.Empty, error)
+	GetClientFlows(context.Context, *GetTableRequest) (*GetTableResponse, error)
 	// Users
 	GetUserUITraits(context.Context, *emptypb.Empty) (*ApiUser, error)
-	SetGUIOptions(context.Context, *SetGUIOptionsRequest) (*emptypb.Empty, error)
+	SetGUIOptions(context.Context, *SetGUIOptionsRequest) (*SetGUIOptionsResponse, error)
 	// List all the GUI users known on this server.
 	GetUsers(context.Context, *emptypb.Empty) (*Users, error)
 	// List all the GUI users in orgs in which we are a member
@@ -829,10 +1000,14 @@ type APIServer interface {
 	VFSRefreshDirectory(context.Context, *VFSRefreshDirectoryRequest) (*proto.ArtifactCollectorResponse, error)
 	VFSStatDirectory(context.Context, *VFSListRequest) (*VFSListResponse, error)
 	VFSStatDownload(context.Context, *VFSStatDownloadRequest) (*proto.VFSDownloadInfo, error)
+	VFSDownloadFile(context.Context, *VFSStatDownloadRequest) (*StartFlowResponse, error)
 	GetTable(context.Context, *GetTableRequest) (*GetTableResponse, error)
+	// Facilitate the HexEditor search API
+	SearchFile(context.Context, *SearchFileRequest) (*SearchFileResponse, error)
 	// Flows
 	CollectArtifact(context.Context, *proto.ArtifactCollectorArgs) (*proto.ArtifactCollectorResponse, error)
 	CancelFlow(context.Context, *ApiFlowRequest) (*StartFlowResponse, error)
+	ResumeFlow(context.Context, *ApiFlowRequest) (*emptypb.Empty, error)
 	GetFlowDetails(context.Context, *ApiFlowRequest) (*FlowDetails, error)
 	GetFlowRequests(context.Context, *ApiFlowRequest) (*ApiFlowRequestDetails, error)
 	// VQL assistance
@@ -841,8 +1016,8 @@ type APIServer interface {
 	// Artifacts
 	GetArtifacts(context.Context, *GetArtifactsRequest) (*proto1.ArtifactDescriptors, error)
 	GetArtifactFile(context.Context, *GetArtifactRequest) (*GetArtifactResponse, error)
-	SetArtifactFile(context.Context, *SetArtifactRequest) (*APIResponse, error)
-	LoadArtifactPack(context.Context, *VFSFileBuffer) (*LoadArtifactPackResponse, error)
+	SetArtifactFile(context.Context, *SetArtifactRequest) (*SetArtifactResponse, error)
+	LoadArtifactPack(context.Context, *LoadArtifactPackRequest) (*LoadArtifactPackResponse, error)
 	// Tools
 	GetToolInfo(context.Context, *proto1.Tool) (*proto1.Tool, error)
 	SetToolInfo(context.Context, *proto1.Tool) (*proto1.Tool, error)
@@ -867,12 +1042,23 @@ type APIServer interface {
 	GetNotebooks(context.Context, *NotebookCellRequest) (*Notebooks, error)
 	NewNotebook(context.Context, *NotebookMetadata) (*NotebookMetadata, error)
 	UpdateNotebook(context.Context, *NotebookMetadata) (*NotebookMetadata, error)
+	DeleteNotebook(context.Context, *NotebookMetadata) (*emptypb.Empty, error)
 	NewNotebookCell(context.Context, *NotebookCellRequest) (*NotebookMetadata, error)
 	GetNotebookCell(context.Context, *NotebookCellRequest) (*NotebookCell, error)
 	UpdateNotebookCell(context.Context, *NotebookCellRequest) (*NotebookCell, error)
+	RevertNotebookCell(context.Context, *NotebookCellRequest) (*NotebookCell, error)
 	CancelNotebookCell(context.Context, *NotebookCellRequest) (*emptypb.Empty, error)
 	CreateNotebookDownloadFile(context.Context, *NotebookExportRequest) (*emptypb.Empty, error)
 	UploadNotebookAttachment(context.Context, *NotebookFileUploadRequest) (*NotebookFileUploadResponse, error)
+	// Remove a notebook attachment.
+	RemoveNotebookAttachment(context.Context, *NotebookFileUploadRequest) (*emptypb.Empty, error)
+	AnnotateTimeline(context.Context, *AnnotationRequest) (*emptypb.Empty, error)
+	// Secret management
+	GetSecretDefinitions(context.Context, *emptypb.Empty) (*SecretDefinitionList, error)
+	AddSecret(context.Context, *Secret) (*emptypb.Empty, error)
+	ModifySecret(context.Context, *ModifySecretRequest) (*emptypb.Empty, error)
+	// Returns a redacted version of the secret.
+	GetSecret(context.Context, *Secret) (*Secret, error)
 	// This can be used by API clients to fetch file content.
 	VFSGetBuffer(context.Context, *VFSFileBuffer) (*VFSFileBuffer, error)
 	// Streaming free form VQL.
@@ -883,6 +1069,8 @@ type APIServer interface {
 	PushEvents(context.Context, *PushEventRequest) (*emptypb.Empty, error)
 	// Push monitoring event to the server.
 	WriteEvent(context.Context, *proto2.VQLResponse) (*emptypb.Empty, error)
+	// Scheduler endpoint for minion scheduling
+	Scheduler(API_SchedulerServer) error
 	// Remote data store access.
 	GetSubject(context.Context, *DataRequest) (*DataResponse, error)
 	SetSubject(context.Context, *DataRequest) (*DataResponse, error)
@@ -903,13 +1091,19 @@ func (UnimplementedAPIServer) CreateHunt(context.Context, *Hunt) (*StartFlowResp
 func (UnimplementedAPIServer) EstimateHunt(context.Context, *HuntEstimateRequest) (*HuntStats, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method EstimateHunt not implemented")
 }
+func (UnimplementedAPIServer) GetHuntTable(context.Context, *GetTableRequest) (*GetTableResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetHuntTable not implemented")
+}
 func (UnimplementedAPIServer) ListHunts(context.Context, *ListHuntsRequest) (*ListHuntsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListHunts not implemented")
 }
 func (UnimplementedAPIServer) GetHunt(context.Context, *GetHuntRequest) (*Hunt, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetHunt not implemented")
 }
-func (UnimplementedAPIServer) ModifyHunt(context.Context, *Hunt) (*emptypb.Empty, error) {
+func (UnimplementedAPIServer) GetHuntTags(context.Context, *emptypb.Empty) (*HuntTags, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetHuntTags not implemented")
+}
+func (UnimplementedAPIServer) ModifyHunt(context.Context, *HuntMutation) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ModifyHunt not implemented")
 }
 func (UnimplementedAPIServer) GetHuntFlows(context.Context, *GetTableRequest) (*GetTableResponse, error) {
@@ -933,16 +1127,16 @@ func (UnimplementedAPIServer) GetClient(context.Context, *GetClientRequest) (*Ap
 func (UnimplementedAPIServer) GetClientMetadata(context.Context, *GetClientRequest) (*ClientMetadata, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetClientMetadata not implemented")
 }
-func (UnimplementedAPIServer) SetClientMetadata(context.Context, *ClientMetadata) (*emptypb.Empty, error) {
+func (UnimplementedAPIServer) SetClientMetadata(context.Context, *SetClientMetadataRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetClientMetadata not implemented")
 }
-func (UnimplementedAPIServer) GetClientFlows(context.Context, *ApiFlowRequest) (*ApiFlowResponse, error) {
+func (UnimplementedAPIServer) GetClientFlows(context.Context, *GetTableRequest) (*GetTableResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetClientFlows not implemented")
 }
 func (UnimplementedAPIServer) GetUserUITraits(context.Context, *emptypb.Empty) (*ApiUser, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetUserUITraits not implemented")
 }
-func (UnimplementedAPIServer) SetGUIOptions(context.Context, *SetGUIOptionsRequest) (*emptypb.Empty, error) {
+func (UnimplementedAPIServer) SetGUIOptions(context.Context, *SetGUIOptionsRequest) (*SetGUIOptionsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetGUIOptions not implemented")
 }
 func (UnimplementedAPIServer) GetUsers(context.Context, *emptypb.Empty) (*Users, error) {
@@ -984,14 +1178,23 @@ func (UnimplementedAPIServer) VFSStatDirectory(context.Context, *VFSListRequest)
 func (UnimplementedAPIServer) VFSStatDownload(context.Context, *VFSStatDownloadRequest) (*proto.VFSDownloadInfo, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method VFSStatDownload not implemented")
 }
+func (UnimplementedAPIServer) VFSDownloadFile(context.Context, *VFSStatDownloadRequest) (*StartFlowResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method VFSDownloadFile not implemented")
+}
 func (UnimplementedAPIServer) GetTable(context.Context, *GetTableRequest) (*GetTableResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTable not implemented")
+}
+func (UnimplementedAPIServer) SearchFile(context.Context, *SearchFileRequest) (*SearchFileResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SearchFile not implemented")
 }
 func (UnimplementedAPIServer) CollectArtifact(context.Context, *proto.ArtifactCollectorArgs) (*proto.ArtifactCollectorResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CollectArtifact not implemented")
 }
 func (UnimplementedAPIServer) CancelFlow(context.Context, *ApiFlowRequest) (*StartFlowResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CancelFlow not implemented")
+}
+func (UnimplementedAPIServer) ResumeFlow(context.Context, *ApiFlowRequest) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ResumeFlow not implemented")
 }
 func (UnimplementedAPIServer) GetFlowDetails(context.Context, *ApiFlowRequest) (*FlowDetails, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetFlowDetails not implemented")
@@ -1011,10 +1214,10 @@ func (UnimplementedAPIServer) GetArtifacts(context.Context, *GetArtifactsRequest
 func (UnimplementedAPIServer) GetArtifactFile(context.Context, *GetArtifactRequest) (*GetArtifactResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetArtifactFile not implemented")
 }
-func (UnimplementedAPIServer) SetArtifactFile(context.Context, *SetArtifactRequest) (*APIResponse, error) {
+func (UnimplementedAPIServer) SetArtifactFile(context.Context, *SetArtifactRequest) (*SetArtifactResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetArtifactFile not implemented")
 }
-func (UnimplementedAPIServer) LoadArtifactPack(context.Context, *VFSFileBuffer) (*LoadArtifactPackResponse, error) {
+func (UnimplementedAPIServer) LoadArtifactPack(context.Context, *LoadArtifactPackRequest) (*LoadArtifactPackResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method LoadArtifactPack not implemented")
 }
 func (UnimplementedAPIServer) GetToolInfo(context.Context, *proto1.Tool) (*proto1.Tool, error) {
@@ -1053,6 +1256,9 @@ func (UnimplementedAPIServer) NewNotebook(context.Context, *NotebookMetadata) (*
 func (UnimplementedAPIServer) UpdateNotebook(context.Context, *NotebookMetadata) (*NotebookMetadata, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdateNotebook not implemented")
 }
+func (UnimplementedAPIServer) DeleteNotebook(context.Context, *NotebookMetadata) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteNotebook not implemented")
+}
 func (UnimplementedAPIServer) NewNotebookCell(context.Context, *NotebookCellRequest) (*NotebookMetadata, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method NewNotebookCell not implemented")
 }
@@ -1062,6 +1268,9 @@ func (UnimplementedAPIServer) GetNotebookCell(context.Context, *NotebookCellRequ
 func (UnimplementedAPIServer) UpdateNotebookCell(context.Context, *NotebookCellRequest) (*NotebookCell, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdateNotebookCell not implemented")
 }
+func (UnimplementedAPIServer) RevertNotebookCell(context.Context, *NotebookCellRequest) (*NotebookCell, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RevertNotebookCell not implemented")
+}
 func (UnimplementedAPIServer) CancelNotebookCell(context.Context, *NotebookCellRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CancelNotebookCell not implemented")
 }
@@ -1070,6 +1279,24 @@ func (UnimplementedAPIServer) CreateNotebookDownloadFile(context.Context, *Noteb
 }
 func (UnimplementedAPIServer) UploadNotebookAttachment(context.Context, *NotebookFileUploadRequest) (*NotebookFileUploadResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UploadNotebookAttachment not implemented")
+}
+func (UnimplementedAPIServer) RemoveNotebookAttachment(context.Context, *NotebookFileUploadRequest) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveNotebookAttachment not implemented")
+}
+func (UnimplementedAPIServer) AnnotateTimeline(context.Context, *AnnotationRequest) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AnnotateTimeline not implemented")
+}
+func (UnimplementedAPIServer) GetSecretDefinitions(context.Context, *emptypb.Empty) (*SecretDefinitionList, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetSecretDefinitions not implemented")
+}
+func (UnimplementedAPIServer) AddSecret(context.Context, *Secret) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddSecret not implemented")
+}
+func (UnimplementedAPIServer) ModifySecret(context.Context, *ModifySecretRequest) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ModifySecret not implemented")
+}
+func (UnimplementedAPIServer) GetSecret(context.Context, *Secret) (*Secret, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetSecret not implemented")
 }
 func (UnimplementedAPIServer) VFSGetBuffer(context.Context, *VFSFileBuffer) (*VFSFileBuffer, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method VFSGetBuffer not implemented")
@@ -1085,6 +1312,9 @@ func (UnimplementedAPIServer) PushEvents(context.Context, *PushEventRequest) (*e
 }
 func (UnimplementedAPIServer) WriteEvent(context.Context, *proto2.VQLResponse) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method WriteEvent not implemented")
+}
+func (UnimplementedAPIServer) Scheduler(API_SchedulerServer) error {
+	return status.Errorf(codes.Unimplemented, "method Scheduler not implemented")
 }
 func (UnimplementedAPIServer) GetSubject(context.Context, *DataRequest) (*DataResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetSubject not implemented")
@@ -1150,6 +1380,24 @@ func _API_EstimateHunt_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _API_GetHuntTable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).GetHuntTable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/GetHuntTable",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).GetHuntTable(ctx, req.(*GetTableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _API_ListHunts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListHuntsRequest)
 	if err := dec(in); err != nil {
@@ -1186,8 +1434,26 @@ func _API_GetHunt_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	return interceptor(ctx, in, info, handler)
 }
 
+func _API_GetHuntTags_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).GetHuntTags(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/GetHuntTags",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).GetHuntTags(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _API_ModifyHunt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(Hunt)
+	in := new(HuntMutation)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -1199,7 +1465,7 @@ func _API_ModifyHunt_Handler(srv interface{}, ctx context.Context, dec func(inte
 		FullMethod: "/proto.API/ModifyHunt",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(APIServer).ModifyHunt(ctx, req.(*Hunt))
+		return srv.(APIServer).ModifyHunt(ctx, req.(*HuntMutation))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1331,7 +1597,7 @@ func _API_GetClientMetadata_Handler(srv interface{}, ctx context.Context, dec fu
 }
 
 func _API_SetClientMetadata_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ClientMetadata)
+	in := new(SetClientMetadataRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -1343,13 +1609,13 @@ func _API_SetClientMetadata_Handler(srv interface{}, ctx context.Context, dec fu
 		FullMethod: "/proto.API/SetClientMetadata",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(APIServer).SetClientMetadata(ctx, req.(*ClientMetadata))
+		return srv.(APIServer).SetClientMetadata(ctx, req.(*SetClientMetadataRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
 func _API_GetClientFlows_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ApiFlowRequest)
+	in := new(GetTableRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -1361,7 +1627,7 @@ func _API_GetClientFlows_Handler(srv interface{}, ctx context.Context, dec func(
 		FullMethod: "/proto.API/GetClientFlows",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(APIServer).GetClientFlows(ctx, req.(*ApiFlowRequest))
+		return srv.(APIServer).GetClientFlows(ctx, req.(*GetTableRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1636,6 +1902,24 @@ func _API_VFSStatDownload_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _API_VFSDownloadFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VFSStatDownloadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).VFSDownloadFile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/VFSDownloadFile",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).VFSDownloadFile(ctx, req.(*VFSStatDownloadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _API_GetTable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetTableRequest)
 	if err := dec(in); err != nil {
@@ -1650,6 +1934,24 @@ func _API_GetTable_Handler(srv interface{}, ctx context.Context, dec func(interf
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(APIServer).GetTable(ctx, req.(*GetTableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_SearchFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SearchFileRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).SearchFile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/SearchFile",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).SearchFile(ctx, req.(*SearchFileRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1686,6 +1988,24 @@ func _API_CancelFlow_Handler(srv interface{}, ctx context.Context, dec func(inte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(APIServer).CancelFlow(ctx, req.(*ApiFlowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_ResumeFlow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApiFlowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).ResumeFlow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/ResumeFlow",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).ResumeFlow(ctx, req.(*ApiFlowRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1817,7 +2137,7 @@ func _API_SetArtifactFile_Handler(srv interface{}, ctx context.Context, dec func
 }
 
 func _API_LoadArtifactPack_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(VFSFileBuffer)
+	in := new(LoadArtifactPackRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -1829,7 +2149,7 @@ func _API_LoadArtifactPack_Handler(srv interface{}, ctx context.Context, dec fun
 		FullMethod: "/proto.API/LoadArtifactPack",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(APIServer).LoadArtifactPack(ctx, req.(*VFSFileBuffer))
+		return srv.(APIServer).LoadArtifactPack(ctx, req.(*LoadArtifactPackRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2050,6 +2370,24 @@ func _API_UpdateNotebook_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _API_DeleteNotebook_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NotebookMetadata)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).DeleteNotebook(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/DeleteNotebook",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).DeleteNotebook(ctx, req.(*NotebookMetadata))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _API_NewNotebookCell_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(NotebookCellRequest)
 	if err := dec(in); err != nil {
@@ -2104,6 +2442,24 @@ func _API_UpdateNotebookCell_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _API_RevertNotebookCell_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NotebookCellRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).RevertNotebookCell(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/RevertNotebookCell",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).RevertNotebookCell(ctx, req.(*NotebookCellRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _API_CancelNotebookCell_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(NotebookCellRequest)
 	if err := dec(in); err != nil {
@@ -2154,6 +2510,114 @@ func _API_UploadNotebookAttachment_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(APIServer).UploadNotebookAttachment(ctx, req.(*NotebookFileUploadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_RemoveNotebookAttachment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NotebookFileUploadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).RemoveNotebookAttachment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/RemoveNotebookAttachment",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).RemoveNotebookAttachment(ctx, req.(*NotebookFileUploadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_AnnotateTimeline_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AnnotationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).AnnotateTimeline(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/AnnotateTimeline",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).AnnotateTimeline(ctx, req.(*AnnotationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_GetSecretDefinitions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).GetSecretDefinitions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/GetSecretDefinitions",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).GetSecretDefinitions(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_AddSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Secret)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).AddSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/AddSecret",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).AddSecret(ctx, req.(*Secret))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_ModifySecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ModifySecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).ModifySecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/ModifySecret",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).ModifySecret(ctx, req.(*ModifySecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_GetSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Secret)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).GetSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/GetSecret",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).GetSecret(ctx, req.(*Secret))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2252,6 +2716,32 @@ func _API_WriteEvent_Handler(srv interface{}, ctx context.Context, dec func(inte
 		return srv.(APIServer).WriteEvent(ctx, req.(*proto2.VQLResponse))
 	}
 	return interceptor(ctx, in, info, handler)
+}
+
+func _API_Scheduler_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(APIServer).Scheduler(&aPISchedulerServer{stream})
+}
+
+type API_SchedulerServer interface {
+	Send(*ScheduleResponse) error
+	Recv() (*ScheduleRequest, error)
+	grpc.ServerStream
+}
+
+type aPISchedulerServer struct {
+	grpc.ServerStream
+}
+
+func (x *aPISchedulerServer) Send(m *ScheduleResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *aPISchedulerServer) Recv() (*ScheduleRequest, error) {
+	m := new(ScheduleRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func _API_GetSubject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -2360,12 +2850,20 @@ var API_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _API_EstimateHunt_Handler,
 		},
 		{
+			MethodName: "GetHuntTable",
+			Handler:    _API_GetHuntTable_Handler,
+		},
+		{
 			MethodName: "ListHunts",
 			Handler:    _API_ListHunts_Handler,
 		},
 		{
 			MethodName: "GetHunt",
 			Handler:    _API_GetHunt_Handler,
+		},
+		{
+			MethodName: "GetHuntTags",
+			Handler:    _API_GetHuntTags_Handler,
 		},
 		{
 			MethodName: "ModifyHunt",
@@ -2468,8 +2966,16 @@ var API_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _API_VFSStatDownload_Handler,
 		},
 		{
+			MethodName: "VFSDownloadFile",
+			Handler:    _API_VFSDownloadFile_Handler,
+		},
+		{
 			MethodName: "GetTable",
 			Handler:    _API_GetTable_Handler,
+		},
+		{
+			MethodName: "SearchFile",
+			Handler:    _API_SearchFile_Handler,
 		},
 		{
 			MethodName: "CollectArtifact",
@@ -2478,6 +2984,10 @@ var API_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CancelFlow",
 			Handler:    _API_CancelFlow_Handler,
+		},
+		{
+			MethodName: "ResumeFlow",
+			Handler:    _API_ResumeFlow_Handler,
 		},
 		{
 			MethodName: "GetFlowDetails",
@@ -2560,6 +3070,10 @@ var API_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _API_UpdateNotebook_Handler,
 		},
 		{
+			MethodName: "DeleteNotebook",
+			Handler:    _API_DeleteNotebook_Handler,
+		},
+		{
 			MethodName: "NewNotebookCell",
 			Handler:    _API_NewNotebookCell_Handler,
 		},
@@ -2572,6 +3086,10 @@ var API_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _API_UpdateNotebookCell_Handler,
 		},
 		{
+			MethodName: "RevertNotebookCell",
+			Handler:    _API_RevertNotebookCell_Handler,
+		},
+		{
 			MethodName: "CancelNotebookCell",
 			Handler:    _API_CancelNotebookCell_Handler,
 		},
@@ -2582,6 +3100,30 @@ var API_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UploadNotebookAttachment",
 			Handler:    _API_UploadNotebookAttachment_Handler,
+		},
+		{
+			MethodName: "RemoveNotebookAttachment",
+			Handler:    _API_RemoveNotebookAttachment_Handler,
+		},
+		{
+			MethodName: "AnnotateTimeline",
+			Handler:    _API_AnnotateTimeline_Handler,
+		},
+		{
+			MethodName: "GetSecretDefinitions",
+			Handler:    _API_GetSecretDefinitions_Handler,
+		},
+		{
+			MethodName: "AddSecret",
+			Handler:    _API_AddSecret_Handler,
+		},
+		{
+			MethodName: "ModifySecret",
+			Handler:    _API_ModifySecret_Handler,
+		},
+		{
+			MethodName: "GetSecret",
+			Handler:    _API_GetSecret_Handler,
 		},
 		{
 			MethodName: "VFSGetBuffer",
@@ -2626,6 +3168,12 @@ var API_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "WatchEvent",
 			Handler:       _API_WatchEvent_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "Scheduler",
+			Handler:       _API_Scheduler_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "api.proto",

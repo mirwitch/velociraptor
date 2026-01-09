@@ -3,20 +3,14 @@ import React, { Component } from 'react';
 import PropTypes from 'prop-types';
 import api from '../core/api-service.jsx';
 import Form from 'react-bootstrap/Form';
-import OverlayTrigger from 'react-bootstrap/OverlayTrigger';
 import Row from 'react-bootstrap/Row';
 import Col from 'react-bootstrap/Col';
 import InputGroup from 'react-bootstrap/InputGroup';
 import classNames from "classnames";
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import Tooltip from 'react-bootstrap/Tooltip';
+import ToolTip from '../widgets/tooltip.jsx';
 import T from '../i8n/i8n.jsx';
-
-const renderToolTip = (props, params) => (
-    <Tooltip show={params.description} {...props}>
-       {T(params.description)}
-     </Tooltip>
-);
+import Button from 'react-bootstrap/Button';
 
 export default class UploadFileForm extends Component {
     static propTypes = {
@@ -31,10 +25,14 @@ export default class UploadFileForm extends Component {
         upload: {},
         upload_info: {},
         upload_mode: true,
+        id: 0,
     }
 
+    isUpload = ()=>this.props.param.type === "upload" ||
+        this.props.param.type === "upload_file"
+
     componentDidMount = () => {
-        if (this.props.param.type === "upload" && this.props.value) {
+        if (this.isUpload() && this.props.value) {
             let url = new URL(this.props.value);
             let parts = decodeURI(url.pathname).split("/");
             this.setState({upload_info: {
@@ -42,6 +40,7 @@ export default class UploadFileForm extends Component {
                 filename: parts[parts.length-1],
             }});
         }
+        this.setState({id: crypto.randomUUID()});
     }
 
     uploadFile = () => {
@@ -70,69 +69,68 @@ export default class UploadFileForm extends Component {
         let name = param.friendly_name || param.name;
 
         return (
-            <Form.Group as={Row}>
+            <Form as={Row}>
               <Form.Label column sm="3">
-                <OverlayTrigger
-                  delay={{show: 250, hide: 400}}
-                  overlay={(props)=>renderToolTip(props, param)}>
+                <ToolTip tooltip={param.description}>
                   <div>
                     {name}
                   </div>
-                </OverlayTrigger>
+                </ToolTip>
               </Form.Label>
               <Col sm="8">
                 <InputGroup className="mb-3">
-                  <InputGroup.Prepend>
-                    <InputGroup.Text
-                      as="button"
-                      className="btn btn-default"
-                      onClick={()=>{
-                          this.setState({upload_mode: !this.state.upload_mode});
-                      }}>
-                      <FontAwesomeIcon icon="cloud" />
-                    </InputGroup.Text>
-                    <InputGroup.Text
-                      as="button"
-                      className={classNames({
-                          "btn": true,
-                          "btn-default": true,
-                          "disabled": !this.state.upload.name,
-                      })}
-                      disabled={!this.state.upload.name}
-                      onClick={this.uploadFile}>
-                      { this.state.loading ?
-                        <FontAwesomeIcon icon="spinner" spin /> :
-                        T("Upload")
-                      }
-                    </InputGroup.Text>
-                  </InputGroup.Prepend>
-                  <Form.File custom>
-                    <Form.File.Input
-                      onChange={e => {
-                          if (!_.isEmpty(e.currentTarget.files)) {
-                              this.setState({
-                                  upload_info: {},
-                                  upload: e.currentTarget.files[0],
-                              });
-                          }
-                      }}
-                    />
-                    { this.state.upload_info.filename ?
-                      <Form.File.Label data-browse="Select a different file">
-                        <a href={ api.href(this.state.upload_info.url) }>
-                          { this.state.upload_info.filename }
-                        </a>
-                      </Form.File.Label>:
-                      <Form.File.Label data-browse="Select file">
-                        { this.state.upload.name ?
-                          this.state.upload.name:
-                          T("Click to upload file")}
-                      </Form.File.Label>
+                  <Button
+                    className="btn btn-default"
+                    onClick={()=>{
+                        this.setState({upload_mode: !this.state.upload_mode});
+                    }}>
+                    <FontAwesomeIcon icon="cloud" />
+                  </Button>
+                  <Button
+                    className={classNames({
+                        "btn": true,
+                        "btn-default": true,
+                        "disabled": !this.state.upload.name,
+                    })}
+                    disabled={!this.state.upload.name}
+                    onClick={this.uploadFile}>
+                    { this.state.loading ?
+                      <FontAwesomeIcon icon="spinner" spin /> :
+                      T("Upload")
                     }
-                  </Form.File>
+                  </Button>
+
+                  <Form.Control type="file" id={this.state.id}
+                                onChange={e => {
+                                    if (!_.isEmpty(e.currentTarget.files)) {
+                                        this.setState({
+                                            upload_info: {},
+                                            upload: e.currentTarget.files[0],
+                                        });
+                                    }
+                                }}
+                  />
+                  { this.state.upload_info.filename &&
+                    <a className="btn btn-default-outline"
+                       href={ api.href(this.state.upload_info.url) }>
+                        { this.state.upload_info.filename }
+                    </a>
+                  }
+
+                  <ToolTip tooltip={T("Click to upload file")}>
+                    <Button variant="default-outline"
+                            className="flush-right">
+                      <label data-browse="Select file" htmlFor={this.state.id}>
+                        {this.state.upload.name ?
+                         this.state.upload.name :
+                         T("Select local file")}
+                      </label>
+                    </Button>
+                  </ToolTip>
                 </InputGroup>
+
               </Col>
-            </Form.Group>
+            </Form>
         );
     }
 
@@ -143,26 +141,23 @@ export default class UploadFileForm extends Component {
         return (
             <Form.Group as={Row}>
               <Form.Label column sm="3">
-                <OverlayTrigger
-                  delay={{show: 250, hide: 400}}
-                  overlay={(props)=>renderToolTip(props, param)}>
+                <ToolTip tooltip={param.description}>
                   <div>
                     {name}
                   </div>
-                </OverlayTrigger>
+                </ToolTip>
               </Form.Label>
               <Col sm="8">
                 <InputGroup className="mb-3">
-                  <InputGroup.Prepend>
-                    <InputGroup.Text
-                      as="button"
+                  <InputGroup.Text>
+                    <Button
                       className="btn btn-default"
                       onClick={()=>{
                           this.setState({upload_mode: !this.state.upload_mode});
                       }}>
                       <FontAwesomeIcon icon="upload" />
-                    </InputGroup.Text>
-                  </InputGroup.Prepend>
+                    </Button>
+                  </InputGroup.Text>
                   <Form.Control as="textarea"
                                 rows={1}
                                 placeholder={T("Type a URL")}

@@ -1,15 +1,16 @@
-//+build extras
+//go:build extras
+// +build extras
 
 package tools
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/Velocidex/json"
 
 	"cloud.google.com/go/pubsub"
 	"github.com/Velocidex/ordereddict"
-	"golang.org/x/net/context"
 	"google.golang.org/api/option"
 
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
@@ -30,6 +31,8 @@ type GCSPubsubPublishFunction struct{}
 func (self *GCSPubsubPublishFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "gcs_pubsub_publish", args)()
 
 	arg := &GCSPubsubPublishArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -58,16 +61,16 @@ func (self *GCSPubsubPublishFunction) Call(ctx context.Context,
 	}
 
 	attributesOrderedDict := arg.Attributes
-	attributesInterfaceMap := attributesOrderedDict.ToDict()
+	attributesInterfaceMap := attributesOrderedDict.ToMap()
 	attributesStringMap := make(map[string]string)
 
-	for key, value := range *attributesInterfaceMap {
+	for key, value := range attributesInterfaceMap {
 		strValue := fmt.Sprintf("%v", value)
 		attributesStringMap[key] = strValue
 	}
 
 	result := t.Publish(ctx, &pubsub.Message{
-		Data: []byte(serialized),
+		Data:       []byte(serialized),
 		Attributes: attributesStringMap,
 	})
 

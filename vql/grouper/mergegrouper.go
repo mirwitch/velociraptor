@@ -10,6 +10,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vql/sorter"
 	"www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/vfilter/aggregators"
 	"www.velocidex.com/golang/vfilter/types"
 )
 
@@ -36,20 +37,19 @@ type AggregateContext struct {
 	row *ordereddict.Dict
 
 	// The context for evaluating the row.
-	context *ordereddict.Dict
+	context types.AggregatorCtx
 }
 
 /*
-  This is a memory efficient grouper with a contrained upper bound on
-  memory consumption.
+This is a memory efficient grouper with a contrained upper bound on
+memory consumption.
 
-  1. Grouped by rows are grouped into bins with a constant group key
-  2. When the number of bins exceeds the chunk size, we:
-  3. Sort the bins by the group key and then serialized the bins into a tmp file.
-  4. When the query is finished we perform a merge-sort on the resulting files:
-  5. Reading the bins from various files by order of the group key, we
-     can group duplicate bins from each file.
-
+ 1. Grouped by rows are grouped into bins with a constant group key
+ 2. When the number of bins exceeds the chunk size, we:
+ 3. Sort the bins by the group key and then serialized the bins into a tmp file.
+ 4. When the query is finished we perform a merge-sort on the resulting files:
+ 5. Reading the bins from various files by order of the group key, we
+    can group duplicate bins from each file.
 */
 type MergeSortGrouper struct {
 	ChunkSize  int
@@ -65,7 +65,7 @@ func (self *MergeSortGrouper) getContext(key string) *AggregateContext {
 	}
 
 	new_aggregate_ctx := &AggregateContext{
-		context: ordereddict.NewDict(),
+		context: aggregators.NewAggregatorCtx(),
 	}
 	self.bins.Set(key, new_aggregate_ctx)
 	return new_aggregate_ctx
@@ -102,19 +102,26 @@ func (self *MergeSortGrouper) groupWithSorting(
 		defer close(row_chan)
 
 		for {
-			_, row, bin_idx, _, err := actor.GetNextRow(ctx, scope)
+			_, row, bin_idx, new_scope, err := actor.GetNextRow(ctx, scope)
 			if err != nil {
 				break
 			}
-			materialized_row := actor.MaterializeRow(ctx, row, scope).
+
+			materialized_row := actor.MaterializeRow(ctx, row, new_scope).
 				Set(GROUPBY_COLUMN, bin_idx)
+
+			new_scope.ChargeOp()
+
 			select {
 			case <-ctx.Done():
+				new_scope.Close()
 				return
 
 			case row_chan <- materialized_row:
 			}
+
 			groupByMergeSortCount.Inc()
+			new_scope.Close()
 		}
 	}()
 
@@ -155,7 +162,7 @@ func (self *MergeSortGrouper) groupWithSorting(
 
 func (self *MergeSortGrouper) transformRow(
 	ctx context.Context, scope types.Scope,
-	context *ordereddict.Dict,
+	context types.AggregatorCtx,
 	actor types.GroupbyActor, row *ordereddict.Dict) *ordereddict.Dict {
 
 	// Create a new scope over which we can evaluate the filter
@@ -170,7 +177,7 @@ func (self *MergeSortGrouper) transformRow(
 	// mask original row (from plugin).
 	new_scope.AppendVars(row)
 	new_scope.AppendVars(transformed_row)
-	new_scope.SetContextDict(context)
+	new_scope.SetAggregatorCtx(context)
 
 	return actor.MaterializeRow(ctx, transformed_row, new_scope)
 }
@@ -203,7 +210,7 @@ func (self *MergeSortGrouper) Group(
 
 			// The transform function receives its own unique context
 			// for the specific aggregate group.
-			new_scope.SetContextDict(aggregate_ctx.context)
+			new_scope.SetAggregatorCtx(aggregate_ctx.context)
 
 			// Update the row with the transformed columns. Note we
 			// must materialize these rows because evaluating the row
@@ -215,9 +222,13 @@ func (self *MergeSortGrouper) Group(
 			// Bins are too large we switch to the slower sort method
 			// which is memory constrained.
 			if self.bins.Len() > int(max_in_memory_group_by) {
-				self.groupWithSorting(ctx, scope, output_chan, actor)
+				scope.Log("GROUP BY: %v bins exceeded, Switching to slower file based operation",
+					self.bins.Len())
+				self.groupWithSorting(ctx, new_scope, output_chan, actor)
+				new_scope.Close()
 				return
 			}
+			new_scope.Close()
 		}
 
 		self.emitBins(ctx, output_chan)

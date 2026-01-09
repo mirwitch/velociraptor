@@ -11,16 +11,21 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	ntfs "www.velocidex.com/golang/go-ntfs/parser"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/paths"
 	timelines_proto "www.velocidex.com/golang/velociraptor/timelines/proto"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/files"
 )
 
 type TimelineItem struct {
-	Row    *ordereddict.Dict
-	Time   time.Time
-	Source string
+	Row                  *ordereddict.Dict
+	Time                 time.Time
+	Message              string
+	TimestampDescription string
+	Source               string
 }
 
 type TimelineReader struct {
@@ -32,6 +37,8 @@ type TimelineReader struct {
 	index_fd          api.FileReader
 	buffered_index_fd io.ReadSeeker
 	index_stat        api.FileInfo
+
+	transformer Transformer
 }
 
 func (self *TimelineReader) getIndex(i int) (*IndexRecord, error) {
@@ -55,7 +62,11 @@ func (self *TimelineReader) getIndex(i int) (*IndexRecord, error) {
 
 func (self *TimelineReader) Stat() *timelines_proto.Timeline {
 	first_record, _ := self.getIndex(0)
-	last_record, _ := self.getIndex(int(self.index_stat.Size()/IndexRecordSize - 1))
+	last_record := first_record
+	last_idx := int(self.index_stat.Size()/IndexRecordSize - 1)
+	if last_idx >= 0 {
+		last_record, _ = self.getIndex(last_idx)
+	}
 
 	if first_record == nil || last_record == nil {
 		return &timelines_proto.Timeline{Id: self.id}
@@ -94,7 +105,7 @@ func (self *TimelineReader) Read(ctx context.Context) <-chan TimelineItem {
 	go func() {
 		defer close(output_chan)
 
-		self.fd.Seek(self.offset, os.SEEK_SET)
+		_, _ = self.fd.Seek(self.offset, os.SEEK_SET)
 		reader := bufio.NewReader(self.fd)
 		for {
 			select {
@@ -128,11 +139,10 @@ func (self *TimelineReader) Read(ctx context.Context) <-chan TimelineItem {
 					continue
 				}
 
-				output_chan <- TimelineItem{
-					Source: self.id,
-					Row:    item,
-					Time:   time.Unix(0, idx_record.Timestamp),
-				}
+				event := self.transformer.Transform(
+					self.id, time.Unix(0, idx_record.Timestamp), item)
+
+				output_chan <- event
 			}
 		}
 	}()
@@ -146,10 +156,15 @@ func (self *TimelineReader) Close() {
 	self.index_fd.Close()
 }
 
-func NewTimelineReader(
-	file_store_factory api.FileStore,
+func (self TimelineReader) New(
+	config_obj *config_proto.Config,
+	transformer Transformer,
 	path_manager paths.TimelinePathManagerInterface) (*TimelineReader, error) {
-	fd, err := file_store_factory.ReadFile(path_manager.Path())
+
+	file_store_factory := file_store.GetFileStore(config_obj)
+
+	filename := path_manager.Path()
+	fd, err := file_store_factory.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -173,13 +188,19 @@ func NewTimelineReader(
 		return nil, err
 	}
 
+	// Track files that should be closed.
+	files.Add(filename.AsClientPath())
+
 	return &TimelineReader{
-		id:                path_manager.Name(),
-		fd:                fd,
-		index_fd:          index_fd,
-		end_idx:           int(stats.Size()/IndexRecordSize - 1),
-		buffered_index_fd: utils.NewReadSeekReaderAdapter(paged),
-		index_stat:        stats,
+		id:       path_manager.Name(),
+		fd:       fd,
+		index_fd: index_fd,
+		end_idx:  int(stats.Size()/IndexRecordSize - 1),
+		buffered_index_fd: utils.NewReadSeekReaderAdapter(paged, func() {
+			files.Remove(filename.AsClientPath())
+		}),
+		index_stat:  stats,
+		transformer: transformer,
 	}, nil
 
 }

@@ -2,12 +2,15 @@ package authenticators
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 
 	"www.velocidex.com/golang/velociraptor/acls"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 func GetOrgIdFromRequest(r *http.Request) string {
@@ -39,41 +42,75 @@ func GetOrgIdFromRequest(r *http.Request) string {
 	return org_id
 }
 
-func CheckOrgAccess(r *http.Request, user_record *api_proto.VelociraptorUser) error {
+// Checks to make sure the user has access to the org they
+// requested. If they do not have access to the org they requested we
+// switch them to any org in which they have at least read
+// access. This behaviour ensures that when a user's access is removed
+// from an org the GUI immediately switches to the next available org.
+func CheckOrgAccess(
+	config_obj *config_proto.Config,
+	r *http.Request,
+	user_record *api_proto.VelociraptorUser,
+	permission acls.ACL_PERMISSION) (err error) {
+
 	org_id := GetOrgIdFromRequest(r)
-	err := _checkOrgAccess(r, org_id, user_record)
+	err = _checkOrgAccess(r, org_id, permission, user_record)
 	if err == nil {
 		return nil
 	}
 
+	// For the root org or an unknown org we switch to another org,
+	// otherwise we need to give the user a more specific error that
+	// they are not authorized for this org.
+	if !utils.IsRootOrg(org_id) &&
+		!errors.Is(err, services.OrgNotFoundError) &&
+		!errors.Is(err, utils.NoAccessToOrgError) {
+		return err
+	}
+
+	ctx := r.Context()
+
+	// Does the user already have a preferred org they want to be in?
+	user_manager := services.GetUserManager()
+	user_options, err := user_manager.GetUserOptions(ctx, user_record.Name)
+	if err != nil {
+		// Not an error - maybe the user never logged in yet
+		user_options = &api_proto.SetGUIOptionsRequest{}
+	}
+
+	// Ok they are allowed to go to their preferred org.
+	err = _checkOrgAccess(r, user_options.Org, permission, user_record)
+	if err == nil {
+		r.Header.Set("Grpc-Metadata-Orgid", user_options.Org)
+
+		// Log them into their org
+		return user_manager.SetUserOptions(ctx, user_record.Name,
+			user_record.Name, user_options)
+	}
+
 	// Redirect the user to the first org they have access to
 	for _, org := range user_record.Orgs {
-		err := _checkOrgAccess(r, org.Id, user_record)
+		err = _checkOrgAccess(r, org.Id, permission, user_record)
 		if err == nil {
 			r.Header.Set("Grpc-Metadata-Orgid", org.Id)
 
-			// Update the user's org preferences
-			user_manager := services.GetUserManager()
-			user_options, err := user_manager.GetUserOptions(
-				r.Context(), user_record.Name)
-			if err == nil {
-				user_options.Org = org.Id
-			} else {
-				user_options = &api_proto.SetGUIOptionsRequest{
-					Org: org.Id,
-				}
-			}
-			user_manager.SetUserOptions(
-				r.Context(), user_record.Name, user_options)
-
-			return nil
+			// Log them into their org
+			user_options.Org = org.Id
+			return user_manager.SetUserOptions(ctx, user_record.Name,
+				user_record.Name, user_options)
 		}
+	}
+
+	if err != nil {
+		return fmt.Errorf("Unable to access any orgs: %w", err)
 	}
 
 	return errors.New("Unauthorized username")
 }
 
-func _checkOrgAccess(r *http.Request, org_id string, user_record *api_proto.VelociraptorUser) error {
+func _checkOrgAccess(r *http.Request,
+	org_id string, permission acls.ACL_PERMISSION,
+	user_record *api_proto.VelociraptorUser) error {
 	org_manager, err := services.GetOrgManager()
 	if err != nil {
 		return err
@@ -84,13 +121,15 @@ func _checkOrgAccess(r *http.Request, org_id string, user_record *api_proto.Velo
 		return err
 	}
 
-	perm, err := services.CheckAccess(org_config_obj, user_record.Name, acls.READ_RESULTS)
+	perm, err := services.CheckAccess(
+		org_config_obj, user_record.Name, permission)
 	if err != nil {
 		return err
 	}
 
 	if !perm || user_record.Locked {
-		return errors.New("Unauthorized username")
+		return fmt.Errorf("User %v accessing %v: %w",
+			user_record.Name, org_id, utils.NoAccessToOrgError)
 	}
 
 	return nil

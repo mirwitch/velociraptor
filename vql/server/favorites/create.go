@@ -9,6 +9,7 @@ import (
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/services"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -34,11 +35,17 @@ func (self *AddFavorite) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("favorites_save: %v", err)
+		return vfilter.Null{}
+	}
+
 	// Favorites are user preferences - so everyone has permission
 	// to add their own favorites.
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("favorites_save: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -75,7 +82,7 @@ func (self *AddFavorite) Call(ctx context.Context,
 		scope.Log("favorites_save: %s", err)
 		return vfilter.Null{}
 	}
-	return vfilter.Null{}
+	return fav
 }
 
 func validateSpec(

@@ -1,8 +1,9 @@
+//go:build cgo && yara
 // +build cgo,yara
 
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -25,7 +26,6 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,42 +35,31 @@ import (
 	yara "github.com/Velocidex/go-yara"
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/uploads"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/functions"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 	"www.velocidex.com/golang/vfilter/types"
 )
 
-type YaraHit struct {
-	Name    string
-	Offset  uint64
-	HexData []string
-	Data    []byte
-}
-
-type YaraResult struct {
-	Rule     string
-	Meta     *ordereddict.Dict
-	Tags     []string
-	String   *YaraHit
-	File     accessors.FileInfo
-	FileName *accessors.OSPath
-}
-
 type YaraScanPluginArgs struct {
-	Rules         string            `vfilter:"required,field=rules,doc=Yara rules in the yara DSL."`
-	Files         []types.Any       `vfilter:"required,field=files,doc=The list of files to scan."`
-	Accessor      string            `vfilter:"optional,field=accessor,doc=Accessor (e.g. ntfs,file)"`
-	Context       int               `vfilter:"optional,field=context,doc=How many bytes to include around each hit"`
-	Start         uint64            `vfilter:"optional,field=start,doc=The start offset to scan"`
-	End           uint64            `vfilter:"optional,field=end,doc=End scanning at this offset (100mb)"`
-	NumberOfHits  int64             `vfilter:"optional,field=number,doc=Stop after this many hits (1)."`
-	Blocksize     uint64            `vfilter:"optional,field=blocksize,doc=Blocksize for scanning (1mb)."`
-	Key           string            `vfilter:"optional,field=key,doc=If set use this key to cache the  yara rules."`
-	Namespace     string            `vfilter:"optional,field=namespace,doc=The Yara namespece to use."`
-	YaraVariables *ordereddict.Dict `vfilter:"optional,field=vars,doc=The Yara variables to use."`
+	Rules           string            `vfilter:"optional,field=rules,doc=Yara rules in the yara DSL or after being compiled by the yarac compiler."`
+	Files           []types.Any       `vfilter:"required,field=files,doc=The list of files to scan."`
+	Accessor        string            `vfilter:"optional,field=accessor,doc=Accessor (e.g. ntfs,file)"`
+	Context         int               `vfilter:"optional,field=context,doc=How many bytes to include around each hit"`
+	Start           uint64            `vfilter:"optional,field=start,doc=The start offset to scan"`
+	End             uint64            `vfilter:"optional,field=end,doc=End scanning at this offset (100mb)"`
+	NumberOfHits    int64             `vfilter:"optional,field=number,doc=Stop after this many hits (1)."`
+	Blocksize       uint64            `vfilter:"optional,field=blocksize,doc=Blocksize for scanning (1mb)."`
+	Key             string            `vfilter:"optional,field=key,doc=If set use this key to cache the  yara rules."`
+	Namespace       string            `vfilter:"optional,field=namespace,doc=The Yara namespece to use."`
+	YaraVariables   *ordereddict.Dict `vfilter:"optional,field=vars,doc=The Yara variables to use."`
+	ForceBufferScan bool              `vfilter:"optional,field=force_buffers,doc=Force buffer scan in all cases."`
 }
 
 type YaraScanPlugin struct{}
@@ -83,11 +72,12 @@ func (self YaraScanPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "yara", args)()
 
 		arg := &YaraScanPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 		if err != nil {
-			scope.Log("yarascan: %v", err)
+			scope.Error("yara: %v", err)
 			return
 		}
 
@@ -99,16 +89,10 @@ func (self YaraScanPlugin) Call(
 			arg.Blocksize = 1024 * 1024
 		}
 
-		err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-		if err != nil {
-			scope.Log("yara: %s", err.Error())
-			return
-		}
-
 		rules, err := getYaraRules(arg.Key, arg.Namespace, arg.Rules,
 			arg.YaraVariables, scope)
 		if err != nil {
-			scope.Log("yara: %v", err)
+			functions.DeduplicatedLog(ctx, scope, "ERROR:yara: "+err.Error())
 			return
 		}
 
@@ -117,13 +101,18 @@ func (self YaraScanPlugin) Call(
 			yara_flag = yara.ScanFlagsFastMode
 		}
 
+		logger, closer := utils.NewDeduplicatedLogger(10 * time.Second)
+		defer closer()
+
 		matcher := &scanReporter{
 			output_chan:    output_chan,
 			blocksize:      arg.Blocksize,
 			number_of_hits: arg.NumberOfHits,
 			context:        arg.Context,
 			ctx:            ctx,
-
+			log_level: vql_subsystem.GetIntFromRow(
+				scope, scope, constants.YARA_LOG_LEVEL),
+			logger:    logger,
 			rules:     rules,
 			scope:     scope,
 			yara_flag: yara_flag,
@@ -131,7 +120,7 @@ func (self YaraScanPlugin) Call(
 
 		accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 		if err != nil {
-			scope.Log("yara: %v", err)
+			scope.Error("yara: %v", err)
 			return
 		}
 
@@ -144,23 +133,29 @@ func (self YaraScanPlugin) Call(
 			}
 			matcher.filename = filename
 
-			// If accessor is not specified we call yara's
-			// ScanFile API which mmaps the entire file
-			// into memory avoiding the need for
-			// buffering.
-			if arg.Accessor == "" || arg.Accessor == "file" {
-				err := matcher.scanFile(ctx, output_chan)
+			// As an optimization, we try to call yara's ScanFile API
+			// which mmaps the entire file into memory avoiding the
+			// need for buffering.
+			raw_accessor, ok := accessor.(accessors.RawFileAPIAccessor)
+
+			// If the start offset is specified we always use the
+			// accessor.
+			if !arg.ForceBufferScan && arg.Start == 0 && ok {
+				underlying_file, err := raw_accessor.GetUnderlyingAPIFilename(filename)
 				if err == nil {
-					continue
-				} else {
-					scope.Log("Directly scanning file %v failed, will use accessor",
-						filename.String())
+					err := matcher.scanFile(ctx, underlying_file, output_chan)
+					if err == nil {
+						continue
+					} else {
+						scope.Log("yara: Directly scanning file %v failed, will use accessor",
+							filename.String())
+					}
 				}
 			}
 
 			// If scanning with the file api failed above
 			// we fall back to accessor scanning.
-			matcher.scanFileByAccessor(ctx, arg.Accessor,
+			matcher.scanFileByAccessor(ctx, arg.Accessor, accessor,
 				arg.Blocksize, arg.Start, arg.End, output_chan)
 		}
 	}()
@@ -183,64 +178,76 @@ func getYaraRules(key, namespace, rules string,
 		key = string(rule_hash[:])
 	}
 	cached_result := vql_subsystem.CacheGet(scope, key)
-	if cached_result == nil {
-		generated_rules := RuleGenerator(scope, rules)
-		compiler, err := yara.NewCompiler()
-		if err != nil {
-			return nil, err
-		}
+	if cached_result != nil {
+		switch t := cached_result.(type) {
+		case error:
+			return nil, t
 
-		if vars != nil {
-			for _, k := range vars.Keys() {
-				v, _ := vars.Get(k)
-				err := compiler.DefineVariable(k, v)
-				if err != nil {
-					vql_subsystem.CacheSet(scope, key, err)
-					return nil, err
-				}
+		case *yara.Rules:
+			return t, nil
+
+		default:
+			// Unknown type - recompile again.
+		}
+	}
+
+	compiled_rules, err := compileRules(
+		scope, vars, key, namespace, rules)
+	if err != nil {
+		vql_subsystem.CacheSet(scope, key, err)
+		return nil, err
+	}
+
+	// Cache the successful rules for further use
+	vql_subsystem.CacheSet(scope, key, compiled_rules)
+	return compiled_rules, nil
+}
+
+func compileRules(scope vfilter.Scope,
+	vars *ordereddict.Dict,
+	key, namespace, rules string) (*yara.Rules, error) {
+
+	// Might be a compiled ruleset.
+	if strings.HasPrefix(rules, "YARA") {
+		return yara.ReadRules(strings.NewReader(rules))
+	}
+
+	generated_rules := RuleGenerator(scope, rules)
+	compiler, err := yara.NewCompiler()
+	if err != nil {
+		return nil, err
+	}
+
+	if vars != nil {
+		for _, i := range vars.Items() {
+			err := compiler.DefineVariable(i.Key, i.Value)
+			if err != nil {
+				vql_subsystem.CacheSet(scope, i.Key, err)
+				return nil, err
 			}
 		}
-
-		err = compiler.AddString(generated_rules, namespace)
-		if err != nil {
-			// Cache the compile failure so only one log is emitted.
-			vql_subsystem.CacheSet(scope, key, err)
-			return nil, err
-		}
-
-		rules, err := compiler.GetRules()
-		if err != nil {
-			vql_subsystem.CacheSet(scope, key, err)
-			return nil, err
-		}
-
-		// Cache the successful rules for further use
-		vql_subsystem.CacheSet(scope, key, rules)
-		return rules, nil
 	}
 
-	switch t := cached_result.(type) {
-	case error:
-		return nil, t
-	case *yara.Rules:
-		return t, nil
-	default:
-		return nil, errors.New("Error")
+	err = compiler.AddString(generated_rules, namespace)
+	if err != nil {
+		// Cache the compile failure so only one log is emitted.
+		vql_subsystem.CacheSet(scope, key, err)
+		return nil, err
 	}
+
+	return compiler.GetRules()
+
 }
 
 func (self *scanReporter) scanFileByAccessor(
 	ctx context.Context,
 	accessor_name string,
+	accessor accessors.FileSystemAccessor,
 	blocksize uint64,
 	start, end uint64,
 	output_chan chan vfilter.Row) {
 
-	accessor, err := accessors.GetAccessor(accessor_name, self.scope)
-	if err != nil {
-		self.scope.Log("yara: %v", err)
-		return
-	}
+	defer utils.CheckForPanic("Panic in scanFileByAccessor")
 
 	// Open the file with the accessor
 	f, err := accessor.OpenWithOSPath(self.filename)
@@ -251,7 +258,12 @@ func (self *scanReporter) scanFileByAccessor(
 	}
 	defer f.Close()
 
-	self.file_info, _ = accessor.LstatWithOSPath(self.filename)
+	self.file_info, err = accessor.LstatWithOSPath(self.filename)
+	if err != nil {
+		self.scope.Log("yara: Failed to open %v with accessor %v: %v",
+			self.filename, accessor_name, err)
+		return
+	}
 	self.reader = utils.MakeReaderAtter(f)
 
 	// Support sparse file scanning
@@ -291,7 +303,10 @@ func (self *scanReporter) scanFileByAccessor(
 func (self *scanReporter) scanRange(start, end uint64, f accessors.ReadSeekCloser) {
 	buf := make([]byte, self.blocksize)
 
-	// self.scope.Log("Scanning %v from %#0x to %#0x", self.filename, start, end)
+	if self.log_level >= 1 {
+		self.logger.Log(self.scope,
+			"Scanning %v from %#0x to %#0x", self.filename, start, end)
+	}
 
 	// base_offset reflects the file offset where we scan.
 	for self.base_offset = start; self.base_offset < end; {
@@ -324,8 +339,11 @@ func (self *scanReporter) scanRange(start, end uint64, f accessors.ReadSeekClose
 			return
 		}
 
+		// There is no way to actively cancel the yara scan so this is
+		// as good as we can get - do not set the timeout too long or
+		// we wont be able to cancel it promptly.
 		err = scanner.SetCallback(self).
-			SetTimeout(10 * time.Second).
+			SetTimeout(100 * time.Second).
 			SetFlags(self.yara_flag).
 			ScanMem(scan_buf)
 		if err != nil {
@@ -334,6 +352,14 @@ func (self *scanReporter) scanRange(start, end uint64, f accessors.ReadSeekClose
 
 		// Advance the read pointer
 		self.base_offset += uint64(n)
+		self.reader = nil
+
+		if self.log_level >= 2 {
+			self.logger.Log(self.scope,
+				"Range %v from %#0x to %#0x: Got to %#0x (%d %%)",
+				self.filename, start, end, self.base_offset,
+				100*(self.base_offset-start)/(end-start))
+		}
 
 		// We count an op as one MB scanned.
 		self.scope.ChargeOp()
@@ -344,9 +370,11 @@ func (self *scanReporter) scanRange(start, end uint64, f accessors.ReadSeekClose
 // filename to libyara directly for faster scanning using mmap. This
 // also ensures that all yara features (like the PE plugin) work.
 func (self *scanReporter) scanFile(
-	ctx context.Context, output_chan chan vfilter.Row) error {
+	ctx context.Context,
+	underlying_file string,
+	output_chan chan vfilter.Row) error {
 
-	fd, err := os.Open(self.filename.String())
+	fd, err := os.Open(underlying_file)
 	if err != nil {
 		return err
 	}
@@ -364,10 +392,13 @@ func (self *scanReporter) scanFile(
 		return err
 	}
 
+	// There is no way to actively cancel the yara scan so this is as
+	// good as we can get - do not set the timeout too long or we wont
+	// be able to cancel it promptly.
 	err = scanner.SetCallback(self).
-		SetTimeout(10 * time.Second).
+		SetTimeout(100 * time.Second).
 		SetFlags(self.yara_flag).
-		ScanFile(self.filename.String())
+		ScanFile(underlying_file)
 	if err != nil {
 		return err
 	}
@@ -395,6 +426,8 @@ type scanReporter struct {
 	end            uint64
 	reader         io.ReaderAt
 	ctx            context.Context
+	log_level      uint64
+	logger         *utils.DeduplicatedLogger
 
 	// Internal scan state
 	scope     vfilter.Scope
@@ -427,6 +460,9 @@ func (self *scanReporter) RuleMatching(
 			Meta:     metas,
 			File:     self.file_info,
 			FileName: self.filename,
+
+			// There are no strings so produce an empty String member.
+			String: &YaraHit{},
 		}
 
 		select {
@@ -456,7 +492,7 @@ func (self *scanReporter) RuleMatching(
 
 		// Make a copy of the underlying data.
 		data := make([]byte, context_end-context_start)
-		n, _ := self.reader.ReadAt(data, int64(context_start))
+		n, _ := self.reader.ReadAt(data, int64(context_start)+int64(match_string.Base))
 		data = data[:n]
 
 		res := &YaraResult{
@@ -467,7 +503,7 @@ func (self *scanReporter) RuleMatching(
 			FileName: self.filename,
 			String: &YaraHit{
 				Name:    match_string.Name,
-				Offset:  match_string.Offset + self.base_offset,
+				Offset:  match_string.Offset + self.base_offset + match_string.Base,
 				Data:    data,
 				HexData: strings.Split(hex.Dump(data), "\n"),
 			},
@@ -512,9 +548,10 @@ func (self YaraScanPlugin) Info(
 	scope vfilter.Scope,
 	type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "yara",
-		Doc:     "Scan files using yara rules.",
-		ArgType: type_map.AddType(scope, &YaraScanPluginArgs{}),
+		Name:     "yara",
+		Doc:      "Scan files using yara rules.",
+		ArgType:  type_map.AddType(scope, &YaraScanPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -534,9 +571,10 @@ func (self YaraProcPlugin) Info(
 	scope vfilter.Scope,
 	type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "proc_yara",
-		Doc:     "Scan processes using yara rules.",
-		ArgType: type_map.AddType(scope, &YaraProcPluginArgs{}),
+		Name:     "proc_yara",
+		Doc:      "Scan processes using yara rules.",
+		ArgType:  type_map.AddType(scope, &YaraProcPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 
@@ -548,6 +586,7 @@ func (self YaraProcPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "proc_yara", args)()
 
 		arg := &YaraProcPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -556,16 +595,44 @@ func (self YaraProcPlugin) Call(
 			return
 		}
 
-		rules, err := getYaraRules(arg.Key, arg.Namespace,
-			arg.Rules, arg.YaraVariables, scope)
+		err = vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
 		if err != nil {
 			scope.Log("proc_yara: %v", err)
 			return
 		}
 
-		scanner, err := yara.NewScanner(rules)
+		accessor, err := accessors.GetAccessor("process", scope)
 		if err != nil {
 			scope.Log("proc_yara: %v", err)
+			return
+		}
+
+		filename := fmt.Sprintf("/%v", arg.Pid)
+		process_stat, err := accessor.Lstat(filename)
+		if err != nil {
+			scope.Log("proc_yara: %v", err)
+			return
+		}
+
+		// Open a handle into the process so we can read context out
+		process_address_space, err := accessor.OpenWithOSPath(
+			process_stat.OSPath())
+		if err != nil {
+			scope.Log("proc_yara: %v", err)
+			return
+		}
+		defer process_address_space.Close()
+
+		rules, err := getYaraRules(arg.Key, arg.Namespace,
+			arg.Rules, arg.YaraVariables, scope)
+		if err != nil {
+			functions.DeduplicatedLog(ctx, scope, "ERROR:proc_yara: "+err.Error())
+			return
+		}
+
+		scanner, err := yara.NewScanner(rules)
+		if err != nil {
+			functions.DeduplicatedLog(ctx, scope, "ERROR:proc_yara: "+err.Error())
 			return
 		}
 
@@ -579,14 +646,20 @@ func (self YaraProcPlugin) Call(
 			number_of_hits: arg.NumberOfHits,
 			context:        arg.Context,
 			ctx:            ctx,
+			reader:         utils.MakeReaderAtter(process_address_space),
 
 			rules:     rules,
 			scope:     scope,
+			filename:  process_stat.OSPath(),
+			file_info: process_stat,
 			yara_flag: yara_flag,
 		}
 
+		// There is no way to actively cancel the yara scan so this is
+		// as good as we can get - do not set the timeout too long or
+		// we wont be able to cancel it promptly.
 		err = scanner.SetCallback(matcher).
-			SetTimeout(10 * time.Second).
+			SetTimeout(100 * time.Second).
 			SetFlags(yara_flag).
 			ScanProc(arg.Pid)
 		if err != nil {
@@ -627,7 +700,7 @@ func RuleGenerator(scope vfilter.Scope, rule string) string {
 			method += " " + kw
 
 		default:
-			scope.Log("Unknown shorthand directive %v", kw)
+			scope.Log("yara: Warning unknown shorthand directive %v - treating as Yara Rule", kw)
 			return rule
 		}
 	}

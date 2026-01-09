@@ -33,7 +33,10 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/Velocidex/json"
 	"github.com/Velocidex/ordereddict"
@@ -41,6 +44,10 @@ import (
 	vjson "www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/utils"
+)
+
+var (
+	retransmissionError = errors.New("RetransmissionError")
 )
 
 const (
@@ -54,11 +61,37 @@ type ResultSetWriterImpl struct {
 	fd       api.FileWriter
 	index_fd api.FileWriter
 
+	file_store_factory api.FileStore
+	log_path           api.FSPathSpec
+
 	sync bool
 }
 
-// Noop for file based result set writers.
-func (self *ResultSetWriterImpl) SetStartRow(i int64) {}
+// This tells us that we expect to write the next row at this offset.
+// We need to ensure the file is actually as we expect it to be.
+func (self *ResultSetWriterImpl) SetStartRow(start_row int64) error {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	// Calculate the number of rows currently in the file.
+	idx_size, err := self.index_fd.Size()
+	if err != nil {
+		return err
+	}
+
+	// The numebr of rows in the underlying file.
+	number_of_rows := idx_size / 8 // 8 Bytes per row in the index.
+
+	// Corrent for any rows we have in memory waiting to be flushed.
+	number_of_rows += int64(len(self.rows))
+
+	// This is a retransmission
+	if number_of_rows > start_row {
+		return retransmissionError
+	}
+
+	return nil
+}
 
 func (self *ResultSetWriterImpl) SetSync() {
 	self.mu.Lock()
@@ -102,6 +135,33 @@ func (self *ResultSetWriterImpl) WriteJSONL(serialized []byte, total_rows uint64
 	}
 
 	_, _ = self.fd.Write(serialized)
+	_, _ = self.index_fd.Write(offsets.Bytes())
+}
+
+func (self *ResultSetWriterImpl) WriteCompressedJSONL(
+	serialized []byte, byte_offset uint64, uncompressed_size int,
+	total_rows uint64) {
+
+	// Sync the index with the current buffers.
+	self.Flush()
+
+	// Write an index that spans the serialized range.
+	offset, err := self.fd.Size()
+	if err != nil {
+		return
+	}
+
+	// All the index slots will point to the start of the blob
+	offsets := new(bytes.Buffer)
+	for i := uint64(0); i < total_rows; i++ {
+		value := uint64(offset) | (i << 40)
+		err = binary.Write(offsets, binary.LittleEndian, value)
+		if err != nil {
+			return
+		}
+	}
+
+	_, _ = self.fd.WriteCompressed(serialized, byte_offset, uncompressed_size)
 	_, _ = self.index_fd.Write(offsets.Bytes())
 }
 
@@ -182,21 +242,29 @@ func (self ResultSetFactory) NewResultSetWriter(
 	completion func(),
 	truncate result_sets.WriteMode) (result_sets.ResultSetWriter, error) {
 
-	result := &ResultSetWriterImpl{opts: opts}
+	result := &ResultSetWriterImpl{
+		opts:               opts,
+		file_store_factory: file_store_factory,
+		log_path:           log_path,
+	}
 
 	// If no path is provided, we are just a log sink
 	if utils.IsNil(log_path) {
 		return &NullResultSetWriter{}, nil
 	}
 
+	// Call the completion when both files are done.
+	completer := utils.NewCompleter(completion)
+
 	fd, err := file_store_factory.WriteFileWithCompletion(
-		log_path, completion)
+		log_path, completer.GetCompletionFunc())
 	if err != nil {
 		return nil, err
 	}
 
-	idx_fd, err := file_store_factory.WriteFile(log_path.
-		SetType(api.PATH_TYPE_FILESTORE_JSON_INDEX))
+	idx_fd, err := file_store_factory.WriteFileWithCompletion(
+		log_path.SetType(api.PATH_TYPE_FILESTORE_JSON_INDEX),
+		completer.GetCompletionFunc())
 	if err != nil {
 		fd.Close()
 		return nil, err
@@ -228,13 +296,29 @@ func (self ResultSetFactory) NewResultSetWriter(
 // A ResultSetReader can produce rows from a result set.
 type ResultSetReaderImpl struct {
 	total_rows int64
-	fd         api.FileReader
-	idx_fd     api.FileReader
-	log_path   api.FSPathSpec
+	mtime      time.Time
+
+	fd       api.FileReader
+	idx_fd   api.FileReader
+	log_path api.FSPathSpec
+
+	stacker api.FSPathSpec
+}
+
+func (self *ResultSetReaderImpl) SetStacker(stacker api.FSPathSpec) {
+	self.stacker = stacker
+}
+
+func (self *ResultSetReaderImpl) Stacker() api.FSPathSpec {
+	return self.stacker
 }
 
 func (self *ResultSetReaderImpl) TotalRows() int64 {
 	return self.total_rows
+}
+
+func (self *ResultSetReaderImpl) MTime() time.Time {
+	return self.mtime
 }
 
 // Seeks the fd to the starting location. If successful then fd is
@@ -317,6 +401,54 @@ func (self *ResultSetReaderImpl) Rows(ctx context.Context) <-chan *ordereddict.D
 			// We have reached the end.
 			if len(row_data) == 0 {
 				return
+			}
+
+			if len(row_data) < 2 {
+				continue
+			}
+
+			// This is a pointer to the real record.
+			if row_data[0] == '@' {
+				ptr_offset, err := strconv.ParseInt(
+					strings.Trim(string(row_data), "@\n"), 0, 64)
+				if err != nil {
+					continue
+				}
+
+				current_offset, err := self.fd.Seek(0, os.SEEK_CUR)
+				if err != nil {
+					return
+				}
+
+				_, err = self.fd.Seek(ptr_offset, os.SEEK_SET)
+				if err != nil {
+					return
+				}
+
+				// Make a new private buffer so as not to disturb the
+				// original buffer.
+				reader := bufio.NewReader(self.fd)
+				row_data, err = reader.ReadBytes('\n')
+				if err != nil {
+					return
+				}
+
+				// Seek back to the correct position
+				_, err = self.fd.Seek(current_offset, os.SEEK_SET)
+				if err != nil {
+					return
+				}
+
+				if len(row_data) < 2 {
+					continue
+				}
+				replacement := &replacement_record{}
+				err = json.Unmarshal(row_data[1:], replacement)
+				if err != nil {
+					continue
+				}
+
+				row_data = replacement.Data
 			}
 
 			item := ordereddict.NewDict()
@@ -402,12 +534,50 @@ func (self NullReader) Stat() (api.FileInfo, error) {
 	return nil, errors.New("Not found")
 }
 
+func (self ResultSetFactory) DeleteResultSet(
+	file_store_factory api.FileStore,
+	path api.FSPathSpec) (err error) {
+
+	// A result set consists of:
+	// 1. The main jsonl file
+	// 2. An index jsonl file
+	// 3. optionally a chunk file for compressed result sets
+	// 4. A directory hierarchy of transformed cache files.
+
+	// Try to delete these but dont worry if they are missing
+	_ = file_store_factory.Delete(path.
+		SetType(api.PATH_TYPE_FILESTORE_JSON_INDEX))
+
+	_ = file_store_factory.Delete(path.
+		SetType(api.PATH_TYPE_FILESTORE_CHUNK_INDEX))
+
+	err = file_store_factory.Delete(path)
+	if err != nil {
+		return err
+	}
+
+	deleter := func(urn api.FSPathSpec, info os.FileInfo) error {
+		return file_store_factory.Delete(urn)
+	}
+	_ = api.Walk(file_store_factory,
+		path.AddChild("sorted"), deleter)
+
+	_ = api.Walk(file_store_factory,
+		path.AddChild("filtered"), deleter)
+
+	return err
+}
+
 func (self ResultSetFactory) NewResultSetReader(
 	file_store_factory api.FileStore,
 	log_path api.FSPathSpec) (result_sets.ResultSetReader, error) {
 
+	if file_store_factory == nil {
+		return nil, errors.New("No filestore")
+	}
+
 	fd, err := file_store_factory.ReadFile(log_path)
-	if err == io.EOF || errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, io.EOF) || errors.Is(err, os.ErrNotExist) {
 		fd = &NullReader{
 			Reader:    bytes.NewReader([]byte{}),
 			pathSpec_: log_path,
@@ -419,12 +589,14 @@ func (self ResultSetFactory) NewResultSetReader(
 
 	// -1 indicates we dont know how many rows there are
 	total_rows := int64(-1)
+	var mtime time.Time
 	idx_fd, err := file_store_factory.ReadFile(log_path.
 		SetType(api.PATH_TYPE_FILESTORE_JSON_INDEX))
 	if err == nil {
 		stat, err := idx_fd.Stat()
 		if err == nil {
 			total_rows = stat.Size() / 8
+			mtime = stat.ModTime()
 		}
 	}
 
@@ -437,6 +609,7 @@ func (self ResultSetFactory) NewResultSetReader(
 
 	return &ResultSetReaderImpl{
 		total_rows: total_rows,
+		mtime:      mtime,
 		fd:         fd,
 		idx_fd:     idx_fd,
 		log_path:   log_path,

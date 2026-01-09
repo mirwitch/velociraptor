@@ -6,7 +6,9 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	recyclebin "www.velocidex.com/golang/velociraptor/vql/parsers/recyclebin"
 	vfilter "www.velocidex.com/golang/vfilter"
@@ -15,7 +17,7 @@ import (
 
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
    by the Free Software Foundation, either version 3 of the License, or
@@ -37,9 +39,10 @@ type _RecycleBinPlugin struct{}
 
 func (self _RecycleBinPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "parse_recyclebin",
-		Doc:     "Parses a $I file found in the $Recycle.Bin",
-		ArgType: type_map.AddType(scope, &_RecycleBinPluginArgs{}),
+		Name:     "parse_recyclebin",
+		Doc:      "Parses a $I file found in the $Recycle.Bin",
+		ArgType:  type_map.AddType(scope, &_RecycleBinPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -51,17 +54,12 @@ func (self _RecycleBinPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "parse_recyclebin", args)()
 
 		arg := &_RecycleBinPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 		if err != nil {
 			scope.Log("parse_recyclebin: %s", err.Error())
-			return
-		}
-
-		err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-		if err != nil {
-			scope.Log("parse_recyclebin: %s", err)
 			return
 		}
 

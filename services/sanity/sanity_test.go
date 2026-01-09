@@ -1,13 +1,13 @@
 package sanity_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/alecthomas/assert"
-	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/protobuf/proto"
 	acl_proto "www.velocidex.com/golang/velociraptor/acls/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
@@ -20,6 +20,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/services/orgs"
 	"www.velocidex.com/golang/velociraptor/services/sanity"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
 )
@@ -32,7 +34,7 @@ type ServicesTestSuite struct {
 
 func (self *ServicesTestSuite) SetupTest() {
 	self.ConfigObj = self.TestSuite.LoadConfig()
-	self.LoadArtifacts([]string{`
+	self.LoadArtifactsIntoConfig([]string{`
 name: TestArtifact
 tools:
 - name: Tool1
@@ -41,26 +43,60 @@ tools:
 - name: Tool2
   url: https://www.example2.com/
 
+`, `name: Server.Internal.UserManager
+type: INTERNAL
 `})
 	self.ConfigObj.Services.NotebookService = true
 	self.ConfigObj.Services.UserManager = true
+	self.ConfigObj.Services.SchedulerService = true
 
 	self.TestSuite.SetupTest()
 }
 
+func (self *ServicesTestSuite) TestBasePath() {
+	test_cases := []struct {
+		sample string
+		ok     bool
+	}{{"/velociraptor", true},
+		{"/velociraptor/", false},
+		{"/a", true},
+		{"/ui", true},
+		{"/foo/bar", true},
+		{"/foo/bar/", false}}
+
+	sanity_checker := &sanity.SanityChecks{}
+
+	for _, tc := range test_cases {
+		config_obj := proto.Clone(self.ConfigObj).(*config_proto.Config)
+		config_obj.GUI.BasePath = tc.sample
+		config_obj.GUI.PublicUrl = fmt.Sprintf(
+			"https://www.example.com/%s/app/index.html", tc.sample)
+
+		ok := true
+		err := sanity_checker.CheckFrontendSettings(config_obj)
+		if err != nil {
+			ok = false
+		}
+
+		assert.Equal(self.T(), ok, tc.ok, "Failed %v", tc.sample)
+	}
+}
+
 // Check tool upgrade.
 func (self *ServicesTestSuite) TestUpgradeTools() {
+	closer := utils.MockTime(utils.NewMockClock(time.Unix(100, 0)))
+	defer closer()
 
 	// Admin forces Tool1 to non-default
 	inventory_service, err := services.GetInventory(self.ConfigObj)
-	inventory_service.(*inventory.InventoryService).Clock = &utils.MockClock{MockNow: time.Unix(100, 0)}
 	inventory_service.(*inventory.InventoryService).ClearForTests()
 
 	tool_definition := &artifacts_proto.Tool{
 		Name: "Tool1",
 		Url:  "https://www.company.com",
 	}
-	err = inventory_service.AddTool(self.ConfigObj, tool_definition,
+	ctx := self.Ctx
+	err = inventory_service.AddTool(ctx, self.ConfigObj, tool_definition,
 		services.ToolOptions{
 			// This flag signifies that an admin explicitly set
 			// this tool. We never overwrite an admin's setting.
@@ -112,9 +148,20 @@ func (self *ServicesTestSuite) TestCreateUser() {
 		self.ConfigObj, user_path_manager.ACL(), acl_obj)
 	assert.NoError(self.T(), err)
 
+	// User org membership is not stored in the datastore since it is
+	// derived by the user manager all the time - so these should not
+	// include org list
 	golden := ordereddict.NewDict().
 		Set("/users/User1", user1).
 		Set("/acl/User1.json", acl_obj)
+
+	user_manager := services.GetUserManager()
+	user1_full, err := user_manager.GetUserWithHashes(
+		self.Ctx, utils.GetSuperuserName(self.ConfigObj), "User1")
+	assert.NoError(self.T(), err)
+
+	// Should include the user hashes and their orgs list
+	golden.Set("user1_full", user1_full)
 
 	serialized, err := json.MarshalIndentNormalized(golden)
 	assert.NoError(self.T(), err)
@@ -175,9 +222,21 @@ func (self *ServicesTestSuite) TestCreateUserInOrgs() {
 			err = db.GetSubject(org_config_obj, user_path_manager.ACL(), acl_obj)
 			assert.NoError(self.T(), err)
 
+			// User org membership is not stored in the datastore
+			// since it is derived by the user manager all the time -
+			// so these should not include org list
 			golden.Set(org_id+"/org", org_record).
 				Set(org_id+"/acl/User1.json", acl_obj)
 		}
+
+		user_manager := services.GetUserManager()
+		user1_full, err := user_manager.GetUserWithHashes(
+			self.Ctx, utils.GetSuperuserName(self.ConfigObj), "User1")
+		assert.NoError(self.T(), err)
+
+		// Should include the user hashes and all their orgs list
+		golden.Set("user1_full", user1_full)
+
 		serialized, err := json.MarshalIndentNormalized(golden)
 		assert.NoError(self.T(), err)
 

@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -18,24 +18,7 @@
 
 // A Zip accessor.
 
-// This accessor provides access to compressed archives. The filename
-// is encoded in such a way that this accessor can delegate to another
-// accessor to actually open the underlying zip file. This makes it
-// possible to open zip files read through e.g. raw ntfs.
-
-// For example a filename is URL encoded as:
-// ntfs:/c:\\Windows\\File.zip#/foo/bar
-
-// Refers to the file opened by the accessor "ntfs" (The URL Scheme)
-// with a path (URL Path) of c:\\Windows\File.zip. We then open this
-// file and return a member called /foo/bar (The URL Fragment) within
-// the archive.
-
-// This scheme allows us to nest zip files if we need to:
-// zip://fs:%2Fc:%5Cfoo%5Cbar%23nested.zip#foo/bar
-
-// Refers to the file /foo/bar stored within a zip file nested.zip
-// which is itself stored on the filesystem at c:\foo\bar\nested.zip
+// This accessor provides access to compressed archives.
 
 package zip
 
@@ -44,8 +27,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,8 +38,11 @@ import (
 	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/services/debug"
 	"www.velocidex.com/golang/velociraptor/third_party/zip"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
+	utils_tempfile "www.velocidex.com/golang/velociraptor/utils/tempfile"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/types"
 )
@@ -115,6 +101,7 @@ func (self *Tracker) Debug() string {
 func (self *Tracker) Reset() {
 	self.mu.Lock()
 	defer self.mu.Unlock()
+
 	self.refs = make(map[string]int)
 }
 
@@ -130,8 +117,22 @@ func (self *Tracker) Dec(filename string) {
 		} else {
 			self.refs[filename] = prev
 		}
+
 	} else {
 		panic(filename)
+	}
+}
+
+func (self *Tracker) ProfileWriter(ctx context.Context,
+	scope vfilter.Scope, output_chan chan vfilter.Row) {
+
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	for filename, ref := range self.refs {
+		output_chan <- ordereddict.NewDict().
+			Set("Filename", filename).
+			Set("ReferenceCount", ref)
 	}
 }
 
@@ -267,6 +268,34 @@ type ZipFileCache struct {
 	scope vfilter.Scope
 }
 
+func (self *ZipFileCache) isComponentEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i := 0; i < len(b); i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (self *ZipFileCache) isComponentEqualNoCase(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i := 0; i < len(b); i++ {
+		if !strings.EqualFold(a[i], b[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func (self *ZipFileCache) maybeGetPassword() string {
 	password_any, pres := self.scope.Resolve(constants.ZIP_PASSWORDS)
 	if pres {
@@ -300,17 +329,32 @@ func (self *ZipFileCache) maybeGetPassword() string {
 // zip.File object, and increase its reference. NOTE: The returned
 // object must be closed to decrement the ZipFileCache reference
 // count.
-func (self *ZipFileCache) Open(full_path *accessors.OSPath) (
+func (self *ZipFileCache) Open(full_path *accessors.OSPath, nocase bool) (
 	accessors.ReadSeekCloser, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
 	self.last_active = time.Now()
 
-	info, err := self._GetZipInfo(full_path)
+	info, err := self._GetZipInfo(full_path, nocase)
 	if err != nil {
 		return nil, err
 	}
+
+	// If there is no member file then this is a directory. We return
+	// it successfully but attempting to read from it is not going to
+	// work.
+	if info.member_file == nil {
+		return &DirectoryZipFile{
+			path: info._full_path,
+		}, nil
+	}
+
+	// Disable stream authentication because the library unpacks the
+	// entire stream into memory to verify it. In practice, the
+	// embedded data.zip file provides sufficient authentication
+	// anyway. See https://github.com/Velocidex/velociraptor/issues/3150
+	info.member_file.DeferAuth = true
 
 	fd, err := info.member_file.Open()
 	if err == zip.ErrPassword {
@@ -332,77 +376,112 @@ func (self *ZipFileCache) Open(full_path *accessors.OSPath) (
 	self.refs++
 	zipAccessorCurrentReferences.Inc()
 	return &SeekableZip{
-		delegate:  fd,
-		info:      info,
-		full_path: full_path,
+		delegate: fd,
+		info:     info,
+
+		// Use the correct path
+		full_path: info.OSPath(),
 
 		// We will be closed when done - Leak a reference.
 		zip_file: self,
 	}, nil
 }
 
-func (self *ZipFileCache) GetZipInfo(full_path *accessors.OSPath) (
+func (self *ZipFileCache) GetZipInfo(full_path *accessors.OSPath, nocase bool) (
 	*ZipFileInfo, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	return self._GetZipInfo(full_path)
+	return self._GetZipInfo(full_path, nocase)
 }
 
 // Searches our lookup table of components to zip.File objects, and
 // wraps the zip.File object with a ZipFileInfo object.
-func (self *ZipFileCache) _GetZipInfo(full_path *accessors.OSPath) (
+func (self *ZipFileCache) _GetZipInfo(full_path *accessors.OSPath, nocase bool) (
 	*ZipFileInfo, error) {
 
-	// This is O(n) but due to the components length check it is
-	// very fast.
-loop:
+	eq := self.isComponentEqual
+	if nocase {
+		eq = self.isComponentEqualNoCase
+	}
+
+	full_path_components := full_path.Components
+
+	var subdir *accessors.OSPath
+
+	// This is O(n) but due to the components length check it is very
+	// fast.
 	for _, cd_cache := range self.lookup {
-		if len(full_path.Components) != len(cd_cache.full_path.Components) {
+		cd_components := cd_cache.full_path.Components
+		if !eq(full_path_components, cd_components) {
+			if subdir == nil &&
+				len(cd_components) > len(full_path_components) &&
+				eq(full_path_components,
+					cd_components[:len(full_path_components)]) {
+
+				subdir = full_path.Copy()
+			}
 			continue
 		}
 
-		for j := range full_path.Components {
-			if full_path.Components[j] != cd_cache.full_path.Components[j] {
-				continue loop
-			}
-		}
-
+		// This is an exact match - return it.
 		return &ZipFileInfo{
 			member_file: cd_cache.member_file,
-			_full_path:  full_path.Copy(),
+			// Return the actual correct casing
+			_full_path: cd_cache.full_path.Copy(),
 		}, nil
 	}
 
-	return nil, fmt.Errorf("Zip: Not found: %v.", full_path.String())
+	// This is the best we can do - we have a subdir match
+	if subdir != nil {
+		return &ZipFileInfo{
+			// Return the actual correct casing
+			_full_path: subdir,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("Zip: %w: %v.",
+		utils.NotFoundError, full_path.String())
 }
 
 func (self *ZipFileCache) GetChildren(
-	full_path *accessors.OSPath) ([]*ZipFileInfo, error) {
+	full_path *accessors.OSPath, nocase bool) ([]*ZipFileInfo, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
 	// Determine if we already emitted this file.
 	seen := make(map[string]*ZipFileInfo)
 
+	normalizer := func(x string) string { return x }
+	if nocase {
+		normalizer = strings.ToLower
+	}
+
 loop:
 	for _, cd_cache := range self.lookup {
+		cd_components := cd_cache.full_path.Components
+		if len(cd_components) <= len(full_path.Components) {
+			continue loop
+		}
 		// This breaks if the cd component does not have the same
 		// prefix as required.
 		for j, component := range full_path.Components {
 			if component != cd_cache.full_path.Components[j] {
-				continue loop
+				if !nocase || !strings.EqualFold(
+					component, cd_cache.full_path.Components[j]) {
+					continue loop
+				}
 			}
 		}
 
 		// The required directory depth we need.
 		depth := len(full_path.Components)
-		if len(cd_cache.full_path.Components) <= depth {
+		if len(cd_components) <= depth {
 			continue
 		}
 
 		// Get the part of the path that is at the required depth.
-		member_name := cd_cache.full_path.Components[depth]
+		member_name := normalizer(cd_components[depth])
 
 		// Have we seen this before?
 		old_result, pres := seen[member_name]
@@ -427,8 +506,9 @@ loop:
 
 			// A directory has no member file
 		} else {
+			basename := cd_cache.full_path.Components[depth]
 			seen[member_name] = &ZipFileInfo{
-				_full_path: full_path.Append(member_name),
+				_full_path: full_path.Append(basename),
 			}
 		}
 	}
@@ -469,17 +549,20 @@ func (self *ZipFileCache) Close() {
 		self.fd.Close()
 		self.is_closed = true
 		zipAccessorCurrentOpened.Dec()
+		tracker.Dec(self.zip_file_name)
 	}
 }
 
-/* Zip members are normally compressed and therefore not seekable. If
-   we read the members sequentially (e.g. for yara scanning or other
-   sequential parsing), then there is no need to unpack the
-   file. However, if the callers need to seek within the archive
-   member we must unpack it to a tempfile.
+/*
+Zip members are normally compressed and therefore not seekable. If
 
-   This wrapper manages this by wrapping the underlying zip member and
-   unpacking to a tmpfile automatically depending on usage patterns.
+We read the members sequentially (e.g. for yara scanning or other
+sequential parsing), then there is no need to unpack the
+file. However, if the callers need to seek within the archive
+member we must unpack it to a tempfile.
+
+This wrapper manages this by wrapping the underlying zip member and
+unpacking to a tmpfile automatically depending on usage patterns.
 */
 type SeekableZip struct {
 	mu sync.Mutex
@@ -499,6 +582,10 @@ type SeekableZip struct {
 	closed bool
 }
 
+func (self *SeekableZip) IsSeekable() bool {
+	return false
+}
+
 func (self *SeekableZip) Close() error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
@@ -508,7 +595,8 @@ func (self *SeekableZip) Close() error {
 		self.tmp_file_backing.Close()
 
 		zipAccessorCurrentTmpConversions.Dec()
-		os.Remove(self.tmp_file_backing.Name())
+		err := os.Remove(self.tmp_file_backing.Name())
+		utils_tempfile.RemoveTmpFile(self.tmp_file_backing.Name(), err)
 	}
 
 	err := self.delegate.Close()
@@ -562,17 +650,18 @@ func (self *SeekableZip) ReadAt(buf []byte, offset int64) (int, error) {
 func (self *SeekableZip) createTmpBackup() (err error) {
 	// Make a fresh reader to the member so we are seeked to the
 	// start of it.
-	reader, err := self.zip_file.Open(self.full_path)
+	reader, err := self.zip_file.Open(self.full_path, false)
 	if err != nil {
-		return err
+		return utils.Wrap(io.EOF, err.Error())
 	}
 	defer reader.Close()
 
 	// Create a tmp file to unpack the zip member into
-	self.tmp_file_backing, err = ioutil.TempFile("", "zip*.tmp")
+	self.tmp_file_backing, err = tempfile.TempFile("zip*.tmp")
 	if err != nil {
 		return err
 	}
+	utils_tempfile.AddTmpFile(self.tmp_file_backing.Name())
 
 	zipAccessorCurrentTmpConversions.Inc()
 	zipAccessorTotalTmpConversions.Inc()
@@ -633,22 +722,38 @@ func (self *SeekableZip) seek(offset int64, whence int) (int64, error) {
 	return current_offset, err
 }
 
+type DirectoryZipFile struct {
+	path *accessors.OSPath
+}
+
+func (self DirectoryZipFile) Read(buff []byte) (int, error) {
+	return 0, utils.Wrap(utils.IOError, "read %v: is a directory", self.path.String())
+}
+
+func (self DirectoryZipFile) Seek(offset int64, whence int) (int64, error) {
+	return 0, nil
+}
+
+func (self DirectoryZipFile) Close() error {
+	return nil
+}
+
 func init() {
-	accessors.Register("zip", &ZipFileSystemAccessor{},
-		`Open a zip file as if it was a directory.
-
-Filename is a pathspec with a delegate accessor opening the Zip file,
-and the Path representing the file within the zip file.
-
-Example:
-
-       select FullPath, Mtime, Size from glob(
-         globs=pathspec(DelegateAccessor='file',
-              DelegatePath="File.zip",
-              Path='/**/*.txt'),
-         accessor='zip')
-
-`)
+	accessors.Register(&ZipFileSystemAccessor{})
+	accessors.Register(accessors.DescribeAccessor(
+		&ZipFileSystemAccessor{
+			nocase: true,
+		}, accessors.AccessorDescriptor{
+			Name:        "zip_nocase",
+			Description: `Open a zip file as if it was a directory. Although zip files are case-sensitive, this accessor behaves case-insensitive`,
+		}))
 
 	json.RegisterCustomEncoder(&ZipFileInfo{}, accessors.MarshalGlobFileInfo)
+
+	debug.RegisterProfileWriter(debug.ProfileWriterInfo{
+		Name:          "ZipTracker",
+		Description:   "Reference counting for open Zip files",
+		ProfileWriter: tracker.ProfileWriter,
+		Categories:    []string{"Global", "VQL", "Plugins"},
+	})
 }

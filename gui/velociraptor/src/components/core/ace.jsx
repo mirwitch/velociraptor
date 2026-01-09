@@ -40,6 +40,11 @@ import 'ace-builds/src-min-noconflict/theme-cobalt.js';
 import 'ace-builds/src-min-noconflict/theme-crimson_editor.js';
 import 'ace-builds/src-min-noconflict/theme-dawn.js';
 import 'ace-builds/src-min-noconflict/theme-dracula.js';
+import 'ace-builds/src-min-noconflict/theme-one_dark.js';
+import 'ace-builds/src-min-noconflict/theme-github_dark.js';
+import 'ace-builds/src-min-noconflict/theme-github_light_default.js';
+import 'ace-builds/src-min-noconflict/theme-cloud_editor_dark.js';
+import 'ace-builds/src-min-noconflict/theme-cloud_editor.js';
 import 'ace-builds/src-min-noconflict/theme-dreamweaver.js';
 import 'ace-builds/src-min-noconflict/theme-eclipse.js';
 import 'ace-builds/src-min-noconflict/theme-github.js';
@@ -82,18 +87,60 @@ import 'ace-builds/src-min-noconflict/mode-sql.js';
 import VqlMode from './mode-vql.jsx';
 import MarkdownMode from './mode-markdown.jsx';
 import YamlMode from './mode-yaml.jsx';
+import SigmaMode from './mode-sigma.jsx';
 import RegexMode from './mode-regex.jsx';
 import YaraMode from './mode-yara.jsx';
 import classNames from "classnames";
+
+import ace from 'ace-builds/src-noconflict/ace.js';
+
+// Only support the following modes.
+ace.config.set('basePath', '/');
+ace.config.$modes = {
+    'ace/mode/vql': new VqlMode(),
+    'ace/mode/md': new MarkdownMode(),
+    'ace/mode/yaml': new YamlMode(),
+    'ace/mode/sigma': new SigmaMode(),
+    'ace/mode/regex': new RegexMode(),
+    'ace/mode/yara': new YaraMode(),
+};
+_.each(ace.config.$modes, (v, k)=>{
+    ace.define(k, null, v);
+});
+
+let options = window.ace.acequire("ace/ext/options");
+options.optionGroups.Main.Mode.items = [
+    {
+        caption: "VQL",
+        value: "ace/mode/vql",
+    }, {
+        caption: "YAML",
+        value: "ace/mode/yaml",
+    }, {
+        caption: "Markdown",
+        value: "ace/mode/md",
+    }, {
+        caption: "Sigma",
+        value: "ace/mode/sigma",
+    }, {
+        caption: "Regex",
+        value: "ace/mode/regex",
+    },  {
+        caption: "Yara",
+        value: "ace/mode/yara",
+    },
+];
 
 import Button from 'react-bootstrap/Button';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 
 import UserConfig from './user.jsx';
 
-import api from '../core/api-service.jsx';
-import axios from 'axios';
+import ToolTip from '../widgets/tooltip.jsx';
 
+import api from '../core/api-service.jsx';
+import {CancelToken} from 'axios';
+import { JSONparse } from '../utils/json_parse.jsx';
 
 export class SettingsButton extends Component {
     static propTypes = {
@@ -102,21 +149,24 @@ export class SettingsButton extends Component {
 
     render() {
         return (
-            <>
+            <ToolTip tooltip={T("Configure Editor")}>
               <Button variant="default"
-                      className="float-left btn-tooltip"
-                      data-tooltip={T("Configure Editor")}
-                      data-position="right"
-
+                      className="float-left"
                       onClick={() => this.props.ace.execCommand("showSettingsMenu")} >
                 <FontAwesomeIcon icon="text-height"/>
+        <span className="sr-only">{T("Configure Editor")}</span>
               </Button>
-            </>
+            </ToolTip>
         );
     }
-};
+}
 
 export default class VeloAce extends Component {
+    constructor() {
+        super();
+        this.aceRef= React.createRef();
+    }
+
     static contextType = UserConfig;
     static propTypes = {
         text: PropTypes.string,
@@ -124,6 +174,7 @@ export default class VeloAce extends Component {
         focus: PropTypes.bool,
         onChange: PropTypes.func,
         options: PropTypes.object,
+        placeholder: PropTypes.string,
 
         // Extra toolbar buttons to go in the editor toolbar.
         toolbar: PropTypes.any,
@@ -154,7 +205,7 @@ export default class VeloAce extends Component {
                 break;
             default:
                 break;
-            };
+            }
 
             if (!v) {
                 delete options[k];
@@ -166,7 +217,7 @@ export default class VeloAce extends Component {
 
     getUserOptions = () => {
         let user_options = this.normalizeOptions(
-            JSON.parse(this.context.traits.ui_settings || "{}"));
+            JSONparse(this.context.traits.ui_settings, {}));
         return Object.assign(user_options, this.props.options || {});
     }
 
@@ -191,7 +242,7 @@ export default class VeloAce extends Component {
     }
 
     componentDidMount() {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
     }
 
     componentWillUnmount() {
@@ -199,21 +250,27 @@ export default class VeloAce extends Component {
     }
 
     componentDidUpdate() {
-        if (this.props.mode !== this.state.mode) {
+        let ref = this.aceRef.current;
+
+        if (ref && this.props.mode !== this.state.mode) {
             this.setState({mode: this.props.mode});
 
+            let sess = ref.editor.getSession();
+            sess.setUseWorker(false);
             if (this.props.mode === "vql") {
-                this.refs.ace.editor.getSession().setMode(new VqlMode());
+                sess.setMode(new VqlMode());
             } else if(this.props.mode === "markdown") {
-                this.refs.ace.editor.getSession().setMode(new MarkdownMode());
+                sess.setMode(new MarkdownMode());
             } else if(this.props.mode === "yaml") {
-                this.refs.ace.editor.getSession().setMode(new YamlMode());
+                sess.setMode(new YamlMode());
+            } else if(this.props.mode === "sigma") {
+                sess.setMode(new SigmaMode());
             } else if(this.props.mode === "regex") {
-                this.refs.ace.editor.getSession().setMode(new RegexMode());
+                sess.setMode(new RegexMode());
             } else if(this.props.mode === "yara") {
-                this.refs.ace.editor.getSession().setMode(new YaraMode());
+                sess.setMode(new YaraMode());
             }
-        };
+        }
     }
 
     render() {
@@ -234,7 +291,7 @@ export default class VeloAce extends Component {
                   "velo-ace-editor",
                   this.props.className)}>
                 <AceEditor
-                  ref="ace"
+                  ref={this.aceRef}
                   className="full-height"
                   showGutter={true}
                   focus={focus}

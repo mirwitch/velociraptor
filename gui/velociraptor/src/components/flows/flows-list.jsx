@@ -1,43 +1,59 @@
-
 import "./flows.css";
 
 import React from 'react';
 import PropTypes from 'prop-types';
 import T from '../i8n/i8n.jsx';
 import _ from 'lodash';
-import BootstrapTable from 'react-bootstrap-table-next';
-import filterFactory from 'react-bootstrap-table2-filter';
+import VeloPagedTable, {
+    TablePaginationControl,
+    TransformViewer,
+} from '../core/paged-table.jsx';
+
+import VeloTable, { getFormatter } from '../core/table.jsx';
 
 import Navbar from 'react-bootstrap/Navbar';
 import ButtonGroup from 'react-bootstrap/ButtonGroup';
 import Button from 'react-bootstrap/Button';
+import ToolTip from '../widgets/tooltip.jsx';
 
 import api from '../core/api-service.jsx';
-import { formatColumns } from "../core/table.jsx";
-import NotebookUploads from '../notebooks/notebook-uploads.jsx';
-
 import NewCollectionWizard from './new-collection.jsx';
 import OfflineCollectorWizard from './offline-collector.jsx';
-import Spinner from '../utils/spinner.jsx';
 import DeleteNotebookDialog from '../notebooks/notebook-delete.jsx';
 import ExportNotebook from '../notebooks/export-notebook.jsx';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { HotKeys } from "react-hotkeys";
 import { withRouter } from "react-router-dom";
-import { runArtifact } from "./utils.jsx";
+import { runArtifact, getNotebookId } from "./utils.jsx";
+import Spinner from '../utils/spinner.jsx';
 
 import Modal from 'react-bootstrap/Modal';
 import UserConfig from '../core/user.jsx';
 import VeloForm from '../forms/form.jsx';
 import AddFlowToHuntDialog from './flows-add-to-hunt.jsx';
+import { EditNotebook } from '../notebooks/new-notebook.jsx';
+import TransactionDialog from "./transactions.jsx";
 
-import axios from 'axios';
+import {CancelToken} from 'axios';
 
+const POLL_TIME = 5000;
+
+const SLIDE_STATES = [{
+    level: "30%",
+    icon: "arrow-down",
+}, {
+    level: "100%",
+    icon: "arrow-up",
+}, {
+    level: "42px",
+    icon: "arrows-up-down",
+}];
 
 export class DeleteFlowDialog extends React.PureComponent {
     static propTypes = {
         client: PropTypes.object,
-        flow: PropTypes.object,
+        flows: PropTypes.array,
+
+        // onClose(ok bool) -> did the user select to delete
         onClose: PropTypes.func.isRequired,
     }
 
@@ -46,7 +62,7 @@ export class DeleteFlowDialog extends React.PureComponent {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
     }
 
     componentWillUnmount() {
@@ -55,34 +71,48 @@ export class DeleteFlowDialog extends React.PureComponent {
 
     startDeleteFlow = () => {
         let client_id = this.props.client && this.props.client.client_id;
-        let flow_id = this.props.flow && this.props.flow.session_id;
+        let flow_ids = _.map(this.props.flows, x=>x.session_id);
 
-        if (flow_id && client_id) {
+        if (!_.isEmpty(flow_ids) && client_id) {
             this.setState({loading: true});
             runArtifact("server",   // This collection happens on the server.
                         "Server.Utils.DeleteFlow",
-                        {FlowId: flow_id,
+                        {FlowIds: JSON.stringify(flow_ids),
                          ClientId: client_id,
+                         Sync: "Y",
                          ReallyDoIt: "Y"}, ()=>{
-                             this.props.onClose();
+                             this.props.onClose(true);
                              this.setState({loading: false});
                          }, this.source.token);
         }
     }
 
     render() {
-        let collected_artifacts = this.props.flow.artifacts_with_results || [];
-        let artifacts = collected_artifacts.join(",");
-        let total_bytes = this.props.flow.total_uploaded_bytes/1024/1024 || 0;
-        let total_rows = this.props.flow.total_collected_rows || 0;
         return (
-            <Modal show={true} onHide={this.props.onClose}>
+            <Modal show={true}
+                   size="lg"
+                   dialogClassName="modal-90w"
+                   onHide={this.props.onClose}>
               <Modal.Header closeButton>
-            <Modal.Title>{T("Permanently delete collection")}</Modal.Title>
+            <Modal.Title>{T("Permanently delete collections")}</Modal.Title>
               </Modal.Header>
-              <Modal.Body><Spinner loading={this.state.loading} />
-                {T("ArtifactDeletionDialog", this.props.flow.session_id,
-                   artifacts, total_bytes, total_rows)}
+              <Modal.Body>
+                <div className="delete-flow-table">
+                  <VeloTable
+                    rows={this.props.flows}
+                    columns={["session_id", "artifacts_with_results",
+                              "total_collected_rows", "total_uploaded_bytes"]}
+                    column_renderers={{
+                        artifacts_with_results: flowRowRenderer.Artifacts,
+                        total_uploaded_bytes: getFormatter("mb"),
+                    }}
+                    header_renderers={{session_id: "FlowId",
+                                       artifacts_with_results: "Artifacts",
+                                       total_collected_rows: "Rows",
+                                       total_uploaded_bytes: "Bytes",
+                                      }}
+                  />
+                </div>
               </Modal.Body>
               <Modal.Footer>
                 <Button variant="secondary" onClick={this.props.onClose}>
@@ -110,7 +140,7 @@ export class SaveCollectionDialog extends React.PureComponent {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
      }
 
     componentWillUnmount() {
@@ -147,15 +177,15 @@ export class SaveCollectionDialog extends React.PureComponent {
               <Modal.Header closeButton>
                 <Modal.Title>{T("Save this collection to your Favorites")}</Modal.Title>
               </Modal.Header>
-              <Modal.Body><Spinner loading={this.state.loading} />
+              <Modal.Body>
                 {T("ArtifactFavorites", artifacts)}
                 <VeloForm
-                  param={{name: "Name", description: T("New Favorite name")}}
+                  param={{name: T("Name"), description: T("New Favorite name")}}
                   value={this.state.name}
                   setValue={x=>this.setState({name:x})}
                 />
                 <VeloForm
-                  param={{name: "Description",
+                  param={{name: T("Description"),
                           description: T("Describe this favorite")}}
                   value={this.state.description}
                   setValue={x=>this.setState({description:x})}
@@ -176,12 +206,18 @@ export class SaveCollectionDialog extends React.PureComponent {
 }
 
 class FlowsList extends React.Component {
+    static contextType = UserConfig;
+
     static propTypes = {
         client: PropTypes.object,
-        flows: PropTypes.array,
         setSelectedFlow: PropTypes.func,
+        setMultiSelectedFlow: PropTypes.func,
         selected_flow: PropTypes.object,
-        fetchFlows: PropTypes.func,
+        collapseToggle: PropTypes.func,
+
+        // React router props.
+        match: PropTypes.object,
+        history: PropTypes.object,
     };
 
     state = {
@@ -192,10 +228,23 @@ class FlowsList extends React.Component {
         showDeleteWizard: false,
         showDeleteNotebook: false,
         initialized_from_parent: false,
+        selectedFlowId: undefined,
+        version: {version: 0},
+        slider: 0,
+        transform: undefined,
+        multiSelectedFlows: [],
+    }
+
+    incrementVersion = () => {
+        this.setState({version: {version: this.state.version.version+1}});
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
+        this.interval = setInterval(this.incrementVersion, POLL_TIME);
+
+        let slider = SLIDE_STATES[this.state.slider];
+        this.props.collapseToggle(slider.level);
 
         let action = this.props.match && this.props.match.params &&
             this.props.match.params.flow_id;
@@ -211,6 +260,12 @@ class FlowsList extends React.Component {
         }
 
         if (action === "new") {
+            // Special handling for the offline collector builder.
+            if (name==="Server.Utils.CreateCollector") {
+                this.setState({showOfflineWizard: true});
+                return;
+            }
+
             let specs = {};
             specs[name] = {};
 
@@ -234,9 +289,6 @@ class FlowsList extends React.Component {
         if (this.interval) {
             clearInterval(this.interval);
         }
-        if (this.recrusive_interval) {
-            clearInterval(this.recrusive_interval);
-        }
     }
 
     // Set the table in focus when the component mounts for the first time.
@@ -256,79 +308,30 @@ class FlowsList extends React.Component {
         request.client_id = this.props.client.client_id;
         api.post("v1/CollectArtifact",
                  request, this.source.token).then((response) => {
-            // When the request is done force our parent to refresh.
-            this.props.fetchFlows();
-
-            // Only disable wizards if the request was successful.
-            this.setState({showWizard: false,
-                           showOfflineWizard: false,
-                           showNewFromRouterWizard: false,
-                           showCopyWizard: false});
-        });
+                     // Only disable wizards if the request was successful.
+                     this.setState({showWizard: false,
+                                    showOfflineWizard: false,
+                                    showNewFromRouterWizard: false,
+                                    showCopyWizard: false});
+                     this.incrementVersion();
+                 });
     }
 
     cancelButtonClicked = () => {
         let client_id = this.props.selected_flow && this.props.selected_flow.client_id;
-        let flow_id = this.props.selected_flow && this.props.selected_flow.session_id;
+        let flow_ids = {};
 
-        if (client_id && flow_id) {
+        _.each(this.state.multiSelectedFlows, x=>{
+            flow_ids[x.session_id] = true;
             api.post("v1/CancelFlow", {
-                client_id: client_id, flow_id: flow_id
+                client_id: client_id, flow_id: x.session_id,
             }, this.source.token).then((response) => {
-                this.props.fetchFlows();
+                delete flow_ids[x.session_id];
+                if(_.isEmpty(flow_ids)) {
+                    this.incrementVersion();
+                };
             });
-        }
-    }
-
-    // Navigates to the next row to the one that is highlighted
-    gotoNextRow = () => {
-        let selected_flow = this.props.selected_flow && this.props.selected_flow.session_id;
-        for(let i=0; i<this.node.table.props.data.length; i++) {
-            let row = this.node.table.props.data[i];
-            if (row.session_id === selected_flow) {
-                // Last row
-                if (i+1 >= this.node.table.props.data.length) {
-                    return;
-                }
-                let next_row = this.node.table.props.data[i+1];
-                this.props.setSelectedFlow(next_row);
-
-                // Scroll the new row into view.
-                const el = document.getElementById(next_row.session_id);
-                if (el) {
-                    el.scrollIntoView();
-                    el.focus();
-                }
-            }
-        };
-    }
-    gotoPrevRow = () => {
-        let selected_flow = this.props.selected_flow && this.props.selected_flow.session_id;
-        for(let i=0; i<this.node.table.props.data.length; i++) {
-            let row = this.node.table.props.data[i];
-            if (row.session_id === selected_flow) {
-                // First row
-                if(i===0){
-                    return;
-                }
-                let prev_row = this.node.table.props.data[i-1];
-                this.props.setSelectedFlow(prev_row);
-
-                // Scroll the new row into view.
-                const el = document.getElementById(prev_row.session_id);
-                if (el) {
-                    el.scrollIntoView();
-                    el.focus();
-                }
-            }
-        };
-    }
-
-    gotoTab = (tab) => {
-        let client_id = this.props.selected_flow && this.props.selected_flow.client_id;
-        let selected_flow = this.props.selected_flow && this.props.selected_flow.session_id;
-        this.props.history.push(
-            "/collected/" + client_id + "/" + selected_flow + "/" + tab);
+        });
     }
 
     setFullScreen = () => {
@@ -344,60 +347,92 @@ class FlowsList extends React.Component {
         }
     }
 
+    expandSlider = ()=>{
+        let next_slide = (this.state.slider + 1) % SLIDE_STATES.length;
+        this.setState({ slider: next_slide});
+        this.props.collapseToggle(SLIDE_STATES[next_slide].level);
+    };
+
+    copyCollection = ()=> {
+        let selected_flows = this.props.selected_flow &&
+            this.props.selected_flow.artifacts_with_results;
+
+        // Special handling for offline collector
+        if (_.isEqual(selected_flows, ["Server.Utils.CreateCollector"])) {
+            let specs = this.props.selected_flow.request &&
+                this.props.selected_flow.request.specs;
+
+            if (!_.isArray(specs) || specs.length != 1) {
+                specs = [];
+            }
+
+            this.setState({
+                offlineSpecs: specs[0].parameters,
+                showOfflineWizard: true});
+        } else {
+            this.setState({showCopyWizard: true});
+        }
+    };
+
     render() {
         let tab = this.props.match && this.props.match.params &&
             this.props.match.params.tab;
         let client_id = this.props.client && this.props.client.client_id;
-        let columns = getFlowColumns(client_id);
         let selected_flow = this.props.selected_flow && this.props.selected_flow.session_id;
+        let username = this.context &&
+            this.context.traits && this.context.traits.username;
+        let router_flow_id = this.props.match && this.props.match.params &&
+            this.props.match.params.flow_id;
 
-        const selectRow = {
+        let selectRow = {
             mode: "radio",
             clickToSelect: true,
             hideSelectColumn: true,
             classes: "row-selected",
-            onSelect: row=>this.props.setSelectedFlow(row),
-            selected: [selected_flow],
+            onSelect: row=>{
+                if(row) {
+                    this.props.setSelectedFlow(row._Flow);
+                    this.setState({selectedFlowId: row._id});
+                }
+            },
+            onMultiSelect: rows=>{
+                let flows = [];
+                _.each(rows, x=>{
+                    if(x && !_.isEmpty(x._Flow)) {
+                        flows.push(x._Flow);
+                    }
+                });
+                this.setState({multiSelectedFlows: flows});
+            },
+            selected: [this.state.selectedFlowId],
         };
 
         // When running on the server we have some special GUI.
         let isServer = client_id === "server";
-        let KeyMap = {
-            GOTO_RESULTS: {
-                name: "Display server dashboard",
-                sequence: "r",
-            },
-            GOTO_LOGS: "l",
-            GOTO_OVERVIEW: "o",
-            GOTO_UPLOADS: "u",
-            NEXT: "n",
-            PREVIOUS: "p",
-            COLLECT: "c",
-        };
-
-        let keyHandlers={
-            GOTO_RESULTS: (e)=>this.gotoTab("results"),
-            GOTO_LOGS: (e)=>this.gotoTab("logs"),
-            GOTO_UPLOADS: (e)=>this.gotoTab("uploads"),
-            GOTO_OVERVIEW: (e)=>this.gotoTab("overview"),
-            NEXT: this.gotoNextRow,
-            PREVIOUS: this.gotoPrevRow,
-            COLLECT: ()=>this.setState({showWizard: true}),
-        };
+        let transform = this.state.transform || {};
 
         return (
             <>
+              <Spinner loading={this.state.loading } />
               { this.state.showDeleteWizard &&
                 <DeleteFlowDialog
                   client={this.props.client}
-                  flow={this.props.selected_flow}
-                  onClose={e=>{
+                  flows={this.state.multiSelectedFlows}
+                  onClose={ok=>{
                       this.setState({showDeleteWizard: false});
-                      this.props.fetchFlows();
+                      if(ok) {
+                          this.setState({
+                              selectedFlowId: undefined,
+                              multiSelectedFlows: [],
+                          });
+                          this.props.setSelectedFlow({});
+                      };
+                      this.incrementVersion();
                   }}/>
               }
               { this.state.showSaveCollectionDialog &&
                 <SaveCollectionDialog
+                  client={this.props.client}
                   flow={this.props.selected_flow}
                   onClose={e=>{
                       this.setState({showSaveCollectionDialog: false});
@@ -424,11 +459,11 @@ class FlowsList extends React.Component {
                   baseFlow={this.props.selected_flow}
                   onCancel={(e) => this.setState({showCopyWizard: false})}
                   onResolve={this.setCollectionRequest} />
-        }
+              }
 
               { this.state.showNewFromRouterWizard &&
                 <NewCollectionWizard
-                  client={this.state.client_id}
+                  client={{client_id: this.state.client_id}}
                   baseFlow={this.state.initial_flow}
                   onCancel={(e) => this.setState({showNewFromRouterWizard: false})}
                   onResolve={this.setCollectionRequest} />
@@ -436,155 +471,246 @@ class FlowsList extends React.Component {
 
               { this.state.showOfflineWizard &&
                 <OfflineCollectorWizard
+                  collector_parameters={this.state.offlineSpecs}
                   onCancel={(e) => this.setState({showOfflineWizard: false})}
                   onResolve={this.setCollectionRequest} />
               }
 
               { this.state.showDeleteNotebook &&
                 <DeleteNotebookDialog
-                  notebook_id={"N." + selected_flow + "-" + client_id}
+                  notebook_id={getNotebookId(selected_flow, client_id)}
                   onClose={(e) => this.setState({showDeleteNotebook: false})}/>
-              }
-
-              { this.state.showNotebookUploadsDialog &&
-                <NotebookUploads
-                  notebook={{notebook_id: "N." + selected_flow + "-" + client_id}}
-                  closeDialog={(e) => this.setState({showNotebookUploadsDialog: false})}/>
               }
 
               { this.state.showExportNotebook &&
                 <ExportNotebook
-                  notebook={{notebook_id: "N." + selected_flow + "-" + client_id}}
+                  notebook={{
+                      notebook_id: getNotebookId( selected_flow, client_id)}}
                   onClose={(e) => this.setState({showExportNotebook: false})}/>
               }
 
+              { this.state.showEditNotebookDialog &&
+                <EditNotebook
+                  notebook={this.state.notebook}
+                  updateNotebooks={()=>{
+                      this.setState({showEditNotebookDialog: false});
+                  }}
+                  closeDialog={() => this.setState({showEditNotebookDialog: false})}
+                />
+              }
+
+              { this.state.showTransactionsDialog &&
+                <TransactionDialog
+                  onClose={e=>{
+                      this.setState({showTransactionsDialog: false});
+                      this.incrementVersion();
+                  }}
+                  flow={this.props.selected_flow}
+                />}
+
               <Navbar className="flow-toolbar">
                 <ButtonGroup>
-                  <Button data-tooltip={T("New Collection")}
-                          data-position="right"
-                          className="btn-tooltip"
-                          onClick={() => this.setState({showWizard: true})}
-                          variant="default">
-                    <FontAwesomeIcon icon="plus"/>
-                  </Button>
+                  <ToolTip tooltip={T("New Collection")}>
+                    <Button onClick={() => this.setState({showWizard: true})}
+                            variant="default">
+                      <FontAwesomeIcon icon="plus"/>
+                      <span className="sr-only">{T("New Collection")}</span>
+                    </Button>
+                  </ToolTip>
 
                   { client_id !== "server" &&
-                    <Button data-tooltip={T("Add to hunt")}
-                            data-position="right"
-                            className="btn-tooltip"
-                            onClick={()=>this.setState({showAddToHunt: true})}
-                            variant="default">
-                      <FontAwesomeIcon icon="crosshairs"/>
-                    </Button>
+                    <ToolTip tooltip={T("Add to hunt")} >
+                      <Button onClick={()=>this.setState({showAddToHunt: true})}
+                              variant="default">
+                        <FontAwesomeIcon icon="crosshairs"/>
+                        <span className="sr-only">{T("Add to hunt")}</span>
+                      </Button>
+                    </ToolTip>
                   }
-                  <Button data-tooltip={T("Delete Artifact Collection")}
-                          data-position="right"
-                          className="btn-tooltip"
-                          onClick={()=>this.setState({showDeleteWizard: true}) }
-                          variant="default">
-                    <FontAwesomeIcon icon="trash-alt"/>
-                  </Button>
-
-                  { this.props.selected_flow.state !== "FINISHED" &&
-                    <Button data-tooltip={T("Cancel Artifact Collection")}
-                            data-position="right"
-                            className="btn-tooltip"
+                  <ToolTip tooltip={T("Delete Artifact Collection")}>
+                    <Button onClick={()=>this.setState({showDeleteWizard: true}) }
+                            variant="default">
+                      <FontAwesomeIcon icon="trash-alt"/>
+                      <span className="sr-only">{T("Delete Artifact Collection")}</span>
+                    </Button>
+                  </ToolTip>
+                  <ToolTip tooltip={T("Cancel Artifact Collection")}>
+                    <Button disabled={this.state.multiSelectedFlows.length < 2 &&
+                                      (this.props.selected_flow.state === "FINISHED" ||
+                                       this.props.selected_flow.state === "ERROR")}
                             onClick={this.cancelButtonClicked}
                             variant="default">
-                    <FontAwesomeIcon icon="stop"/>
+                      <FontAwesomeIcon icon="stop"/>
+                      <span className="sr-only">{T("Cancel Artifact Collection")}</span>
                     </Button>
-                  }
-                  <Button data-tooltip={T("Copy Collection")}
-                          data-position="right"
-                          className="btn-tooltip"
-                          onClick={() => this.setState({showCopyWizard: true})}
-                          variant="default">
-                    <FontAwesomeIcon icon="copy"/>
-                  </Button>
-                  <Button data-tooltip={T("Save Collection")}
-                          data-position="right"
-                          className="btn-tooltip"
-                          onClick={() => this.setState({
-                              showSaveCollectionDialog: true
-                          })}
-                          variant="default">
-                    <FontAwesomeIcon icon="save"/>
-                  </Button>
-
-                  { isServer &&
-                    <Button data-tooltip={T("Build offline collector")}
-                            data-position="right"
-                            className="btn-tooltip"
-                            onClick={() => this.setState({showOfflineWizard: true})}
+                  </ToolTip>
+                  <ToolTip tooltip={T("Copy Collection")}>
+                    <Button onClick={this.copyCollection}
                             variant="default">
-                      <FontAwesomeIcon icon="paper-plane"/>
+                      <FontAwesomeIcon icon="copy"/>
+                      <span className="sr-only">{T("Copy Collection")}</span>
                     </Button>
-                  }
+                  </ToolTip>
+                  <ToolTip tooltip={T("Save Collection")} >
+                    <Button onClick={() => this.setState({
+                                showSaveCollectionDialog: true
+                            })}
+                            variant="default">
+                      <FontAwesomeIcon icon="save"/>
+                      <span className="sr-only">{T("Save Collection")}</span>
+                    </Button>
+                  </ToolTip>
+                  <ToolTip tooltip={T("Stats Toggle")}  >
+                    <Button variant="default"
+                            onClick={this.expandSlider}>
+                      <FontAwesomeIcon icon={SLIDE_STATES[this.state.slider].icon}/>
+                    </Button>
+                  </ToolTip>
 
+                  { transform.filter_column !== "Creator" ?
+                    <ToolTip tooltip={T("Show only my collections")}>
+                      <Button onClick={()=>{
+                                  this.setState({transform: {
+                                      filter_regex: username,
+                                      filter_column: "Creator"}});
+                                  this.incrementVersion();
+                              }}
+                              variant="default">
+                        <FontAwesomeIcon icon="user" />
+                        <span className="sr-only">{T("Show only my hunts")}</span>
+                      </Button>
+                    </ToolTip>
+                    :
+                    <ToolTip tooltip={T("Show all collections")}>
+                      <Button onClick={()=>{
+                                  this.setState({transform: {}});
+                                  this.incrementVersion();
+                              }}
+                              variant="default">
+                        <FontAwesomeIcon icon="user-large-slash" />
+                        <span className="sr-only">{T("Show all hunts")}</span>
+                      </Button>
+                    </ToolTip>
+                  }
+                  { this.props.selected_flow &&
+                    this.props.selected_flow.transactions_outstanding ?
+                    <ToolTip tooltip={T("Resume Uploads")}>
+                      <Button onClick={()=>this.setState({showTransactionsDialog: true})}
+                              variant="default">
+                        <FontAwesomeIcon icon="repeat" />
+                        <span className="sr-only">{T("Resume Uploads")}</span>
+                      </Button>
+                    </ToolTip> : <></> }
+                  { isServer &&
+                    <ToolTip tooltip={T("Build offline collector")}>
+                      <Button onClick={() => this.setState({showOfflineWizard: true})}
+                              variant="default">
+                        <FontAwesomeIcon icon="paper-plane"/>
+                        <span className="sr-only">{T("Build offline collector")}</span>
+                      </Button>
+                    </ToolTip>
+                  }
                 </ButtonGroup>
+                <ButtonGroup>
+                  { this.state.page_state ?
+                    <TablePaginationControl
+                      total_size={this.state.page_state.total_size}
+                      start_row={this.state.page_state.start_row}
+                      page_size={this.state.page_state.page_size}
+                      current_page={this.state.page_state.start_row /
+                                    this.state.page_state.page_size}
+                      onRowChange={this.state.page_state.onRowChange}
+                      onPageSizeChange={this.state.page_state.onPageSizeChange}
+                    />
+                    : <TablePaginationControl total_size={0}/> }
+                  <TransformViewer
+                    transform={this.state.transform}
+                    setTransform={t=>this.setState({transform: t})}
+                  />
+                </ButtonGroup>
+
                 { tab === "notebook" &&
                   <ButtonGroup className="float-right">
-                    <Button data-tooltip={T("Notebooks")}
-                            data-position="left"
-                            className="btn-tooltip"
-                            disabled={true}
-                            variant="outline-dark">
-                      <FontAwesomeIcon icon="book"/>
-                    </Button>
+                    <ToolTip tooltip={T("Notebooks")} >
+                      <Button disabled={true}
+                              variant="outline-dark">
+                        <FontAwesomeIcon icon="book"/>
+                        <span className="sr-only">{T("Notebooks")}</span>
+                      </Button>
+                    </ToolTip>
+                    <ToolTip tooltip={T("Edit Notebook")}>
+                      <Button onClick={()=>{
+                          this.setState({loading: true});
 
-                    <Button data-tooltip={T("Full Screen")}
-                            data-position="left"
-                            className="btn-tooltip"
-                            onClick={this.setFullScreen}
-                            variant="default">
-                      <FontAwesomeIcon icon="expand"/>
-                    </Button>
+                          api.get("v1/GetNotebooks", {
+                              include_uploads: true,
+                              notebook_id: getNotebookId(
+                                  selected_flow, client_id),
+                          }, this.source.token).then(resp=>{
+                              let items = resp.data.items;
+                              if (_.isEmpty(items)) {
+                                  return;
+                              }
 
-                    <Button data-tooltip={T("Delete Notebook")}
-                            data-position="left"
-                            className="btn-tooltip"
-                            onClick={() => this.setState({showDeleteNotebook: true})}
-                            variant="default">
-                      <FontAwesomeIcon icon="trash"/>
-                    </Button>
+                              this.setState({notebook: items[0],
+                                             loading: false,
+                                             showEditNotebookDialog: true});
+                          });
+                      }}
+                              variant="default">
+                        <FontAwesomeIcon icon="wrench"/>
+                        <span className="sr-only">{T("Edit Notebook")}</span>
+                      </Button>
+                    </ToolTip>
+                    <ToolTip tooltip={T("Full Screen")}>
 
-                    <Button data-tooltip={T("Notebook Uploads")}
-                            data-position="left"
-                            className="btn-tooltip"
-                            onClick={() => this.setState({showNotebookUploadsDialog: true})}
-                            variant="default">
-                      <FontAwesomeIcon icon="fa-file-download"/>
-                    </Button>
+                      <Button onClick={this.setFullScreen}
+                              variant="default">
+                        <FontAwesomeIcon icon="expand"/>
+                        <span className="sr-only">{T("Full Screen")}</span>
+                      </Button>
+                    </ToolTip>
+                    <ToolTip tooltip={T("Delete Notebook")}>
+                      <Button onClick={() => this.setState({showDeleteNotebook: true})}
+                              variant="default">
+                        <FontAwesomeIcon icon="trash"/>
+                        <span className="sr-only">{T("Delete Notebook")}</span>
+                      </Button>
+                    </ToolTip>
 
-                    <Button data-tooltip={T("Export Notebook")}
-                            data-position="left"
-                            className="btn-tooltip"
-                            onClick={() => this.setState({showExportNotebook: true})}
-                            variant="default">
-                      <FontAwesomeIcon icon="download"/>
-                    </Button>
+                    <ToolTip tooltip={T("Export Notebook")}>
+                      <Button onClick={() => this.setState({showExportNotebook: true})}
+                              variant="default">
+                        <FontAwesomeIcon icon="download"/>
+                        <span className="sr-only">{T("Export Notebook")}</span>
+                      </Button>
+                    </ToolTip>
 
                   </ButtonGroup>
                 }
               </Navbar>
 
               <div className="fill-parent no-margins toolbar-margin selectable">
-                <HotKeys keyMap={KeyMap} handlers={keyHandlers}>
-                  <BootstrapTable
-                    hover
-                    condensed
-                    ref={ n => this.node = n }
-                    keyField="session_id"
-                    bootstrap4
-                    headerClasses="alert alert-secondary"
-                    bodyClasses="fixed-table-body"
-                    data={this.props.flows}
-                    columns={columns}
-                    selectRow={ selectRow }
-                    rowClasses={ rowClassRenderer }
-                    filter={ filterFactory() }
-                  />
-                </HotKeys>
+                <VeloPagedTable
+                  url="v1/GetClientFlows"
+                  params={{client_id: client_id}}
+                  translate_column_headers={true}
+                  prevent_transformations={{
+                      Mb: true, Rows: true,
+                      State: true, "Last Active": true}}
+                  selectRow={selectRow}
+                  renderers={flowRowRenderer}
+                  version={this.state.version}
+                  no_spinner={true}
+                  row_classes={rowClassRenderer(router_flow_id)}
+                  transform={this.state.transform}
+                  setTransform={x=>{
+                      this.setState({transform: x});
+                  }}
+                  no_toolbar={true}
+                  name={"GetClientFlows" + client_id}
+                  setPageState={x=>this.setState({page_state: x})}
+                />
               </div>
             </>
         );
@@ -594,6 +720,7 @@ class FlowsList extends React.Component {
 export default withRouter(FlowsList);
 
 
+
 const stateRenderer = (cell, row) => {
     let result = <></>;
 
@@ -601,44 +728,84 @@ const stateRenderer = (cell, row) => {
         result = <FontAwesomeIcon icon="check"/>;
 
     } else if (cell === "RUNNING") {
+        result = <FontAwesomeIcon icon="calendar-plus" />;
+
+    } else if (cell === "WAITING") {
         result = <FontAwesomeIcon icon="hourglass"/>;
+
+    } else if (cell === "IN_PROGRESS") {
+        // An error occured but the flow is still running.
+        if(row && row._Flow && row._Flow.status) {
+            result = <>
+                       <FontAwesomeIcon icon="person-running"/>&nbsp;
+                       <FontAwesomeIcon icon="exclamation"/>
+                     </>;
+        } else {
+
+            result = <FontAwesomeIcon icon="person-running"/>;
+        }
+
+    } else if (cell === "UNRESPONSIVE") {
+        result = <FontAwesomeIcon icon="question"/>;
 
     } else {
         result = <FontAwesomeIcon icon="exclamation"/>;
     }
 
-    return <div className="flow-status-icon">{result}</div>;
+    return <ToolTip tooltip={T(cell)}>
+             <div className="flow-status-icon">{result}</div>
+           </ToolTip>;
 };
 
-const rowClassRenderer = (row, rowIndex) => {
-    if (row.request && row.request.urgent) {
-        return 'flow-urgent';
+export const flowRowRenderer = {
+    State: stateRenderer,
+    Artifacts: (cell, row) => {
+        return _.map(cell, function(item, idx) {
+            return <div key={idx}>{item}</div>;
+        });
+    },
+};
+
+const rowClassRenderer = (selected_flow_id) => {
+    return (row, rowIndex) => {
+        if (row._Urgent === "true") {
+            return 'flow-urgent';
+        }
+        return "";
+    };
+};
+
+
+export class SimpleFlowsList extends React.Component {
+    static propTypes = {
+        client_id: PropTypes.string,
+        setSelectedFlow: PropTypes.func,
+        selected_flow: PropTypes.object,
+        version: PropTypes.object,
+    };
+
+    render() {
+        const selectRow = {
+            onSelect: row=>{
+                this.props.setSelectedFlow(row._Flow);
+            },
+        };
+
+        return (
+            <>
+              <VeloPagedTable
+                url="v1/GetClientFlows"
+                params={{client_id: this.props.client_id}}
+                translate_column_headers={true}
+                prevent_transformations={{
+                    Mb: true, Rows: true,
+                    State: true, "Last Active": true}}
+                selectRow={selectRow}
+                renderers={flowRowRenderer}
+                version={this.props.version}
+                setPageState={x=>this.setState({page_state: x})}
+              />
+            </>
+        );
     }
-    return '';
 };
-
-export function getFlowColumns(client_id) {
-    return formatColumns([
-        {dataField: "state", text: T("State"), sort: true,
-         formatter: stateRenderer,
-        },
-        {dataField: "session_id", text: T("FlowId"), type: "flow"},
-        {dataField: "request.artifacts", text: T("Artifacts"),
-         sort: true, filtered: true,
-         formatter: (cell, row) => {
-             return _.map(cell, function(item, idx) {
-                 return <div key={idx}>{item}</div>;
-             });
-         }},
-        {dataField: "create_time", text: T("Created"), sort: true,
-         type: "timestamp"},
-        {dataField: "active_time", text: T("Last Active"), sort: true,
-         type: "timestamp"},
-        {dataField: "request.creator", text: T("Creator"),
-         sort: true, filtered: true},
-        {dataField: "total_uploaded_bytes", text: T("Mb"),
-         align: 'right', sort: true, sortNumeric: true, type: "mb"},
-        {dataField: "total_collected_rows", text: T("Rows"),
-         sort: true, sortNumeric: true, align: 'right'}
-    ]);
-}

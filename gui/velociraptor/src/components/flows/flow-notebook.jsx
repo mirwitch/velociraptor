@@ -1,11 +1,15 @@
 import React from 'react';
 import PropTypes from 'prop-types';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 import api from '../core/api-service.jsx';
 import NotebookRenderer from '../notebooks/notebook-renderer.jsx';
 import _ from 'lodash';
 import T from '../i8n/i8n.jsx';
+import Spinner from '../utils/spinner.jsx';
+
 const POLL_TIME = 5000;
+
+import { getNotebookId } from './utils.jsx';
 
 
 export default class FlowNotebook extends React.Component {
@@ -19,7 +23,7 @@ export default class FlowNotebook extends React.Component {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.interval = setInterval(this.fetchNotebooks, POLL_TIME);
         this.fetchNotebooks();
     }
@@ -56,14 +60,22 @@ export default class FlowNotebook extends React.Component {
             return;
         }
 
-        let notebook_id = "N." + flow_id + "-" + client_id;
+        let notebook_id = getNotebookId(flow_id, client_id);
 
         this.source.cancel();
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
 
-        this.setState({loading: true});
+        // Only show the loading sign when we load a new notebook not
+        // for periodic refresh.
+        let old_notebook_id = this.state.notebook &&
+            this.state.notebook.notebook_id;
+        if (notebook_id !== old_notebook_id) {
+            this.setState({loading: true});
+        }
+
         api.get("v1/GetNotebooks", {
             notebook_id: notebook_id,
+            include_uploads: true,
         }, this.source.token).then(response=>{
             if (response.cancel) return;
 
@@ -78,29 +90,23 @@ export default class FlowNotebook extends React.Component {
             let request = {
                 name: T("Notebook for Collection", flow_id),
                 notebook_id: notebook_id,
-                context: {
-                    type: "flow",
-                    flow_id: flow_id,
-                    client_id: client_id,
-                },
                 // Flow notebooks are all public.
                 public: true,
-                env: [
-                    {key: "FlowId", value: flow_id},
-                    {key: "ClientId", value: client_id},
-                    {key: "NotebookId", value: notebook_id},
-                ],
             };
 
+            this.setState({loading: true});
             api.post('v1/NewNotebook', request,
                      this.source.token).then((response) => {
-                let cell_metadata = response.data && response.data.cell_metadata;
-                if (_.isEmpty(cell_metadata)) {
-                    return;
-                }
+                         this.setState({loading: false});
 
-                this.fetchNotebooks();
-            });
+                         let cell_metadata = response.data &&
+                             response.data.cell_metadata;
+                         if (_.isEmpty(cell_metadata)) {
+                             return;
+                         }
+
+                         this.fetchNotebooks();
+                     });
         });
     }
 
@@ -109,16 +115,18 @@ export default class FlowNotebook extends React.Component {
         let flow_id = this.props.flow && this.props.flow.session_id;
 
         return (
-            <> {!_.isEmpty(this.state.notebook) &&
-                <NotebookRenderer
-                  env={{
-                      client_id: client_id,
-                      flow_id: flow_id,
-                  }}
-                  notebook={this.state.notebook}
-                  fetchNotebooks={this.fetchNotebooks}
-                />
-               }
+            <>
+              <Spinner loading={this.state.loading } />
+              {!_.isEmpty(this.state.notebook) &&
+               <NotebookRenderer
+                 env={{
+                     client_id: client_id,
+                     flow_id: flow_id,
+                 }}
+                 notebook={this.state.notebook}
+                 updateVersion={this.fetchNotebooks}
+               />
+              }
             </>
         );
     }

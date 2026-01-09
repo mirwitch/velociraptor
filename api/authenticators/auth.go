@@ -1,30 +1,50 @@
 package authenticators
 
 import (
+	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 
+	"www.velocidex.com/golang/velociraptor/acls"
+	utils "www.velocidex.com/golang/velociraptor/api/utils"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 )
 
 var (
 	mu sync.Mutex
 
+	// Factory dispatcher
 	auth_dispatcher = make(map[string]func(
+		ctx *HTTPClientContext,
 		config_obj *config_proto.Config,
 		auth_config *config_proto.Authenticator) (Authenticator, error))
+
+	auth_cache Authenticator
 )
+
+func ResetAuthCache() {
+	mu.Lock()
+	defer mu.Unlock()
+	auth_cache = nil
+}
 
 // All SSO Authenticators implement this interface.
 type Authenticator interface {
-	AddHandlers(mux *http.ServeMux) error
-	AddLogoff(mux *http.ServeMux) error
-	AuthenticateUserHandler(parent http.Handler) http.Handler
+	AddHandlers(mux *utils.ServeMux) error
+	AddLogoff(mux *utils.ServeMux) error
+
+	// Make sure the user is authenticated and has the required
+	// permission access to the requested org. (usually this is
+	// acls.READ_RESULTS)
+	AuthenticateUserHandler(parent http.Handler,
+		permission acls.ACL_PERMISSION) http.Handler
 
 	IsPasswordLess() bool
+	RequireClientCerts() bool
 	AuthRedirectTemplate() string
 }
 
@@ -35,11 +55,35 @@ func NewAuthenticator(config_obj *config_proto.Config) (Authenticator, error) {
 		return nil, errors.New("GUI not configured")
 	}
 
-	return getAuthenticatorByType(config_obj, config_obj.GUI.Authenticator)
+	mu.Lock()
+	cached := auth_cache
+	mu.Unlock()
+
+	if cached != nil {
+		return cached, nil
+	}
+
+	ctx, err := ClientContext(context.Background(), config_obj,
+		DefaultTransforms(config_obj, config_obj.GUI.Authenticator))
+	if err != nil {
+		return nil, err
+	}
+
+	new_auth, err := getAuthenticatorByType(
+		ctx, config_obj, config_obj.GUI.Authenticator)
+	if err == nil {
+		mu.Lock()
+		auth_cache = new_auth
+		mu.Unlock()
+	}
+
+	return new_auth, err
 }
 
 func RegisterAuthenticator(name string,
-	handler func(config_obj *config_proto.Config,
+	handler func(
+		ctx *HTTPClientContext,
+		config_obj *config_proto.Config,
 		auth_config *config_proto.Authenticator) (Authenticator, error)) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -48,14 +92,19 @@ func RegisterAuthenticator(name string,
 }
 
 func getAuthenticatorByType(
+	ctx *HTTPClientContext,
 	config_obj *config_proto.Config,
 	auth_config *config_proto.Authenticator) (Authenticator, error) {
 
 	mu.Lock()
-	handler, pres := auth_dispatcher[strings.ToLower(auth_config.Type)]
+	key := strings.ToLower(auth_config.Type)
+	handler, pres := auth_dispatcher[key]
 	mu.Unlock()
 	if pres {
-		return handler(config_obj, auth_config)
+		// Make sure the dispatcher lock is unlocked during call to
+		// handler - the multi authenticator needs to access the
+		// other types.
+		return handler(ctx, config_obj, auth_config)
 	}
 	return nil, errors.New("No valid authenticator found")
 }
@@ -70,94 +119,135 @@ func configRequirePublicUrl(config_obj *config_proto.Config) error {
 }
 
 func init() {
-	RegisterAuthenticator("azure", func(config_obj *config_proto.Config,
+	RegisterAuthenticator("azure", func(
+		ctx *HTTPClientContext,
+		config_obj *config_proto.Config,
 		auth_config *config_proto.Authenticator) (Authenticator, error) {
 		err := configRequirePublicUrl(config_obj)
 		if err != nil {
 			return nil, err
 		}
-		return &AzureAuthenticator{
+		router := &AzureOidcRouter{
 			config_obj:    config_obj,
 			authenticator: auth_config,
-			base:          getBasePath(config_obj),
-			public_url:    getPublicURL(config_obj),
-		}, nil
+		}
+		claims_getter := &AzureClaimsGetter{
+			config_obj: config_obj,
+			router:     router,
+		}
+		return NewOidcAuthenticator(
+			config_obj, auth_config, router, claims_getter), nil
 	})
 
-	RegisterAuthenticator("github", func(config_obj *config_proto.Config,
+	RegisterAuthenticator("github", func(
+		ctx *HTTPClientContext,
+		config_obj *config_proto.Config,
 		auth_config *config_proto.Authenticator) (Authenticator, error) {
 		err := configRequirePublicUrl(config_obj)
 		if err != nil {
 			return nil, err
 		}
-		return &GitHubAuthenticator{
-			config_obj:    config_obj,
-			authenticator: auth_config,
-			base:          getBasePath(config_obj),
-			public_url:    getPublicURL(config_obj),
-		}, nil
+
+		router := &GithubOidcRouter{
+			config_obj: config_obj,
+		}
+		claims_getter := &GithubClaimsGetter{
+			config_obj: config_obj,
+		}
+		return NewOidcAuthenticator(
+			config_obj, auth_config, router, claims_getter), nil
 	})
 
-	RegisterAuthenticator("google", func(config_obj *config_proto.Config,
+	// This is now basically an alias for a generic OIDC connector
+	// since Google is pretty good about following the standards.
+	RegisterAuthenticator("google", func(
+		ctx *HTTPClientContext,
+		config_obj *config_proto.Config,
 		auth_config *config_proto.Authenticator) (Authenticator, error) {
 		err := configRequirePublicUrl(config_obj)
 		if err != nil {
 			return nil, err
 		}
-		return &GoogleAuthenticator{
-			config_obj:    config_obj,
-			authenticator: auth_config,
-			base:          getBasePath(config_obj),
-			public_url:    getPublicURL(config_obj),
-		}, nil
+
+		router := &GoogleOidcRouter{
+			config_obj: config_obj,
+		}
+
+		claims_getter, err := NewOidcClaimsGetter(
+			ctx, config_obj, auth_config, router)
+		if err != nil {
+			return nil, err
+		}
+
+		return NewOidcAuthenticator(
+			config_obj, auth_config, router, claims_getter), nil
 	})
 
-	RegisterAuthenticator("saml", func(config_obj *config_proto.Config,
+	RegisterAuthenticator("saml", func(
+		ctx *HTTPClientContext,
+		config_obj *config_proto.Config,
 		auth_config *config_proto.Authenticator) (Authenticator, error) {
 		return NewSamlAuthenticator(config_obj, auth_config)
 	})
 
-	RegisterAuthenticator("basic", func(config_obj *config_proto.Config,
+	RegisterAuthenticator("basic", func(
+		ctx *HTTPClientContext,
+		config_obj *config_proto.Config,
 		auth_config *config_proto.Authenticator) (Authenticator, error) {
 		return &BasicAuthenticator{
 			config_obj: config_obj,
-			base:       getBasePath(config_obj),
-			public_url: getPublicURL(config_obj),
 		}, nil
 	})
 
-	RegisterAuthenticator("oidc", func(config_obj *config_proto.Config,
+	RegisterAuthenticator("certs", func(
+		ctx *HTTPClientContext,
+		config_obj *config_proto.Config,
+		auth_config *config_proto.Authenticator) (Authenticator, error) {
+		if config_obj.GUI == nil || config_obj.GUI.UsePlainHttp {
+			return nil, errors.New("'Certs' authenticator must use TLS!")
+		}
+
+		result := &CertAuthenticator{
+			config_obj:    config_obj,
+			x509_roots:    x509.NewCertPool(),
+			default_roles: auth_config.DefaultRolesForUnknownUser,
+		}
+		if config_obj.Client != nil {
+			result.x509_roots.AppendCertsFromPEM([]byte(
+				config_obj.Client.CaCertificate))
+		}
+
+		return result, nil
+	})
+
+	RegisterAuthenticator("oidc", func(
+		ctx *HTTPClientContext,
+		config_obj *config_proto.Config,
 		auth_config *config_proto.Authenticator) (Authenticator, error) {
 		err := configRequirePublicUrl(config_obj)
 		if err != nil {
 			return nil, err
 		}
-		return &OidcAuthenticator{
-			config_obj:    config_obj,
+
+		router := &DefaultOidcRouter{
 			authenticator: auth_config,
-			base:          getBasePath(config_obj),
-			public_url:    getPublicURL(config_obj),
-		}, nil
+			config_obj:    config_obj,
+		}
+
+		claims_getter, err := NewOidcClaimsGetter(
+			ctx, config_obj, auth_config, router)
+		if err != nil {
+			return nil, err
+		}
+
+		return NewOidcAuthenticator(
+			config_obj, auth_config, router, claims_getter), nil
 	})
 
-	RegisterAuthenticator("multi", func(config_obj *config_proto.Config,
+	RegisterAuthenticator("multi", func(
+		ctx *HTTPClientContext,
+		config_obj *config_proto.Config,
 		auth_config *config_proto.Authenticator) (Authenticator, error) {
-		return NewMultiAuthenticator(config_obj, auth_config)
+		return NewMultiAuthenticator(ctx, config_obj, auth_config)
 	})
-}
-
-// Ensure base path start and ends with /
-func getBasePath(config_obj *config_proto.Config) string {
-	bare := strings.TrimSuffix(config_obj.GUI.BasePath, "/")
-	bare = strings.TrimPrefix(bare, "/")
-	if bare == "" {
-		return "/"
-	}
-	return "/" + bare + "/"
-}
-
-// Ensure public URL start and ends with /
-func getPublicURL(config_obj *config_proto.Config) string {
-	bare := strings.TrimSuffix(config_obj.GUI.PublicUrl, "/")
-	return bare + "/"
 }

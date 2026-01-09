@@ -1,33 +1,37 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package csv
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/accessors/file"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/config"
 	"www.velocidex.com/golang/velociraptor/file_store/csv"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -52,17 +56,12 @@ func (self ParseCSVPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "parse_csv", args)()
 
 		arg := &ParseCSVPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 		if err != nil {
 			scope.Log("parse_csv: %s", err.Error())
-			return
-		}
-
-		err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-		if err != nil {
-			scope.Log("parse_csv: %s", err)
 			return
 		}
 
@@ -81,7 +80,11 @@ func (self ParseCSVPlugin) Call(
 				}
 				defer fd.Close()
 
-				csv_reader := csv.NewReader(fd)
+				csv_reader, err := csv.NewReader(fd)
+				if err != nil {
+					scope.Log("parse_csv: %v", err)
+					return
+				}
 				csv_reader.TrimLeadingSpace = true
 				csv_reader.LazyQuotes = true
 
@@ -110,15 +113,21 @@ func (self ParseCSVPlugin) Call(
 
 				var headers []string
 				for {
+					before_offset := csv_reader.ByteOffset
 					row := ordereddict.NewDict()
 					row_data, err := csv_reader.ReadAny()
-					if err == io.EOF {
+					if errors.Is(err, io.EOF) {
 						return
 					}
 
 					if err != nil {
 						// Report the error and skip to the next record
-						scope.Log("parse_csv: %v", err)
+						scope.Log("INFO:parse_csv: %v", err)
+
+						// If we are not making any progress, just give up
+						if csv_reader.ByteOffset == before_offset {
+							return
+						}
 						continue
 					}
 
@@ -157,9 +166,10 @@ func (self ParseCSVPlugin) Call(
 
 func (self ParseCSVPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "parse_csv",
-		Doc:     "Parses events from a CSV file.",
-		ArgType: type_map.AddType(scope, &ParseCSVPluginArgs{}),
+		Name:     "parse_csv",
+		Doc:      "Parses events from a CSV file.",
+		ArgType:  type_map.AddType(scope, &ParseCSVPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -173,6 +183,7 @@ func (self _WatchCSVPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "watch_csv", args)()
 
 		arg := &ParseCSVPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -181,18 +192,18 @@ func (self _WatchCSVPlugin) Call(
 			return
 		}
 
-		err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-		if err != nil {
-			scope.Log("watch_csv: %s", err)
-			return
-		}
-
 		event_channel := make(chan vfilter.Row)
+
+		config_obj, ok := vql_subsystem.GetServerConfig(scope)
+		if !ok {
+			config_obj = config.GetDefaultConfig()
+		}
 
 		// Register the output channel as a listener to the
 		// global event.
 		for _, filename := range arg.Filenames {
-			GlobalCSVService.Register(
+			watcher_service := NewCSVWatcherService(config_obj)
+			watcher_service.Register(
 				filename, arg.Accessor,
 				ctx, scope, event_channel)
 		}
@@ -216,12 +227,13 @@ func (self _WatchCSVPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap)
 		Name: "watch_csv",
 		Doc: "Watch a CSV file and stream events from it. " +
 			"Note: This is an event plugin which does not complete.",
-		ArgType: type_map.AddType(scope, &ParseCSVPluginArgs{}),
+		ArgType:  type_map.AddType(scope, &ParseCSVPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
 type WriteCSVPluginArgs struct {
-	Filename string              `vfilter:"required,field=filename,doc=CSV files to open"`
+	Filename *accessors.OSPath   `vfilter:"required,field=filename,doc=CSV files to open"`
 	Accessor string              `vfilter:"optional,field=accessor,doc=The accessor to use"`
 	Query    vfilter.StoredQuery `vfilter:"required,field=query,doc=query to write into the file."`
 }
@@ -236,6 +248,7 @@ func (self WriteCSVPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "write_csv", args)()
 
 		arg := &WriteCSVPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -254,7 +267,21 @@ func (self WriteCSVPlugin) Call(
 				return
 			}
 
-			file, err := os.OpenFile(arg.Filename,
+			// Make sure we are allowed to write there.
+			err = file.CheckPrefix(arg.Filename)
+			if err != nil {
+				scope.Log("write_csv: %v", err)
+				return
+			}
+
+			underlying_file, err := accessors.GetUnderlyingAPIFilename(
+				arg.Accessor, scope, arg.Filename)
+			if err != nil {
+				scope.Log("write_csv: %s", err)
+				return
+			}
+
+			file, err := os.OpenFile(underlying_file,
 				os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0700)
 			if err != nil {
 				scope.Log("write_csv: Unable to open file %s: %s",
@@ -289,9 +316,10 @@ func (self WriteCSVPlugin) Call(
 
 func (self WriteCSVPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "write_csv",
-		Doc:     "Write a query into a CSV file.",
-		ArgType: type_map.AddType(scope, &WriteCSVPluginArgs{}),
+		Name:     "write_csv",
+		Doc:      "Write a query into a CSV file.",
+		ArgType:  type_map.AddType(scope, &WriteCSVPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_WRITE).Build(),
 	}
 }
 

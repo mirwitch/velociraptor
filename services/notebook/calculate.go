@@ -2,23 +2,13 @@ package notebook
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"runtime/debug"
-	"strings"
 	"time"
 
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	"www.velocidex.com/golang/velociraptor/json"
-	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/paths"
-	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
-	"www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
-
 
 func (self *NotebookManager) UpdateNotebookCell(
 	ctx context.Context,
@@ -26,290 +16,140 @@ func (self *NotebookManager) UpdateNotebookCell(
 	user_name string,
 	in *api_proto.NotebookCellRequest) (*api_proto.NotebookCell, error) {
 
+	// Request does not specify a version - get the current version
+	// from the data store and append a new version on the end.
+	if in.Version == "" {
+		cell_metadata, err := self.getCurrentCellVersion(
+			in.NotebookId, in.CellId)
+		if err != nil {
+			return nil, err
+		}
+
+		// The cell is currently not versioned at all - treat the old
+		// version as an empty string version. This supports backwards
+		// compatibility with older releases.
+		if cell_metadata.CurrentVersion == "" {
+			cell_metadata.AvailableVersions = []string{""}
+		}
+
+		// We are about to add a new version on the cell, so we need
+		// to trim any redo versions which will be lost once the cell
+		// is recalculated.
+		cell_metadata.AvailableVersions, err = self.trimRedoVersions(
+			ctx, self.config_obj, notebook_metadata.NotebookId, cell_metadata.CellId,
+			cell_metadata.CurrentVersion, cell_metadata.AvailableVersions)
+		if err != nil {
+			return nil, err
+		}
+
+		// Next version
+		in.Version = GetNextVersion(cell_metadata.CurrentVersion)
+		in.AvailableVersions = append(cell_metadata.AvailableVersions, in.Version)
+
+		// Trim older versions
+		in.AvailableVersions, err = self.trimOldCellVersions(
+			ctx, self.config_obj, notebook_metadata.NotebookId,
+			in.CellId, in.AvailableVersions)
+		if err != nil {
+			return nil, err
+		}
+
+		// Preserve the cell type
+		if in.Type == "" {
+			in.Type = cell_metadata.Type
+		}
+	}
+
+	if in.Type == "" {
+		in.Type = "markdown"
+	}
+
+	// Write the cell record as calculating while we attempt to
+	// schedule it.
 	notebook_cell := &api_proto.NotebookCell{
-		Input:            in.Input,
-		Output:           `<div class="padded"><i class="fa fa-spinner fa-spin fa-fw"></i> Calculating...</div>`,
-		CellId:           in.CellId,
-		Type:             in.Type,
-		Timestamp:        time.Now().Unix(),
-		CurrentlyEditing: in.CurrentlyEditing,
-		Calculating:      true,
-		Env:              in.Env,
+		Input:             in.Input,
+		CellId:            in.CellId,
+		Type:              in.Type,
+		Timestamp:         utils.GetTime().Now().UnixNano(),
+		CurrentlyEditing:  in.CurrentlyEditing,
+		Calculating:       true,
+		Output:            "Loading",
+		Env:               in.Env,
+		CurrentVersion:    in.Version,
+		AvailableVersions: in.AvailableVersions,
 	}
 
-	notebook_path_manager := paths.NewNotebookPathManager(
-		notebook_metadata.NotebookId)
+	// If the output field is specified, we just set it as is without
+	// actually calculating it.
+	if in.Output != "" {
+		notebook_cell.Calculating = false
+		notebook_cell.CurrentlyEditing = false
+		notebook_cell.Output = in.Output
+		return notebook_cell, self.Store.SetNotebookCell(
+			notebook_metadata.NotebookId, notebook_cell)
+	}
 
-	err := self.Store.SetNotebook(notebook_metadata)
+	err := self.Store.SetNotebookCell(
+		notebook_metadata.NotebookId, notebook_cell)
 	if err != nil {
-		return nil, err
+		return notebook_cell, err
 	}
 
-	// Run the actual query independently.
-	query_ctx, query_cancel := context.WithCancel(context.Background())
+	request := &NotebookRequest{
+		NotebookMetadata:    notebook_metadata,
+		Username:            user_name,
+		NotebookCellRequest: in,
+	}
 
-	acl_manager := acl_managers.NewServerACLManager(self.config_obj, user_name)
-
-	manager, err := services.GetRepositoryManager(self.config_obj)
+	scheduler, err := services.GetSchedulerService(self.config_obj)
 	if err != nil {
-		return nil, err
+		return notebook_cell, err
 	}
-	global_repo, err := manager.GetGlobalRepository(self.config_obj)
+
+	// Read work is done in NotebookWorker.ProcessUpdateRequest
+	response_chan, err := scheduler.Schedule(ctx, services.SchedulerJob{
+		Queue: "Notebook",
+		Job:   json.MustMarshalString(request),
+		OrgId: self.config_obj.OrgId,
+	})
 	if err != nil {
-		return nil, err
+		// Failed to schedule this cell - write the error in the cell.
+		notebook_cell.Calculating = false
+		notebook_cell.Error = err.Error()
+		notebook_cell.Messages = append(notebook_cell.Messages,
+			"ERROR:"+err.Error())
+
+		err1 := self.Store.SetNotebookCell(notebook_metadata.NotebookId, notebook_cell)
+		if err1 != nil {
+			return notebook_cell, err1
+		}
+
+		return notebook_cell, err
 	}
 
-	tmpl, err := reporting.NewGuiTemplateEngine(
-		self.config_obj, query_ctx, nil, acl_manager, global_repo,
-		notebook_path_manager.Cell(in.CellId),
-		"Server.Internal.ArtifactDescription")
-	if err != nil {
-		return nil, err
+	wait := 2 * time.Second
+	if in.Sync {
+		wait = time.Hour
 	}
 
-	tmpl.SetEnv("NotebookId", in.NotebookId)
+	// Only wait here for a short time to keep the browser moving.
+	fast_ctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
 
-	// Register a progress reporter so we can monitor how the
-	// template rendering is going.
-	tmpl.Progress = &progressReporter{
-		config_obj:    self.config_obj,
-		notebook_cell: notebook_cell,
-		notebook_id:   in.NotebookId,
-		start:         time.Now(),
-		store:         self.Store,
-	}
+	select {
+	case <-fast_ctx.Done():
+		return notebook_cell, nil
 
-	// Add the notebook environment into the cell template.
-	for _, env := range notebook_metadata.Env {
-		tmpl.SetEnv(env.Key, env.Value)
-	}
-
-	// Also apply the cell env
-	for _, env := range in.Env {
-		tmpl.SetEnv(env.Key, env.Value)
-	}
-
-	input := in.Input
-	cell_type := in.Type
-
-	// Update the content asynchronously
-	start_time := time.Now()
-
-	// RPC call deadline - if we can complete within 1 second pass
-	// the response directly to the RPC caller.
-	sub_ctx, sub_cancel := context.WithTimeout(ctx, time.Second)
-
-	// Main error will be delivered to the RPC caller if we can
-	// complete the entire operation before the deadline.
-	var main_err error
-
-	// Watcher thread: Wait for cancellation from the GUI or a 10 min timeout.
-	go func() {
-		defer query_cancel()
-
-		notifier, err := services.GetNotifier(self.config_obj)
+	case job_resp, ok := <-response_chan:
+		if !ok {
+			return notebook_cell, nil
+		}
+		notebook_resp := &NotebookResponse{}
+		err := json.Unmarshal([]byte(job_resp.Job), notebook_resp)
 		if err != nil {
-			return
-		}
-		cancel_notify, remove_notification := notifier.
-			ListenForNotification(in.CellId)
-		defer remove_notification()
-
-		default_notebook_expiry := self.config_obj.Defaults.NotebookCellTimeoutMin
-		if default_notebook_expiry == 0 {
-			default_notebook_expiry = 10
+			return nil, err
 		}
 
-		select {
-		// Query is done - get out of here.
-		case <-query_ctx.Done():
-
-		// Active cancellation from the GUI.
-		case <-cancel_notify:
-			tmpl.Scope.Log("Cancelled after %v !", time.Since(start_time))
-
-			// Set a timeout.
-		case <-time.After(time.Duration(default_notebook_expiry) * time.Minute):
-			tmpl.Scope.Log("Query timed out after %v !", time.Since(start_time))
-		}
-
-	}()
-
-	// Main worker: Just run the query until done.
-	go func() {
-		// Cancel and release the main thread if we
-		// finish quickly before the timeout.
-		defer sub_cancel()
-
-		// Make sure to cancel the query context if we
-		// finished early - the Waiter goroutine above will be
-		// released.
-		defer query_cancel()
-
-		// Close the template when we are done with it.
-		defer tmpl.Close()
-
-		resp, err := self.updateCellContents(query_ctx, tmpl,
-			in.CurrentlyEditing, in.NotebookId,
-			in.CellId, cell_type, in.Env, input, in.Input)
-		if err != nil {
-			main_err = err
-			logger := logging.GetLogger(self.config_obj, &logging.GUIComponent)
-			logger.Error("Rendering error: %v", err)
-		}
-
-		// Update the response if we can.
-		if resp != nil {
-			notebook_cell = resp
-		}
-	}()
-
-	// Wait here up to 1 second for immediate response - but if
-	// the response takes too long, just give up and return a
-	// continuation. The GUI will continue polling for notebook
-	// state and will pick up the changes by itself.
-	<-sub_ctx.Done()
-
-	return notebook_cell, main_err
-}
-
-func (self *NotebookManager) updateCellContents(
-	ctx context.Context,
-	tmpl *reporting.GuiTemplateEngine,
-	currently_editing bool,
-	notebook_id, cell_id, cell_type string,
-	env []*api_proto.Env,
-	input, original_input string) (res *api_proto.NotebookCell, err error) {
-
-	output := ""
-
-	cell_type = strings.ToLower(cell_type)
-
-	// Create a new cell to set the result in.
-	make_cell := func(output string) *api_proto.NotebookCell {
-		encoded_data, err := json.Marshal(tmpl.Data)
-		if err != nil {
-			tmpl.Scope.Log("Error: %v", err)
-		}
-
-		return &api_proto.NotebookCell{
-			Input:            original_input,
-			Output:           output,
-			Data:             string(encoded_data),
-			Messages:         tmpl.Messages(),
-			MoreMessages:     tmpl.MoreMessages(),
-			CellId:           cell_id,
-			Type:             cell_type,
-			Env:              env,
-			Timestamp:        time.Now().Unix(),
-			CurrentlyEditing: currently_editing,
-			Duration:         int64(time.Since(tmpl.Start).Seconds()),
-		}
-	}
-
-	// If an error occurs it is important to ensure the cell is
-	// still written with an error message.
-	make_error_cell := func(output string, err error) (
-		*api_proto.NotebookCell, error) {
-		tmpl.Scope.Log("Error: %v", err)
-		return make_cell(output), err
-	}
-
-	// Do not let exceptions take down the server.
-	defer func() {
-		r := recover()
-		if r != nil {
-			res, err = make_error_cell("", fmt.Errorf(
-				"PANIC: %v: %v", r, string(debug.Stack())))
-		}
-	}()
-
-	switch cell_type {
-
-	case "vql_suggestion":
-		// noop - these cells will be created by the user on demand.
-
-	case "markdown", "md":
-		// A Markdown cell just feeds directly into the
-		// template.
-		output, err = tmpl.Execute(&artifacts_proto.Report{Template: input})
-		if err != nil {
-			return make_error_cell(output, err)
-		}
-
-	case "vql":
-		// No query, nothing to do
-		if reporting.IsEmptyQuery(input) {
-			tmpl.Error("Please specify a query to run")
-		} else {
-			vqls, err := vfilter.MultiParseWithComments(input)
-			if err != nil {
-				// Try parsing without comments if comment parser fails
-				vqls, err = vfilter.MultiParse(input)
-				if err != nil {
-					return make_error_cell(output, err)
-				}
-			}
-
-			no_query := true
-			for _, vql := range vqls {
-				if vql.Comments != nil {
-					// Only extract multiline comments to render template
-					// Ignore code comments
-					comments := multiLineCommentsToString(vql)
-					if comments != "" {
-					    fragment_output, err := tmpl.Execute(&artifacts_proto.Report{Template: comments})
-					    if err != nil {
-						    return make_error_cell(output, err)
-					    }
-					    output += fragment_output
-					}
-				}
-				if vql.Let != "" || vql.Query != nil || vql.StoredQuery != nil {
-					no_query = false
-					rows, err := tmpl.RunQuery(vql, nil)
-
-					if err != nil {
-						return make_error_cell(output, err)
-					}
-
-					// VQL Let won't return rows. Ignore
-					if vql.Let == "" {
-						output_any, ok := tmpl.Table(rows).(string)
-						if ok {
-							output += output_any
-						}
-					}
-				}
-			}
-			// No VQL found, only comments
-			if no_query {
-				tmpl.Error("Please specify a query to run")
-			}
-		}
-
-	default:
-		return make_error_cell(output, errors.New("Unsupported cell type."))
-	}
-
-	tmpl.Close()
-
-	notebook_cell := make_cell(output)
-	return notebook_cell, self.Store.SetNotebookCell(notebook_id, notebook_cell)
-}
-
-func multiLineCommentsToString(vql *vfilter.VQL) string {
-	output := ""
-
-	for _, comment := range vql.Comments {
-		if comment.MultiLine != nil {
-			output += *comment.MultiLine
-		}
-	}
-
-	if output != "" {
-		return output[2 : len(output)-2]
-	} else {
-		return output
+		return notebook_resp.NotebookCell, job_resp.Err
 	}
 }

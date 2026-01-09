@@ -4,7 +4,13 @@
 
 .velo-table {
     margin-top: 10px;
+    padding-left: 16px;
 }
+
+.table > :not(:last-child) > :last-child > *  {
+    border-bottom-color: transparent;
+}
+
 
 /* Collapse empty rows as much as possible */
 .velo-table td:empty {
@@ -52,4 +58,8 @@ td .number {
 
 button.table-transformed.btn[disabled] {
     color: var(--color-foreground);
+}
+
+.no-break {
+    white-space: pre;
 }

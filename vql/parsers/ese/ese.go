@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -25,10 +25,12 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/go-ese/parser"
-	ntfs "www.velocidex.com/golang/go-ntfs/parser"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/readers"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
@@ -63,6 +65,7 @@ func (self _SRUMLookupId) Call(
 	ctx context.Context, scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
+	defer vql_subsystem.RegisterMonitor(ctx, "srum_lookup_id", args)()
 	defer utils.RecoverVQL(scope)
 
 	arg := &_SRUMLookupIdArgs{}
@@ -72,49 +75,31 @@ func (self _SRUMLookupId) Call(
 		return &vfilter.Null{}
 	}
 
-	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-	if err != nil {
-		scope.Log("srum_lookup_id: %s", err)
-		return &vfilter.Null{}
-	}
-
 	key := arg.Filename.String() + arg.Accessor
 	lookup_map, ok := vql_subsystem.CacheGet(scope, key).(map[int64]string)
 	if !ok {
 		lookup_map = make(map[int64]string)
 		defer vql_subsystem.CacheSet(scope, key, lookup_map)
 
-		accessor, err := accessors.GetAccessor(arg.Accessor, scope)
+		// Use a managed reader
+		reader, err := readers.NewAccessorReader(scope, arg.Accessor, arg.Filename, 10000)
 		if err != nil {
-			scope.Log("srum_lookup_id: %v", err)
-			return &vfilter.Null{}
-		}
-		fd, err := accessor.OpenWithOSPath(arg.Filename)
-		if err != nil {
-			scope.Log("parse_ese: Unable to open file %s: %v",
+			scope.Log("srum_lookup_id: Unable to open file %s: %v",
 				arg.Filename, err)
 			return &vfilter.Null{}
 		}
-		defer fd.Close()
-
-		reader, err := ntfs.NewPagedReader(
-			utils.MakeReaderAtter(fd), 1024, 10000)
-		if err != nil {
-			scope.Log("parse_ese: Unable to open file %s: %v",
-				arg.Filename, err)
-			return &vfilter.Null{}
-		}
+		defer reader.Close()
 
 		ese_ctx, err := parser.NewESEContext(reader)
 		if err != nil {
-			scope.Log("parse_ese: Unable to open file %s: %v",
+			scope.Log("srum_lookup_id: Unable to open file %s: %v",
 				arg.Filename, err)
 			return &vfilter.Null{}
 		}
 
 		catalog, err := parser.ReadCatalog(ese_ctx)
 		if err != nil {
-			scope.Log("parse_ese: Unable to open file %s: %v",
+			scope.Log("srum_lookup_id: Unable to open file %s: %v",
 				arg.Filename, err)
 			return &vfilter.Null{}
 		}
@@ -138,7 +123,7 @@ func (self _SRUMLookupId) Call(
 			return nil
 		})
 		if err != nil {
-			scope.Log("parse_ese: Unable to open file %s: %v",
+			scope.Log("srum_lookup_id: Unable to open file %s: %v",
 				arg.Filename, err)
 			return &vfilter.Null{}
 		}
@@ -194,6 +179,7 @@ func (self _ESEPlugin) Call(
 	go func() {
 		defer close(output_chan)
 		defer utils.RecoverVQL(scope)
+		defer vql_subsystem.RegisterMonitor(ctx, "parse_ese", args)()
 
 		arg := &_ESEArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -206,32 +192,12 @@ func (self _ESEPlugin) Call(
 			arg.Accessor = "auto"
 		}
 
-		err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-		if err != nil {
-			scope.Log("parse_ese: %s", err)
-			return
-		}
-
-		accessor, err := accessors.GetAccessor(arg.Accessor, scope)
+		reader, err := readers.NewAccessorReader(scope, arg.Accessor, arg.Filename, 10000)
 		if err != nil {
 			scope.Log("parse_ese: %v", err)
 			return
 		}
-		fd, err := accessor.OpenWithOSPath(arg.Filename)
-		if err != nil {
-			scope.Log("parse_ese: Unable to open file %s: %v",
-				arg.Filename, err)
-			return
-		}
-		defer fd.Close()
-
-		reader, err := ntfs.NewPagedReader(
-			utils.MakeReaderAtter(fd), 1024, 10000)
-		if err != nil {
-			scope.Log("parse_ese: Unable to open file %s: %v",
-				arg.Filename, err)
-			return
-		}
+		defer reader.Close()
 
 		ese_ctx, err := parser.NewESEContext(reader)
 		if err != nil {
@@ -271,9 +237,10 @@ func (self _ESEPlugin) Call(
 
 func (self _ESEPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "parse_ese",
-		Doc:     "Opens an ESE file and dump a table.",
-		ArgType: type_map.AddType(scope, &_ESEArgs{}),
+		Name:     "parse_ese",
+		Doc:      "Opens an ESE file and dump a table.",
+		ArgType:  type_map.AddType(scope, &_ESEArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -292,6 +259,7 @@ func (self _ESECatalogPlugin) Call(
 	go func() {
 		defer close(output_chan)
 		defer utils.RecoverVQL(scope)
+		defer vql_subsystem.RegisterMonitor(ctx, "parse_ese_catalog", args)()
 
 		arg := &_ESECatalogArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -304,32 +272,12 @@ func (self _ESECatalogPlugin) Call(
 			arg.Accessor = "auto"
 		}
 
-		err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-		if err != nil {
-			scope.Log("parse_ese_catalog: %s", err)
-			return
-		}
-
-		accessor, err := accessors.GetAccessor(arg.Accessor, scope)
+		reader, err := readers.NewAccessorReader(scope, arg.Accessor, arg.Filename, 10000)
 		if err != nil {
 			scope.Log("parse_ese_catalog: %v", err)
 			return
 		}
-		fd, err := accessor.OpenWithOSPath(arg.Filename)
-		if err != nil {
-			scope.Log("parse_ese_catalog: Unable to open file %s: %v",
-				arg.Filename, err)
-			return
-		}
-		defer fd.Close()
-
-		reader, err := ntfs.NewPagedReader(
-			utils.MakeReaderAtter(fd), 1024, 10000)
-		if err != nil {
-			scope.Log("parse_ese_catalog: Unable to open file %s: %v",
-				arg.Filename, err)
-			return
-		}
+		defer reader.Close()
 
 		ese_ctx, err := parser.NewESEContext(reader)
 		if err != nil {
@@ -345,16 +293,15 @@ func (self _ESECatalogPlugin) Call(
 			return
 		}
 
-		for _, name := range catalog.Tables.Keys() {
-			table_any, _ := catalog.Tables.Get(name)
-			table := table_any.(*parser.Table)
+		for _, i := range catalog.Tables.Items() {
+			table := i.Value.(*parser.Table)
 
 			for _, column := range table.Columns {
 				select {
 				case <-ctx.Done():
 					return
 				case output_chan <- ordereddict.NewDict().
-					Set("Table", name).
+					Set("Table", i.Key).
 					Set("Column", column.Name).
 					Set("Type", column.Type):
 				}
@@ -367,9 +314,10 @@ func (self _ESECatalogPlugin) Call(
 
 func (self _ESECatalogPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "parse_ese_catalog",
-		Doc:     "Opens an ESE file and dump the schema.",
-		ArgType: type_map.AddType(scope, &_ESECatalogArgs{}),
+		Name:     "parse_ese_catalog",
+		Doc:      "Opens an ESE file and dump the schema.",
+		ArgType:  type_map.AddType(scope, &_ESECatalogArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

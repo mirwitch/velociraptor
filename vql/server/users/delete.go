@@ -4,9 +4,8 @@ import (
 	"context"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sirupsen/logrus"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/users"
+	"www.velocidex.com/golang/velociraptor/services"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -25,6 +24,12 @@ func (self UserDeleteFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
+	err := services.RequireFrontend()
+	if err != nil {
+		scope.Log("user_delete: %v", err)
+		return vfilter.Null{}
+	}
+
 	// ACLs are checked by the users module
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
@@ -33,7 +38,7 @@ func (self UserDeleteFunction) Call(
 	}
 
 	arg := &UserDeleteFunctionArgs{}
-	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+	err = arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
 		scope.Log("user_delete: %s", err)
 		return vfilter.Null{}
@@ -44,16 +49,25 @@ func (self UserDeleteFunction) Call(
 		orgs = arg.OrgIds
 	}
 
-	principal := vql_subsystem.GetPrincipal(scope)
-	logging.LogAudit(config_obj, principal, "user_delete",
-		logrus.Fields{"Username": arg.Username})
-
 	if arg.ReallyDoIt {
-		err = users.DeleteUser(ctx, principal, arg.Username, orgs)
+		principal := vql_subsystem.GetPrincipal(scope)
+		users_manager := services.GetUserManager()
+		err = users_manager.DeleteUser(ctx, principal, arg.Username, orgs)
 		if err != nil {
 			scope.Log("user_delete: %s", err)
 			return vfilter.Null{}
 		}
+
+		err = services.LogAudit(ctx,
+			config_obj, principal, "user_delete",
+			ordereddict.NewDict().
+				Set("username", arg.Username).
+				Set("org_ids", orgs))
+		if err != nil {
+			logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+			logger.Error("<red>user_delete</> %v %v", principal, arg.Username)
+		}
+
 	} else {
 		scope.Log("user_delete: Will remove %v from orgs %v", arg.Username, orgs)
 	}

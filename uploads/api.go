@@ -4,8 +4,10 @@ package uploads
 import (
 	"context"
 	"io"
+	"os"
 	"time"
 
+	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -22,9 +24,55 @@ type UploadResponse struct {
 	Reference  string   `json:"Reference,omitempty"`
 	Components []string `json:"Components,omitempty"`
 	Accessor   string   `json:"Accessor,omitempty"`
+	ID         int64    `json:"UploadId"`
 
 	// The type of upload this is (Currently "idx" is an index file)
 	Type string `json:"Type,omitempty"`
+}
+
+func (self *UploadResponse) AsDict() *ordereddict.Dict {
+	res := ordereddict.NewDict().
+		Set("Path", self.Path).
+		Set("Size", self.Size).
+		Set("UploadId", self.ID)
+
+	if self.StoredSize > 0 {
+		res.Set("StoredSize", self.StoredSize)
+	}
+
+	if self.Error != "" {
+		res.Set("Error", self.Error)
+	}
+
+	if self.Sha256 != "" {
+		res.Set("sha256", self.Sha256)
+	}
+
+	if self.Md5 != "" {
+		res.Set("md5", self.Md5)
+	}
+
+	if self.StoredName != "" {
+		res.Set("StoredName", self.StoredName)
+	}
+
+	if self.Reference != "" {
+		res.Set("Reference", self.Reference)
+	}
+
+	if len(self.Components) > 0 {
+		res.Set("Components", append([]string{}, self.Components...))
+	}
+
+	if self.Accessor != "" {
+		res.Set("Accessor", self.Accessor)
+	}
+
+	if self.Type != "" {
+		res.Set("Type", self.Type)
+	}
+
+	return res
 }
 
 // Provide an uploader capable of uploading any reader object.
@@ -39,7 +87,8 @@ type Uploader interface {
 		atime time.Time,
 		ctime time.Time,
 		btime time.Time,
-		reader io.Reader) (*UploadResponse, error)
+		mode os.FileMode,
+		reader io.ReadSeeker) (*UploadResponse, error)
 }
 
 // A generic interface for reporting file ranges. Implementations will
@@ -57,59 +106,4 @@ type RangeReader interface {
 	io.Seeker
 
 	Ranges() []Range
-}
-
-func RangeSize(runs []Range) int64 {
-	if len(runs) == 0 {
-		return 0
-	}
-
-	last_run := runs[len(runs)-1]
-	return last_run.Offset + last_run.Length
-}
-
-// Get the ranges of a reader if possible. If the reader can not
-// provide this information we just make a pseudo range that covers
-// the entire size of the reader with its expected_size.
-func GetRanges(
-	ctx context.Context,
-	reader io.Reader,
-	expected_size int64) (<-chan io.Reader, []Range) {
-	output_chan := make(chan io.Reader)
-
-	ranges := []Range{{Length: expected_size}}
-
-	// Can the reader produce ranges?
-	range_reader, ok := reader.(RangeReader)
-	if ok {
-		ranges = range_reader.Ranges()
-	}
-
-	go func() {
-		defer close(output_chan)
-
-		range_reader, ok := reader.(RangeReader)
-		if !ok {
-			select {
-			case <-ctx.Done():
-				return
-			case output_chan <- reader:
-			}
-			return
-		}
-
-		for _, rng := range ranges {
-			_, err := range_reader.Seek(rng.Offset, io.SeekStart)
-			if err == nil {
-				select {
-				case <-ctx.Done():
-					return
-				case output_chan <- io.LimitReader(range_reader, rng.Length):
-				}
-			}
-		}
-
-	}()
-
-	return output_chan, ranges
 }

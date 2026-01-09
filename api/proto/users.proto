@@ -110,10 +110,21 @@ message ApiUserInterfaceTraits {
     // Current selected Org.
     string org = 24;
 
-    bool disable_server_events = 26;
+    // The user's specific base path - only used for crazy reverse
+    // proxy configurations.
+    string base_path = 29;
 
+    // Optional features of the UI to disable.
+    bool disable_server_events = 26;
     string auth_redirect_template = 27;
+    bool disable_quarantine_button = 28;
 };
+
+message GlobalUserMessage {
+    string key = 1;
+    string level = 2;
+    string message = 3;
+}
 
 // Describe the user to the GUI.
 message ApiUser {
@@ -138,12 +149,20 @@ message ApiUser {
     bool org_admin = 12 [(sem_type) = {
         description: "Whether this user is an OrgAdmin"
     }];
+
+    repeated GlobalUserMessage global_messages = 13;
 }
 
 // Contol the GUI per user.
 message GUICustomizations {
     bool disable_server_events = 1;
     bool disable_user_management = 2;
+    bool disable_quarantine_button = 3;
+
+    // Updated from config_obj.Defaults.HuntExpiryHours
+    int64 hunt_expiry_hours = 4;
+
+    repeated string indexed_client_metadata = 5;
 }
 
 message SetGUIOptionsRequest {
@@ -151,7 +170,9 @@ message SetGUIOptionsRequest {
     string timezone = 6;
     string lang = 5;
 
-    // Downloads will be protected using this password.
+    // Downloads will be protected using this password. If this is
+    // empty we do not update the password. If it is set to "-" we
+    // reset the password to the empty string.
     string default_password = 3;
 
     // Offer to protect download exports by default.
@@ -165,7 +186,22 @@ message SetGUIOptionsRequest {
     GUICustomizations customizations = 8;
 
     repeated GUILink links = 9;
+
+    // Optional features of the UI to disable:
+    // TODO: Move to GUICustomizations.
+    bool disable_server_events = 26;
+    string auth_redirect_template = 27;
+    bool disable_quarantine_button = 28;
 }
+
+message SetGUIOptionsResponse {
+    // If this is specifed the GUI will redirect to the specified
+    // URL. This helps when there are multiple servers that can handle
+    // the user and a better one is needed. Normally this is really
+    // set by any middleware (e.g. custom authenticators).
+    string redirect_url = 1;
+}
+
 
 message Users {
     repeated VelociraptorUser users = 1;

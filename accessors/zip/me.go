@@ -2,10 +2,10 @@ package zip
 
 import (
 	"io"
-	"os"
 
 	"github.com/go-errors/errors"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/config"
 	"www.velocidex.com/golang/velociraptor/third_party/zip"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -19,10 +19,7 @@ type MEFileSystemAccessor struct {
 func (self *MEFileSystemAccessor) GetZipFile(file_path *accessors.OSPath) (
 	*ZipFileCache, error) {
 
-	me, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
+	me := config.EmbeddedFile
 
 	mu.Lock()
 	zip_file_cache, pres := self.fd_cache[me]
@@ -101,7 +98,7 @@ func (self *MEFileSystemAccessor) LstatWithOSPath(
 		return nil, err
 	}
 
-	return root.GetZipInfo(full_path)
+	return root.GetZipInfo(full_path, false)
 }
 
 func (self *MEFileSystemAccessor) Open(serialized_path string) (
@@ -124,7 +121,7 @@ func (self *MEFileSystemAccessor) OpenWithOSPath(
 	}
 
 	// Get the zip member from the zip file.
-	fd, err := zip_file_cache.Open(full_path)
+	fd, err := zip_file_cache.Open(full_path, false)
 	if err != nil {
 		zip_file_cache.Close()
 		return nil, err
@@ -151,7 +148,7 @@ func (self *MEFileSystemAccessor) ReadDirWithOSPath(
 		return nil, err
 	}
 
-	children, err := root.GetChildren(full_path)
+	children, err := root.GetChildren(full_path, false)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +175,14 @@ func (self MEFileSystemAccessor) New(scope vfilter.Scope) (
 	return &MEFileSystemAccessor{base.(*ZipFileSystemAccessor)}, nil
 }
 
+func (self MEFileSystemAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name:        "me",
+		Description: `Access files bundled inside the Velociraptor binary itself. This is used for unpacking extra files delivered by the Offline Collector`,
+	}
+}
+
 func init() {
-	accessors.Register("me", &MEFileSystemAccessor{},
-		`Access files bundled inside the Velociraptor binary itself. This is used for unpacking extra files delivered by the Offline Collector`)
+	accessors.Register(&MEFileSystemAccessor{})
+
 }

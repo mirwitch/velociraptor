@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"strings"
 
-	"github.com/sirupsen/logrus"
+	"github.com/Velocidex/ordereddict"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
@@ -21,6 +21,7 @@ func createInitialUsers(
 		return nil
 	}
 
+	superuser := utils.GetSuperuserName(config_obj)
 	user_names := config_obj.GUI.InitialUsers
 
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
@@ -30,6 +31,7 @@ func createInitialUsers(
 	for _, org := range config_obj.GUI.InitialOrgs {
 		org_list = append(org_list, org.OrgId)
 	}
+
 	org_manager, err := services.GetOrgManager()
 	if err != nil {
 		return err
@@ -37,7 +39,7 @@ func createInitialUsers(
 
 	for _, user := range user_names {
 		users_manager := services.GetUserManager()
-		user_record, err := users_manager.GetUser(ctx, user.Name)
+		user_record, err := users_manager.GetUser(ctx, superuser, user.Name)
 		if err != nil || user_record.Name != user.Name {
 			logger.Info("Initial user %v not present, creating", user.Name)
 			new_user, err := users.NewUserRecord(config_obj, user.Name)
@@ -102,9 +104,13 @@ func createInitialUsers(
 				return err
 			}
 
-			logging.LogAudit(config_obj, "SanityService",
+			err = services.LogAudit(ctx,
+				config_obj, "SanityService",
 				"Granting administrator role, because user is specified in the config's initial users",
-				logrus.Fields{"user": user.Name})
+				ordereddict.NewDict().Set("user", user.Name))
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil

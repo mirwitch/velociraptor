@@ -1,7 +1,6 @@
 package artifacts_test
 
 import (
-	"io/ioutil"
 	"os"
 	"path"
 	"runtime"
@@ -12,11 +11,14 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
+	"www.velocidex.com/golang/velociraptor/datastore"
+	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/memory"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/simple"
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
@@ -58,14 +60,14 @@ func (self *PathManageTestSuite) SetupTest() {
 	self.ConfigObj = self.LoadConfig()
 
 	var err error
-	self.dirname, err = ioutil.TempDir("", "path_manager_test")
+	self.dirname, err = tempfile.TempDir("path_manager_test")
 	assert.NoError(self.T(), err)
 
 	self.ConfigObj.Datastore.Implementation = "FileBaseDataStore"
 	self.ConfigObj.Datastore.FilestoreDirectory = self.dirname
 	self.ConfigObj.Datastore.Location = self.dirname
 
-	self.LoadArtifacts([]string{`
+	self.LoadArtifactsIntoConfig([]string{`
 name: Windows.Sys.Users
 type: CLIENT
 `, `
@@ -94,34 +96,38 @@ func (self *PathManageTestSuite) TearDownTest() {
 // by day to ensure they are not too large and can be easily archived.
 func (self *PathManageTestSuite) TestPathManager() {
 	ts := int64(1587800823)
+	closer := utils.MockTime(utils.NewMockClock(time.Unix(ts, 0)))
+	defer closer()
+
+	db, err := datastore.GetDB(self.ConfigObj)
+	assert.NoError(self.T(), err)
 
 	for _, testcase := range path_tests {
 		path_manager, err := artifacts.NewArtifactPathManager(
-			self.ConfigObj,
+			self.Ctx, self.ConfigObj,
 			testcase.client_id,
 			testcase.flow_id,
 			testcase.full_artifact_name)
 		assert.NoError(self.T(), err)
 
-		path_manager.Clock = &utils.MockClock{MockNow: time.Unix(ts, 0)}
 		path, err := path_manager.GetPathForWriting()
 		assert.NoError(self.T(), err)
 		assert.Equal(self.T(),
-			cleanPath(path.AsFilestoreFilename(self.ConfigObj)),
+			cleanPath(datastore.AsFilestoreFilename(
+				db, self.ConfigObj, path)),
 			cleanPath(self.dirname+"/"+testcase.expected))
 
-		file_store := memory.NewMemoryFileStore(self.ConfigObj)
-		file_store.Clear()
-
+		file_store_factory := memory.NewMemoryFileStore(self.ConfigObj)
 		qm := memory.NewMemoryQueueManager(
-			self.ConfigObj, file_store).(*memory.MemoryQueueManager)
-		qm.Clock = path_manager.Clock
+			self.ConfigObj, file_store_factory).(*memory.MemoryQueueManager)
+
+		file_store.OverrideFilestoreImplementation(self.ConfigObj, file_store_factory)
 
 		err = qm.PushEventRows(path_manager,
 			[]*ordereddict.Dict{ordereddict.NewDict()})
 		assert.NoError(self.T(), err)
 
-		data, ok := file_store.Get(cleanPath(
+		data, ok := file_store_factory.Get(cleanPath(
 			self.dirname + testcase.expected))
 		assert.Equal(self.T(), ok, true)
 		assert.Equal(self.T(), string(data), "{\"_ts\":1587800823}\n")

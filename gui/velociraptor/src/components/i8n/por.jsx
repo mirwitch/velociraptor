@@ -1,8 +1,15 @@
+import _ from 'lodash';
+import hex2a from "./utils";
+import React from 'react';
 import Alert from 'react-bootstrap/Alert';
 import humanizeDuration from "humanize-duration";
+import api from '../core/api-service.jsx';
+
+import automated from "./por.json";
+
 
 const Portuguese = {
-    SEARCH_CLIENTS: "Pesquisar clientes",
+    "SEARCH_CLIENTS": "Pesquisar clientes",
     "Quarantine description": (
         <>
           <p>Você está prestes a colocar este host em quarentena.</p>
@@ -96,6 +103,10 @@ const Portuguese = {
     },
     "Create a new artifact": "Criar um novo artefato",
     "Save": "Salvar",
+    "Search": "Procurar",
+    "Toggle Main Menu": "Alternar menu principal",
+    "Main Menu": "Menu principal",
+    "Welcome": "Bem-vindo",
 
     // Navegação do teclado.
     "Global hotkeys": "Teclas de atalho globais",
@@ -171,8 +182,8 @@ const Portuguese = {
     "Permanently delete collection": "Excluir coleta permanentemente",
     "ArtifactDeletionDialog": (session_id, artifacts, total_bytes, total_rows)=>
     <>
-      Você está prestes a excluir permanentemente a coleta de artefatos
-      <b>{session_id}</b>.
+      Você está prestes a excluir permanentemente a coleta de
+      artefatos <b>{session_id}</b>.
       <br/>
       Esta coleta tinha os artefatos <b className="wrapped-text">
                     {artifacts}
@@ -242,7 +253,7 @@ const Portuguese = {
     "Max Execution Time in Seconds":"Tempo Máx. de Execução em Segundos",
     "Max Idle Time in Seconds":"Tempo Ocioso Máximo em Segundos",
     "If set collection will be terminated after this many seconds with no progress.":"Caso configurado, a coleta terminará após se passar o numero selecionado em segundos sem nenhum progresso.",
-    "Max Mb Uploaded":"Máximo de MB carregados",
+    "Max bytes Uploaded":"Máximo de MB carregados",
     "Collection did not upload files":"A coleta não possui arquivos enviados",
 
     "Create Offline collector: Select artifacts to collect":"Criar Coletor Offline: Selecione Artefatos para Coletar",
@@ -371,19 +382,19 @@ const Portuguese = {
     em seu próprio disco e depois compara seu hash quando necessário.
     As ferramentas só serão baixadas se o hash mudar.
         </>,
-    "ServedFromURL": (base_path, url)=>
+    "ServedFromURL": (url)=>
     <>
-      Os clientes obtêm a ferramenta diretamente de
-      <a href={base_path + url}>{url}</a> se
+      Os clientes obtêm a ferramenta diretamente
+      de <a href={api.href(url)}>{url}</a> se
       necessário. Observe que, se o hash não corresponder ao
       hash esperado, os clientes rejeitarão o arquivo.
     </>,
     "ServedFromGithub": (github_project, github_asset_regex)=>
     <>
       O URL da ferramenta é atualizado por
-      GitHub como a versão mais recente do projeto
-      <b>{github_project}</b> que se encaixa
-      <b>{github_asset_regex}</b>
+      GitHub como a versão mais recente do
+      projeto <b>{github_project}</b> que se
+      encaixa <b>{github_asset_regex}</b>
     </>,
     "PlaceHolder":
         <>
@@ -492,12 +503,15 @@ const Portuguese = {
     "Theme":"Tópico",
     "Select a theme":"Selecione um tópico",
     "Default Velociraptor":"Velociraptor Padrão",
-    "Velociraptor (light)":"Velociraptor (light)",
-    "Ncurses (light)":"Ncurses (light)",
-    "Velociraptor (dark)":"Velociraptor (dark)",
-    "Github dimmed (dark)":"Github esmaecido (dark)",
-    "Cool Gray (dark)":"Cinza frio (dark)",
-    "Strawberry Milkshake (light)":"Strawberry Milkshake (light)",
+    "Velociraptor Classic (light)": "Velociraptor Clássico (leve)",
+    "Velociraptor (light)":"Velociraptor (leve)",
+    "Ncurses (light)":"Ncurses (leve)",
+    "Ncurses (dark)":"Ncurses (escuro)",
+    "Velociraptor (dark)":"Velociraptor (escuro)",
+    "Github dimmed (dark)":"Github esmaecido (escuro)",
+    "Github (light)":"Github (leve)",
+    "Cool Gray (dark)":"Cinza frio (escuro)",
+    "Strawberry Milkshake (light)":"Strawberry Milkshake (leve)",
     "Downloads Password":"Senha para Downloads",
     "Default password to use for downloads":"Senha padrão para downloads",
 
@@ -571,8 +585,6 @@ const Portuguese = {
     "vfs_path":"vfs_path",
     "file_size":"file_size",
     "uploaded_size":"uploaded_size",
-    "TablePagination": (from, to, size)=>
-    <>Mostrar linha { from } a { to } de { size }</>,
 
     "Select a language":"Selecionar idioma",
     "English":"Inglês",
@@ -608,6 +620,59 @@ const Portuguese = {
     "Show client monitoring tables":"Mostrar tabelas de monitoramento de clientes",
     "Urgent": "Urgente",
     "Skip queues and run query urgently": "Pule filas e execute a consulta com urgência",
+
+    // Below need verification
+    "Role_administrator": "Administrador do servidor",
+    "Role_org_admin": "Administrador da organização",
+    "Role_reader": "Usuário somente leitura",
+    "Role_analyst": "Analista",
+    "Role_investigator" : "Investigador",
+    "Role_artifact_writer": "Escritor de artefato",
+     "Role_api": "Cliente de API somente leitura",
+
+     "Perm_ANY_QUERY": "Qualquer consulta",
+     "Perm_PUBISH": "Publicar",
+     "Perm_READ_RESULTS": "Ler resultados",
+     "Perm_LABEL_CLIENT": "Clientes de etiquetas",
+     "Perm_COLLECT_CLIENT": "Coletar cliente",
+     "Perm_START_HUNT": "Iniciar busca",
+     "Perm_COLLECT_SERVER": "Coletar servidor",
+     "Perm_ARTIFACT_WRITER": "Gravador de artefato",
+     "Perm_SERVER_ARTIFACT_WRITER": "Gravador de artefato do servidor",
+     "Perm_EXECVE" : "EXECVE",
+     "Perm_NOTEBOOK_EDITOR": "Editor de Caderno",
+     "Perm_SERVER_ADMIN": "Administrador do servidor",
+     "Perm_ORG_ADMIN": "Administrador da organização",
+     "Perm_IMPERSONATION": "Impersonation",
+     "Perm_FILESYSTEM_READ": "Leitura do sistema de arquivos",
+     "Perm_FILESYSTEM_WRITE": "Gravação do sistema de arquivos",
+     "Perm_MACHINE_STATE": "Estado da máquina",
+     "Perm_PREPARE_RESULTS": "Preparar resultados",
+     "Perm_DATASTORE_ACCESS": "Acesso ao armazenamento de dados",
+
+     "ToolPerm_ANY_QUERY": "Emitir qualquer consulta ",
+     "ToolPerm_PUBISH": "Publicar eventos em filas do lado do servidor (normalmente não é necessário)",
+     "ToolPerm_READ_RESULTS": "Ler resultados de buscas, fluxos ou notebooks já executados",
+     "ToolPerm_LABEL_CLIENT": "Pode manipular rótulos e metadados do cliente",
+     "ToolPerm_COLLECT_CLIENT": "Agendar ou cancelar novas coletas em clientes",
+     "ToolPerm_START_HUNT": "Iniciar uma nova busca",
+     "ToolPerm_COLLECT_SERVER": "Agendar novas coletas de artefatos nos servidores Velociraptor",
+     "ToolPerm_ARTIFACT_WRITER": "Adicionar ou editar artefatos personalizados executados no servidor",
+     "ToolPerm_SERVER_ARTIFACT_WRITER": "Adicionar ou editar artefatos personalizados executados no servidor",
+     "ToolPerm_EXECVE": "Permitido executar comandos arbitrários em clientes",
+     "ToolPerm_NOTEBOOK_EDITOR": "Permitido alterar blocos de anotações e células",
+     "ToolPerm_SERVER_ADMIN": "Permitido para gerenciar a configuração do servidor",
+     "ToolPerm_ORG_ADMIN": "Permitido para gerenciar organizações",
+     "ToolPerm_IMPERSONATION": "Permite que o usuário especifique um nome de usuário diferente para o plug-in query()",
+     "ToolPerm_FILESYSTEM_READ": "Permitido ler arquivos arbitrários do sistema de arquivos",
+     "ToolPerm_FILESYSTEM_WRITE": "Permitido criar arquivos no sistema de arquivos",
+     "ToolPerm_MACHINE_STATE": "Permitido coletar informações de estado de máquinas (por exemplo, pslist())",
+     "ToolPerm_PREPARE_RESULTS": "Permitido criar arquivos zip",
+     "ToolPerm_DATASTORE_ACCESS": "Acesso permitido ao armazenamento de dados brutos",
 };
+
+_.each(automated, (v, k)=>{
+    Portuguese[hex2a(k)] = v;
+});
 
 export default Portuguese;

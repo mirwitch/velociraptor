@@ -2,20 +2,16 @@ import React, { Component } from 'react';
 import PropTypes from 'prop-types';
 
 import _ from 'lodash';
-import axios from 'axios';
-import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-
-import classNames from "classnames";
+import {CancelToken} from 'axios';
 
 import TreeView from '../utils/tree/tree.jsx';
 
 import UserConfig from '../core/user.jsx';
-import { SplitPathComponents, Join } from '../utils/paths.jsx';
+import { EncodePathInURL, DecodePathInURL, SplitPathComponents, Join } from '../utils/paths.jsx';
 
 import api from '../core/api-service.jsx';
 import { withRouter }  from "react-router-dom";
-
-import { EncodePathInURL, DecodePathInURL } from '../utils/paths.jsx';
+import { JSONparse } from '../utils/json_parse.jsx';
 
 
 class VeloFileTree extends Component {
@@ -26,10 +22,14 @@ class VeloFileTree extends Component {
         version: PropTypes.string,
         updateVFSPath: PropTypes.func,
         updateCurrentNode: PropTypes.func,
+
+        // React router props.
+        match: PropTypes.object,
+        history: PropTypes.object,
     }
 
     componentDidMount() {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.updateTree(this.props.vfs_path);
     }
 
@@ -164,7 +164,7 @@ class VeloFileTree extends Component {
 
             // Cancel any in flight calls.
             this.source.cancel();
-            this.source = axios.CancelToken.source();
+            this.source = CancelToken.source();
 
             api.get("v1/VFSListDirectory/" + client_id, {
                 vfs_components: prev_components,
@@ -176,7 +176,7 @@ class VeloFileTree extends Component {
 
                 if (response && response.data) {
                     // Hold on to the raw data.
-                    node.raw_data = JSON.parse(response.data.Response || '[]');
+                    node.raw_data = JSONparse(response.data.Response,  []);
                     node.flow_id = response.data.flow_id;
                     node.start_idx = response.data.start_idx;
                     node.end_idx = response.data.end_idx;
@@ -194,7 +194,7 @@ class VeloFileTree extends Component {
                             children.push({
                                 name: file_info.Name,
                                 path: path_components,
-                                full_path: file_info._FullPath,
+                                full_path: file_info._OSPath || file_info._FullPath,
                                 children: [],
                             });
                         }

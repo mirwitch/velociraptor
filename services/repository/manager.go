@@ -3,13 +3,14 @@ package repository
 import (
 	"context"
 	"errors"
-	"fmt"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	"github.com/Velocidex/yaml/v2"
+	"google.golang.org/protobuf/proto"
 	"www.velocidex.com/golang/velociraptor/artifacts/assets"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
@@ -26,18 +27,29 @@ type RepositoryManager struct {
 	global_repository *Repository
 	wg                *sync.WaitGroup
 	config_obj        *config_proto.Config
+	metadata          *metadataManager
 }
 
 func (self *RepositoryManager) NewRepository() services.Repository {
-	return &Repository{
-		Data: make(map[string]*artifacts_proto.Artifact),
+	result := &Repository{
+		Data:     make(map[string]*artifacts_proto.Artifact),
+		metadata: self.metadata,
 	}
+
+	return result
 }
 
 // Watch for updates from other nodes to the repository manager.
 func (self *RepositoryManager) StartWatchingForUpdates(
 	ctx context.Context, wg *sync.WaitGroup,
 	config_obj *config_proto.Config) error {
+
+	// Are we running on the client? we dont need to sync local
+	// repository managers.
+	if config_obj.Services != nil &&
+		config_obj.Services.ClientEventTable {
+		return nil
+	}
 
 	journal, err := services.GetJournal(config_obj)
 	if err != nil {
@@ -98,9 +110,10 @@ func (self *RepositoryManager) StartWatchingForUpdates(
 						continue
 					}
 
-					artifact, err := global_repository.LoadYaml(definition,
-						!services.ValidateArtifact,
-						!services.ArtifactIsBuiltIn)
+					artifact, err := global_repository.LoadYaml(
+						definition, services.ArtifactOptions{
+							ValidateArtifact:  false,
+							ArtifactIsBuiltIn: false})
 
 					if err == nil {
 						logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
@@ -108,13 +121,39 @@ func (self *RepositoryManager) StartWatchingForUpdates(
 					}
 
 				default:
-					fmt.Printf("Unknown op %v\n", op)
+					logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+					logger.Error("RepositoryManager: <red>Unknown op %v</>", op)
 				}
 			}
 		}
 	}()
 
 	return nil
+}
+
+func (self *RepositoryManager) SetArtifactMetadata(
+	ctx context.Context, config_obj *config_proto.Config,
+	principal, name string, metadata *artifacts_proto.ArtifactMetadata) error {
+
+	self.metadata.Set(name, metadata)
+
+	// Tell interested parties that we modified this artifact.
+	journal, err := services.GetJournal(config_obj)
+	if err != nil {
+		return err
+	}
+
+	err = journal.PushRowsToArtifact(ctx, config_obj,
+		[]*ordereddict.Dict{
+			ordereddict.NewDict().
+				Set("setter", principal).
+				Set("artifact", name).
+				Set("op", "metadata").
+				Set("metadata", metadata).
+				Set("id", self.id),
+		}, "Server.Internal.ArtifactModification", "server", "")
+
+	return err
 }
 
 func (self *RepositoryManager) GetGlobalRepository(
@@ -134,7 +173,8 @@ func (self *RepositoryManager) SetGlobalRepositoryForTests(
 }
 
 func (self *RepositoryManager) SetArtifactFile(
-	config_obj *config_proto.Config, principal, definition, required_prefix string) (
+	ctx context.Context, config_obj *config_proto.Config,
+	principal, definition, required_prefix string) (
 	*artifacts_proto.Artifact, error) {
 
 	// Use regexes to force the artifact into the correct prefix.
@@ -145,7 +185,9 @@ func (self *RepositoryManager) SetArtifactFile(
 	// Ensure that the artifact is correct by parsing it.
 	tmp_repository := self.NewRepository()
 	artifact_definition, err := tmp_repository.LoadYaml(
-		definition, services.ValidateArtifact, !services.ArtifactIsBuiltIn)
+		definition, services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: false})
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +208,9 @@ func (self *RepositoryManager) SetArtifactFile(
 
 	// Load the artifact into the currently running repository.
 	artifact, err := global_repository.LoadYaml(
-		definition, services.ValidateArtifact, !services.ArtifactIsBuiltIn)
+		definition, services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: false})
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +245,7 @@ func (self *RepositoryManager) SetArtifactFile(
 		return nil, err
 	}
 
-	err = journal.PushRowsToArtifact(config_obj,
+	err = journal.PushRowsToArtifact(ctx, config_obj,
 		[]*ordereddict.Dict{
 			ordereddict.NewDict().
 				Set("setter", principal).
@@ -220,14 +264,15 @@ func (self *RepositoryManager) SetParent(
 }
 
 func (self *RepositoryManager) DeleteArtifactFile(
-	config_obj *config_proto.Config, principal, name string) error {
+	ctx context.Context, config_obj *config_proto.Config,
+	principal, name string) error {
 	global_repository, err := self.GetGlobalRepository(config_obj)
 	if err != nil {
 		return err
 	}
 
 	// If not there nothing to do...
-	_, pres := global_repository.Get(config_obj, name)
+	_, pres := global_repository.Get(ctx, config_obj, name)
 	if !pres {
 		return nil
 	}
@@ -241,7 +286,7 @@ func (self *RepositoryManager) DeleteArtifactFile(
 		return err
 	}
 
-	err = journal.PushRowsToArtifact(config_obj,
+	err = journal.PushRowsToArtifact(ctx, config_obj,
 		[]*ordereddict.Dict{
 			ordereddict.NewDict().
 				Set("setter", principal).
@@ -265,12 +310,16 @@ func (self *RepositoryManager) DeleteArtifactFile(
 func NewRepositoryManagerForTest(
 	ctx context.Context, wg *sync.WaitGroup,
 	config_obj *config_proto.Config) (services.RepositoryManager, error) {
-	self := _newRepositoryManager(config_obj, wg)
+	self := _newRepositoryManager(ctx, config_obj, wg)
 
 	// Load some artifacts via the autoexec mechanism.
 	if config_obj.Autoexec != nil {
 		for _, def := range config_obj.Autoexec.ArtifactDefinitions {
-			_, err := self.global_repository.LoadProto(def, true)
+			_, err := self.global_repository.LoadProto(
+				def, services.ArtifactOptions{
+					ValidateArtifact:  true,
+					ArtifactIsBuiltIn: true,
+				})
 			if err != nil {
 				return nil, err
 			}
@@ -281,15 +330,28 @@ func NewRepositoryManagerForTest(
 }
 
 func _newRepositoryManager(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	wg *sync.WaitGroup) *RepositoryManager {
+
+	global_repository := &Repository{
+		// Artifact name -> definition
+		Data:     make(map[string]*artifacts_proto.Artifact),
+		metadata: NewMetadataManager(ctx, config_obj),
+	}
+
+	// Start the metada house keeping loop.
+	wg.Add(1)
+	go global_repository.metadata.HouseKeeping(
+		ctx, config_obj, wg, global_repository)
+
+	// Shared between the manager repositories.
 	return &RepositoryManager{
-		wg:         wg,
-		id:         utils.GetId(),
-		config_obj: config_obj,
-		global_repository: &Repository{
-			Data: make(map[string]*artifacts_proto.Artifact),
-		},
+		wg:                wg,
+		id:                utils.GetId(),
+		config_obj:        config_obj,
+		global_repository: global_repository,
+		metadata:          global_repository.metadata,
 	}
 }
 
@@ -300,11 +362,24 @@ func NewRepositoryManager(ctx context.Context, wg *sync.WaitGroup,
 	logger.Info("Starting repository manager for %v", services.GetOrgName(config_obj))
 
 	// Load all the artifacts in the repository and compile them in the background.
-	self := _newRepositoryManager(config_obj, wg)
+	self := _newRepositoryManager(ctx, config_obj, wg)
+
+	// Backup the custom artifacts - only for the Master node.
+	if services.IsMaster(config_obj) && !services.IsClient(config_obj) {
+		backup_service, err := services.GetBackupService(config_obj)
+		if err == nil {
+			backup_service.Register(&RepositoryBackupProvider{
+				config_obj: config_obj,
+			})
+		}
+	}
 
 	return self, self.StartWatchingForUpdates(ctx, wg, config_obj)
 }
 
+// Loads artifacts that are defined directly in th Autoexec config
+// section. These are considered built in (so they can not be
+// modified) but are not actually compiled in.
 func LoadArtifactsFromConfig(
 	repo_manager services.RepositoryManager,
 	config_obj *config_proto.Config) error {
@@ -313,13 +388,26 @@ func LoadArtifactsFromConfig(
 		return err
 	}
 
+	options := services.ArtifactOptions{
+		ValidateArtifact:     true,
+		ArtifactIsBuiltIn:    true,
+		ArtifactIsCompiledIn: false,
+	}
+
 	// Load some artifacts via the autoexec mechanism.
 	if config_obj.Autoexec != nil {
 		for _, def := range config_obj.Autoexec.ArtifactDefinitions {
+			def = proto.Clone(def).(*artifacts_proto.Artifact)
+
+			// These artifacts do not actually have a raw section so
+			// create one for them.
+			serialize, err := yaml.Marshal(def)
+			if err == nil {
+				def.Raw = string(serialize)
+			}
 
 			// Artifacts loaded from the config file are considered built in.
-			def.BuiltIn = true
-			_, err := global_repository.LoadProto(def, true)
+			_, err = global_repository.LoadProto(def, options)
 			if err != nil {
 				return err
 			}
@@ -330,38 +418,36 @@ func LoadArtifactsFromConfig(
 
 func LoadBuiltInArtifacts(ctx context.Context,
 	config_obj *config_proto.Config,
-	self *RepositoryManager, validate bool) error {
+	self *RepositoryManager) error {
+
+	// Load the built in artifacts as built in. NOTE: Built in
+	// artifacts can not be overwritten!
+	options := services.ArtifactOptions{
+		ValidateArtifact:     false,
+		ArtifactIsBuiltIn:    true,
+		ArtifactIsCompiledIn: true,
+	}
 
 	now := time.Now()
 
-	assets.Init()
-
-	files, err := assets.WalkDirs("", false)
-	if err != nil {
-		return err
-	}
-
 	count := 0
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	for _, file := range files {
-		if strings.HasPrefix(file, "artifacts/definitions") &&
+	for file := range assets.Inventory {
+		if strings.HasPrefix(file, "/artifacts/definitions") &&
 			strings.HasSuffix(file, "yaml") {
 			data, err := assets.ReadFile(file)
 			if err != nil {
 				logger.Info("Cant read asset %s: %v", file, err)
-				if validate {
+				if options.ValidateArtifact {
 					return err
 				}
 				continue
 			}
 
-			// Load the built in artifacts as built in. NOTE: Built in
-			// artifacts can not be overwritten!
-			_, err = self.global_repository.LoadYaml(
-				string(data), validate, services.ArtifactIsBuiltIn)
+			_, err = self.global_repository.LoadYaml(string(data), options)
 			if err != nil {
 				logger.Info("Cant parse asset %s: %s", file, err)
-				if validate {
+				if options.ValidateArtifact {
 					return err
 				}
 				continue
@@ -377,19 +463,12 @@ func LoadBuiltInArtifacts(ctx context.Context,
 		return err
 	}
 
-	if config_obj.Datastore != nil {
-		grepository, err = InitializeGlobalRepositoryFromFilestore(
-			ctx, config_obj, self.global_repository)
-		if err != nil {
-			return err
-		}
-	}
-
 	// Compile the artifacts in the background so they are ready
 	// to go when the GUI searches for them.
 	self.wg.Add(1)
 	go func() {
 		defer self.wg.Done()
+
 		names, err := grepository.List(ctx, config_obj)
 		if err != nil {
 			logger.Error("Error: %v", err)
@@ -402,7 +481,7 @@ func LoadBuiltInArtifacts(ctx context.Context,
 				return
 
 			default:
-				_, pres := grepository.Get(config_obj, name)
+				_, pres := grepository.Get(ctx, config_obj, name)
 				if !pres {
 					grepository.Del(name)
 				}

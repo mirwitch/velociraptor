@@ -24,11 +24,18 @@ import (
 var (
 	remote_mu             sync.Mutex
 	remote_datastopre_imp = NewRemoteDataStore(context.Background())
-	RPC_TIMEOUT           = 100 // Seconds
 	RPC_BACKOFF           = 10.0
 	RPC_RETRY             = 10
-	timeoutError          = errors.New("Timeout")
+	timeoutError          = errors.New("gRPC Timeout in Remote datastore")
 )
+
+func RPCTimeout(config_obj *config_proto.Config) time.Duration {
+	if config_obj.Datastore == nil ||
+		config_obj.Datastore.RemoteDatastoreRpcDeadline == 0 {
+		return time.Duration(100 * time.Second)
+	}
+	return time.Duration(config_obj.Datastore.RemoteDatastoreRpcDeadline) * time.Second
+}
 
 func Retry(ctx context.Context,
 	config_obj *config_proto.Config, cb func() error) error {
@@ -59,6 +66,7 @@ func Retry(ctx context.Context,
 			select {
 			case <-ctx.Done():
 				return timeoutError
+
 			case <-time.After(time.Duration(RPC_BACKOFF) * time.Second):
 			}
 
@@ -85,19 +93,33 @@ func (self *RemoteDataStore) GetSubject(
 	})
 }
 
+func (self *RemoteDataStore) Healthy() error {
+	return nil
+}
+
 func (self *RemoteDataStore) _GetSubject(
 	config_obj *config_proto.Config,
 	urn api.DSPathSpec,
-	message proto.Message) error {
+	message proto.Message) (err error) {
 
 	defer Instrument("read", "RemoteDataStore", urn)()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(RPC_TIMEOUT)*time.Second)
+	ctx, cancel := utils.WithTimeoutCause(
+		context.Background(), RPCTimeout(config_obj), timeoutError)
 	defer cancel()
 
-	conn, closer, err := grpc_client.Factory.GetAPIClient(ctx, config_obj)
-	defer closer()
+	// Make the call as the superuser
+	conn, closer, err := grpc_client.Factory.GetAPIClient(ctx,
+		grpc_client.SuperUser, config_obj)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err1 := closer()
+		if err1 != nil && err == nil {
+			err = err1
+		}
+	}()
 
 	result, err := conn.GetSubject(ctx, &api_proto.DataRequest{
 		OrgId: config_obj.OrgId,
@@ -164,12 +186,11 @@ func (self *RemoteDataStore) _SetSubjectWithCompletion(
 	config_obj *config_proto.Config,
 	urn api.DSPathSpec,
 	message proto.Message,
-	completion func()) error {
+	completion func()) (err error) {
 
 	defer Instrument("write", "RemoteDataStore", urn)()
 
 	var value []byte
-	var err error
 
 	if urn.Type() == api.PATH_TYPE_DATASTORE_JSON {
 		value, err = protojson.Marshal(message)
@@ -184,12 +205,22 @@ func (self *RemoteDataStore) _SetSubjectWithCompletion(
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(RPC_TIMEOUT)*time.Second)
+	ctx, cancel := utils.WithTimeoutCause(
+		context.Background(), RPCTimeout(config_obj), timeoutError)
 	defer cancel()
 
-	conn, closer, err := grpc_client.Factory.GetAPIClient(ctx, config_obj)
-	defer closer()
+	// Make the call as the superuser
+	conn, closer, err := grpc_client.Factory.GetAPIClient(
+		ctx, grpc_client.SuperUser, config_obj)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err1 := closer()
+		if err1 != nil && err == nil {
+			err = err1
+		}
+	}()
 
 	_, err = conn.SetSubject(ctx, &api_proto.DataRequest{
 		OrgId: config_obj.OrgId,
@@ -214,16 +245,25 @@ func (self *RemoteDataStore) DeleteSubjectWithCompletion(
 
 func (self *RemoteDataStore) _DeleteSubjectWithCompletion(
 	config_obj *config_proto.Config,
-	urn api.DSPathSpec, completion func()) error {
+	urn api.DSPathSpec, completion func()) (err error) {
 
 	defer Instrument("delete", "RemoteDataStore", urn)()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(RPC_TIMEOUT)*time.Second)
+	ctx, cancel := utils.WithTimeoutCause(
+		context.Background(), RPCTimeout(config_obj), timeoutError)
 	defer cancel()
 
-	conn, closer, err := grpc_client.Factory.GetAPIClient(ctx, config_obj)
-	defer closer()
+	conn, closer, err := grpc_client.Factory.GetAPIClient(
+		ctx, grpc_client.SuperUser, config_obj)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err1 := closer()
+		if err1 != nil && err == nil {
+			err = err1
+		}
+	}()
 
 	_, err = conn.DeleteSubject(ctx, &api_proto.DataRequest{
 		OrgId: config_obj.OrgId,
@@ -234,7 +274,8 @@ func (self *RemoteDataStore) _DeleteSubjectWithCompletion(
 			Tag:        urn.Tag(),
 		}})
 
-	if completion != nil {
+	if completion != nil &&
+		!utils.CompareFuncs(completion, utils.SyncCompleter) {
 		completion()
 	}
 
@@ -251,16 +292,25 @@ func (self *RemoteDataStore) DeleteSubject(
 
 func (self *RemoteDataStore) _DeleteSubject(
 	config_obj *config_proto.Config,
-	urn api.DSPathSpec) error {
+	urn api.DSPathSpec) (err error) {
 
 	defer Instrument("delete", "RemoteDataStore", urn)()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(RPC_TIMEOUT)*time.Second)
+	ctx, cancel := utils.WithTimeoutCause(
+		context.Background(), RPCTimeout(config_obj), timeoutError)
 	defer cancel()
 
-	conn, closer, err := grpc_client.Factory.GetAPIClient(ctx, config_obj)
-	defer closer()
+	conn, closer, err := grpc_client.Factory.GetAPIClient(
+		ctx, grpc_client.SuperUser, config_obj)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err1 := closer()
+		if err1 != nil && err == nil {
+			err = err1
+		}
+	}()
 
 	_, err = conn.DeleteSubject(ctx, &api_proto.DataRequest{
 		OrgId: config_obj.OrgId,
@@ -291,16 +341,25 @@ func (self *RemoteDataStore) ListChildren(
 // Lists all the children of a URN.
 func (self *RemoteDataStore) _ListChildren(
 	config_obj *config_proto.Config,
-	urn api.DSPathSpec) ([]api.DSPathSpec, error) {
+	urn api.DSPathSpec) (res []api.DSPathSpec, err error) {
 
 	defer Instrument("list", "RemoteDataStore", urn)()
 
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(RPC_TIMEOUT)*time.Second)
+	ctx, cancel := utils.WithTimeoutCause(
+		context.Background(), RPCTimeout(config_obj), timeoutError)
 	defer cancel()
 
-	conn, closer, err := grpc_client.Factory.GetAPIClient(ctx, config_obj)
-	defer closer()
+	conn, closer, err := grpc_client.Factory.GetAPIClient(
+		ctx, grpc_client.SuperUser, config_obj)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		err1 := closer()
+		if err1 != nil && err == nil {
+			err = err1
+		}
+	}()
 
 	result, err := conn.ListChildren(ctx, &api_proto.DataRequest{
 		OrgId: config_obj.OrgId,
@@ -337,7 +396,7 @@ func NewRemoteDataStore(ctx context.Context) *RemoteDataStore {
 	return result
 }
 
-func StartRemoteDatastore(
+func StartDatastore(
 	ctx context.Context, wg *sync.WaitGroup,
 	config_obj *config_proto.Config) error {
 
@@ -356,6 +415,9 @@ func StartRemoteDatastore(
 		remote_datastopre_imp = NewRemoteDataStore(ctx)
 		g_impl = nil
 		remote_mu.Unlock()
+
+	} else if implementation == "FileBaseDataStore" {
+		return startFullDiskChecker(ctx, wg, config_obj)
 	}
 	return nil
 }

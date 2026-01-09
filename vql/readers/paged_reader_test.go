@@ -1,23 +1,21 @@
-// +build !windows
-
 package readers
 
 import (
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/alecthomas/assert"
 	"github.com/stretchr/testify/suite"
 	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/velociraptor/vtesting"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
 	"www.velocidex.com/golang/vfilter"
 
 	_ "www.velocidex.com/golang/velociraptor/accessors/file"
@@ -34,7 +32,6 @@ type TestSuite struct {
 func (self *TestSuite) SetupTest() {
 	self.scope = vql_subsystem.MakeScope()
 	self.scope.AppendVars(ordereddict.NewDict().
-		Set(vql_subsystem.CACHE_VAR, vql_subsystem.NewScopeCache()).
 		Set(vql_subsystem.ACL_MANAGER_VAR, acl_managers.NullACLManager{}).
 		Set(constants.SCOPE_ROOT, self.scope))
 
@@ -42,7 +39,7 @@ func (self *TestSuite) SetupTest() {
 	self.pool = GetReaderPool(self.scope, 5)
 
 	var err error
-	self.tmp_dir, err = ioutil.TempDir("", "tmp")
+	self.tmp_dir, err = tempfile.TempDir("tmp")
 	assert.NoError(self.T(), err)
 
 	// Create 10 files with data
@@ -80,7 +77,7 @@ func (self *TestSuite) TestPagedReader() {
 	buff := make([]byte, 4)
 
 	for i := 0; i < 10; i++ {
-		reader, err := NewPagedReader(
+		reader, err := NewAccessorReader(
 			self.scope, "file", self.filenames[i], 100)
 		assert.NoError(self.T(), err)
 		_, err = reader.ReadAt(buff, 0)
@@ -90,7 +87,7 @@ func (self *TestSuite) TestPagedReader() {
 	}
 
 	for i := 0; i < 10; i++ {
-		reader, err := NewPagedReader(self.scope, "file", self.filenames[i], 100)
+		reader, err := NewAccessorReader(self.scope, "file", self.filenames[i], 100)
 		assert.NoError(self.T(), err)
 		_, err = reader.ReadAt(buff, 0)
 		assert.NoError(self.T(), err)
@@ -99,7 +96,7 @@ func (self *TestSuite) TestPagedReader() {
 
 	// Open the same reader 10 time returns from the cache.
 	for i := 0; i < 10; i++ {
-		reader, err := NewPagedReader(self.scope, "file", self.filenames[1], 100)
+		reader, err := NewAccessorReader(self.scope, "file", self.filenames[1], 100)
 		assert.NoError(self.T(), err)
 
 		_, err = reader.ReadAt(buff, 0)
@@ -110,7 +107,7 @@ func (self *TestSuite) TestPagedReader() {
 
 	// Make sure that it is ok to close the reader at any time -
 	// the next read will be valid.
-	reader, err := NewPagedReader(self.scope, "file", self.filenames[1], 100)
+	reader, err := NewAccessorReader(self.scope, "file", self.filenames[1], 100)
 	assert.NoError(self.T(), err)
 
 	for i := 0; i < 10; i++ {
@@ -153,7 +150,8 @@ func (self *TestSuite) TestPagedReader() {
 	})
 
 	// No outstanding readers
-	assert.Equal(self.T(), int64(0), self.pool.lru.Size())
+	metrics := self.pool.lru.GetMetrics()
+	assert.Equal(self.T(), int64(0), metrics.Size)
 
 }
 

@@ -29,6 +29,7 @@ func (self ReadKeyValues) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "read_reg_key", args)()
 
 		arg := &ReadKeyValuesArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -69,7 +70,11 @@ func (self ReadKeyValues) Call(
 				if value_data != nil {
 					value, pres := value_data.Get("value")
 					if pres {
-						result.Set(item.Name(), value)
+						name := item.Name()
+						if name == "" {
+							name = "@"
+						}
+						result.Set(name, value)
 					}
 				}
 			}

@@ -4,7 +4,6 @@ import (
 	"www.velocidex.com/golang/velociraptor/acls"
 	acl_proto "www.velocidex.com/golang/velociraptor/acls/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
@@ -33,7 +32,7 @@ func (self *RoleACLManager) CheckAccess(
 
 func (self *RoleACLManager) GetPrincipal() string {
 	if self.is_admin {
-		return constants.PinnedServerName
+		return utils.GetSuperuserName(self.config_obj)
 	}
 	return ""
 }
@@ -42,6 +41,10 @@ func (self *RoleACLManager) GetPrincipal() string {
 func (self *RoleACLManager) CheckAccessInOrg(
 	org_id string, permission ...acls.ACL_PERMISSION) (bool, error) {
 	return self.CheckAccess(permission...)
+}
+
+// NOOP because we always use the same token for all comparisons.
+func (self *RoleACLManager) SwitchDefaultOrg(config_obj *config_proto.Config) {
 }
 
 func (self *RoleACLManager) CheckAccessWithArgs(

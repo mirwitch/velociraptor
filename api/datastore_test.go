@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/protobuf/proto"
 	"www.velocidex.com/golang/velociraptor/api"
@@ -17,6 +16,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 	"www.velocidex.com/golang/velociraptor/vtesting/assert"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
 )
 
 type DatastoreAPITest struct {
@@ -44,7 +44,7 @@ func (self *DatastoreAPITest) SetupTest() {
 	// Wait for the server to come up.
 	vtesting.WaitUntil(2*time.Second, self.T(), func() bool {
 		conn, closer, err := grpc_client.Factory.GetAPIClient(
-			self.Sm.Ctx, self.ConfigObj)
+			self.Sm.Ctx, grpc_client.SuperUser, self.ConfigObj)
 		assert.NoError(self.T(), err)
 		defer closer()
 
@@ -64,7 +64,7 @@ func (self *DatastoreAPITest) TestDatastore() {
 
 	// Make some RPC calls
 	conn, closer, err := grpc_client.Factory.GetAPIClient(
-		self.Sm.Ctx, self.ConfigObj)
+		self.Sm.Ctx, grpc_client.SuperUser, self.ConfigObj)
 	assert.NoError(self.T(), err)
 	defer closer()
 

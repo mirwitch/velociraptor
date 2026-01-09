@@ -7,6 +7,8 @@ import (
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
+	"www.velocidex.com/golang/vfilter/types"
+	"www.velocidex.com/golang/vfilter/utils/dict"
 )
 
 type _ToDictFunctionArgs struct {
@@ -27,6 +29,8 @@ func (self _ToDictFunc) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vf
 
 func (self _ToDictFunc) Call(ctx context.Context, scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "to_dict", args)()
 
 	arg := &_ToDictFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -71,6 +75,7 @@ func (self _ItemsFunc) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfi
 
 func (self _ItemsFunc) Call(ctx context.Context, scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "items", args)()
 
 	arg := &_ToDictFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -83,10 +88,9 @@ func (self _ItemsFunc) Call(ctx context.Context, scope vfilter.Scope,
 
 	switch t := arg.Item.(type) {
 	case *ordereddict.Dict:
-		for _, k := range t.Keys() {
-			v, _ := t.Get(k)
+		for _, i := range t.Items() {
 			result = append(result, ordereddict.NewDict().
-				Set("_key", k).Set("_value", v))
+				Set("_key", i.Key).Set("_value", i.Value))
 		}
 	default:
 		result = append(result, ordereddict.NewDict().
@@ -96,7 +100,40 @@ func (self _ItemsFunc) Call(ctx context.Context, scope vfilter.Scope,
 	return result
 }
 
+type _DictFunc struct{}
+
+func (self _DictFunc) Info(scope types.Scope, type_map *types.TypeMap) *types.FunctionInfo {
+	return &types.FunctionInfo{
+		Name:         "dict",
+		Doc:          "Construct a dict from arbitrary keyword args.",
+		FreeFormArgs: true,
+	}
+}
+
+func (self _DictFunc) Call(ctx context.Context, scope types.Scope, args *ordereddict.Dict) types.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "dict", args)()
+
+	return dict.RowToDict(ctx, scope, args)
+}
+
+type _LazyDictFunc struct{}
+
+func (self *_LazyDictFunc) Info(scope types.Scope, type_map *types.TypeMap) *types.FunctionInfo {
+	return &types.FunctionInfo{
+		Name: "lazy_dict",
+		Doc:  "Construct a dict from arbitrary keyword args - does not materialize args so it is suitable for building args via `**` expansion.",
+	}
+}
+
+func (self *_LazyDictFunc) Call(ctx context.Context, scope types.Scope, args *ordereddict.Dict) types.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "lazr_dict", args)()
+
+	return args
+}
+
 func init() {
 	vql_subsystem.RegisterFunction(&_ItemsFunc{})
 	vql_subsystem.RegisterFunction(&_ToDictFunc{})
+	vql_subsystem.OverrideFunction(&_DictFunc{})
+	vql_subsystem.OverrideFunction(&_LazyDictFunc{})
 }

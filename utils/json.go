@@ -13,6 +13,16 @@ import (
 	vjson "www.velocidex.com/golang/velociraptor/json"
 )
 
+func ParseJsonToObject(serialized []byte) (*ordereddict.Dict, error) {
+	if len(serialized) == 0 || serialized[0] != '{' {
+		return nil, errors.New("Invalid JSON object")
+	}
+
+	item := ordereddict.NewDict()
+	err := json.Unmarshal(serialized, &item)
+	return item, err
+}
+
 func ParseJsonToDicts(serialized []byte) ([]*ordereddict.Dict, error) {
 	if len(serialized) == 0 {
 		return nil, nil
@@ -91,8 +101,7 @@ func ReadJsonFromFile(ctx context.Context, fd io.Reader) chan *ordereddict.Dict 
 				if len(row_data) == 0 || err != nil {
 					return
 				}
-				item := ordereddict.NewDict()
-				err = item.UnmarshalJSON(row_data)
+				item, err := ParseJsonToObject(row_data)
 				if err != nil {
 					continue
 				}

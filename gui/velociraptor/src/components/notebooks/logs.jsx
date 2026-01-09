@@ -2,6 +2,7 @@ import React, { Component } from 'react';
 import PropTypes from 'prop-types';
 import Modal from 'react-bootstrap/Modal';
 import FlowLogs from '../flows/flow-logs.jsx';
+import T from '../i8n/i8n.jsx';
 
 class ViewCellLogsTable extends FlowLogs {
     static propTypes = {
@@ -21,6 +22,7 @@ class ViewCellLogsTable extends FlowLogs {
             notebook_id: this.props.notebook_metadata &&
                 this.props.notebook_metadata.notebook_id,
             cell_id: this.props.cell && this.props.cell.cell_id,
+            cell_version: this.props.cell && this.props.cell.current_version,
             type: "logs",
         };
     }
@@ -42,7 +44,7 @@ export default class ViewCellLogs extends Component {
                    scrollable={true}
                    onHide={this.props.closeDialog}>
               <Modal.Header closeButton>
-                <Modal.Title>View Cell Logs</Modal.Title>
+                <Modal.Title>{T("View Cell Logs")}</Modal.Title>
               </Modal.Header>
               <Modal.Body>
                 <ViewCellLogsTable

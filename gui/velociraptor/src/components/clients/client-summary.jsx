@@ -3,7 +3,7 @@ import "./client-summary.css";
 import React, { Component } from 'react';
 import PropTypes from 'prop-types';
 import T from '../i8n/i8n.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 import api from '../core/api-service.jsx';
 
 import { Link } from  "react-router-dom";
@@ -19,7 +19,7 @@ export default class VeloClientSummary extends Component {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.interval = setInterval(this.getClientInfo, POLL_TIME);
         this.getClientInfo();
     }
@@ -29,9 +29,19 @@ export default class VeloClientSummary extends Component {
         clearInterval(this.interval);
     }
 
+    componentDidUpdate = (prevProps, prevState, rootNode) => {
+        let old_client_id = prevProps.client && prevProps.client.client_id;
+        let new_client_id = this.props.client && this.props.client.client_id;
+        if (old_client_id !== new_client_id) {
+            clearInterval(this.interval);
+            this.interval = setInterval(this.getClientInfo, POLL_TIME);
+            this.getClientInfo();
+        }
+    }
+
     getClientInfo = () => {
         this.source.cancel();
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
 
         let params = {update_mru: true};
         let client_id = this.props.client && this.props.client.client_id;
@@ -39,6 +49,10 @@ export default class VeloClientSummary extends Component {
             api.get("v1/GetClient/" + client_id, params,
                     this.source.token).then(
                 response=>{
+                    if (response.cancel) return;
+                    if (!response.data || response.data.client_id !== client_id) {
+                        return;
+                    }
                     this.props.setClient(response.data);
                 }).catch(err=>{
                     // The client is not valid - navigate away from
@@ -102,7 +116,7 @@ export default class VeloClientSummary extends Component {
                 to={"/host/"+this.props.client.client_id}>
                 { fqdn }
               </Link>
-              <span className="centered">
+              <span className="centered client-status">
                 <VeloClientStatusIcon client={this.props.client}/>
               </span>
               { this.timeDifference(this.props.client.last_seen_at) }

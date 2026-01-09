@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -21,7 +21,6 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"runtime"
 	"sync"
 	"time"
@@ -34,13 +33,21 @@ import (
 	"www.velocidex.com/golang/velociraptor/crypto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	crypto_server "www.velocidex.com/golang/velociraptor/crypto/server"
+	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/flows"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
+const (
+	DrainRequestsForClient      = true
+	DoNotDrainRequestsForClient = false
+)
+
 type Server struct {
+	Healthy int32
+
 	manager *crypto_server.ServerCryptoManager
 	logger  *logging.LogContext
 
@@ -54,8 +61,7 @@ type Server struct {
 	// The server dynamically adjusts concurrency. This signals exit.
 	done chan bool
 
-	Bucket  *ratelimit.Bucket
-	Healthy int32
+	Bucket *ratelimit.Bucket
 }
 
 func (self *Server) Concurrency() *utils.Concurrency {
@@ -155,7 +161,7 @@ func (self *Server) ProcessSingleUnauthenticatedMessage(
 
 		err = enroll(ctx, config_obj, self, message.CSR)
 		if err != nil {
-			self.logger.Error(fmt.Sprintf("Enrol Error: %s", err))
+			self.logger.Error("Enrol Error: %s", err)
 		}
 		return err
 	}
@@ -195,7 +201,7 @@ func (self *Server) DecryptForReader(ctx context.Context, request []byte) (
 func (self *Server) Decrypt(ctx context.Context, request []byte) (
 	*crypto.MessageInfo, error) {
 
-	message_info, err := self.manager.Decrypt(request)
+	message_info, err := self.manager.Decrypt(ctx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -221,6 +227,18 @@ func (self *Server) Process(
 		return nil, 0, err
 	}
 
+	db, err := datastore.GetDB(config_obj)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// If the datastore is not healthy refuse to accept this
+	// connection.
+	err = db.Healthy()
+	if err != nil {
+		return nil, 0, err
+	}
+
 	// Older clients
 	if message_info.Version < constants.CLIENT_API_VERSION_0_6_8 {
 		runner := flows.NewLegacyFlowRunner(config_obj)
@@ -231,7 +249,9 @@ func (self *Server) Process(
 
 		// Newer clients maintain flow state on the client so need a
 		// much cheaper flow runner.
-		runner := flows.NewFlowRunner(config_obj)
+		runner := flows.NewFlowRunner(ctx, config_obj)
+		defer runner.Close(ctx)
+
 		err = runner.ProcessMessages(ctx, message_info)
 	}
 
@@ -245,7 +265,7 @@ func (self *Server) Process(
 	}
 	err = client_info_manager.UpdateStats(ctx, message_info.Source,
 		&services.Stats{
-			Ping:      uint64(time.Now().UnixNano() / 1000),
+			Ping:      uint64(utils.Now().UnixNano() / 1000),
 			IpAddress: message_info.RemoteAddr,
 		})
 	if err != nil {
@@ -256,9 +276,9 @@ func (self *Server) Process(
 		// outstanding. Eventually the real client info will be
 		// properly updated.
 		err = client_info_manager.Set(ctx, &services.ClientInfo{
-			actions_proto.ClientInfo{
+			ClientInfo: &actions_proto.ClientInfo{
 				ClientId:  message_info.Source,
-				Ping:      uint64(time.Now().UnixNano() / 1000),
+				Ping:      uint64(utils.Now().UnixNano() / 1000),
 				IpAddress: message_info.RemoteAddr,
 			}})
 		if err != nil {
@@ -267,6 +287,9 @@ func (self *Server) Process(
 	}
 
 	message_list := &crypto_proto.MessageList{}
+
+	// Check if any messages are queued for the client. This also
+	// checks for any outstanding status checks.
 	if drain_requests_for_client {
 		tasks, err := client_info_manager.GetClientTasks(ctx, message_info.Source)
 		if err == nil {

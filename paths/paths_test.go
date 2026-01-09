@@ -1,10 +1,10 @@
 package paths_test
 
 import (
+	"context"
 	"strings"
 	"testing"
 
-	"github.com/alecthomas/assert"
 	"github.com/stretchr/testify/suite"
 	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
@@ -14,6 +14,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store/memory"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
 )
 
 type PathManagerTestSuite struct {
@@ -38,7 +39,7 @@ func (self *PathManagerTestSuite) TestAsClientPath() {
 
 	// Parse the path back into a path spec - this should restore
 	// the type from the extension.
-	new_path_spec := paths.ExtractClientPathSpec("", client_path)
+	new_path_spec := ExtractClientPathSpec("", client_path)
 
 	assert.Equal(self.T(), new_path_spec.Type(), path_spec.Type())
 	assert.Equal(self.T(), new_path_spec.Components(), path_spec.Components())
@@ -48,7 +49,7 @@ func (self *PathManagerTestSuite) TestAsClientPath() {
 // where the file will be created. Return this path - this includes
 // any file store escaping or path transformations.
 func (self *PathManagerTestSuite) getDatastorePath(path_spec api.DSPathSpec) string {
-	ds := datastore.NewMemcacheDataStore(self.config_obj)
+	ds := datastore.NewMemcacheDataStore(context.Background(), self.config_obj)
 	data := &crypto_proto.VeloMessage{}
 	ds.SetSubject(self.config_obj, path_spec, data)
 
@@ -58,7 +59,7 @@ func (self *PathManagerTestSuite) getDatastorePath(path_spec api.DSPathSpec) str
 			continue
 		}
 		results = append(results, normalize_path(
-			k.AsDatastoreFilename(self.config_obj)))
+			datastore.AsDatastoreFilename(ds, self.config_obj, k)))
 	}
 	assert.Equal(self.T(), 1, len(results))
 
@@ -101,4 +102,34 @@ func (self *PathManagerTestSuite) getFilestorePath(path_spec api.FSPathSpec) str
 
 func TestPathManagers(t *testing.T) {
 	suite.Run(t, &PathManagerTestSuite{})
+}
+
+// Breaks a client path into components. The client's path may consist
+// of a drive letter or a device which will be treated as a single
+// component. For example:
+// C:\Windows -> "C:\", "Windows"
+// \\.\c:\Windows -> "\\.\C:", "Windows"
+
+// Other components that contain path separators need to be properly
+// quoted as usual:
+// HKEY_LOCAL_MACHINE\Software\Microsoft\"http://www.google.com"\Foo ->
+// "HKEY_LOCAL_MACHINE", "Software", "Microsoft", "http://www.google.com", "Foo"
+func ExtractClientPathSpec(accessor, path string) api.FSPathSpec {
+	result := path_specs.NewUnsafeFilestorePath()
+	if accessor != "" {
+		result = result.AddChild(accessor)
+	}
+
+	components := paths.ExtractClientPathComponents(path)
+
+	// Restore the PathSpec type from its extensions
+	if len(components) > 0 {
+		last := len(components) - 1
+		name_type, name := api.GetFileStorePathTypeFromExtension(
+			components[last])
+		components[last] = name
+		result = result.SetType(name_type)
+	}
+
+	return result.AddChild(components...)
 }

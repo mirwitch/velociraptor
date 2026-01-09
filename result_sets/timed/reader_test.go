@@ -4,28 +4,29 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/assert"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
 )
 
 // Test migration from an old index arrangement.
 func (self *TimedResultSetTestSuite) TestTimedResultSetMigration() {
 	now := time.Unix(1587800000, 0)
-	clock := &utils.MockClock{MockNow: now}
+	clock := utils.NewMockClock(now)
+	closer := utils.MockTime(clock)
+	defer closer()
 
 	// Start off by writing some events on a queue.
 	path_manager, err := artifacts.NewArtifactPathManager(
-		self.ConfigObj,
+		self.Ctx, self.ConfigObj,
 		self.client_id,
 		self.flow_id,
 		"Windows.Events.ProcessCreation")
 	assert.NoError(self.T(), err)
-	path_manager.Clock = clock
 
 	// Recreate events from older version. Previously we used the
 	// regular ResultSetWriter to write unindexed files.
@@ -35,7 +36,7 @@ func (self *TimedResultSetTestSuite) TestTimedResultSetMigration() {
 	for i := int64(0); i < 50; i++ {
 		// Advance the clock by 1 hour.
 		now := 1587800000 + 10000*i
-		clock.MockNow = time.Unix(now, 0).UTC()
+		clock.Set(time.Unix(now, 0).UTC())
 
 		writer, err := result_sets.NewResultSetWriter(
 			file_store_factory, path_manager.Path(),
@@ -44,14 +45,14 @@ func (self *TimedResultSetTestSuite) TestTimedResultSetMigration() {
 
 		writer.Write(ordereddict.NewDict().
 			Set("_ts", now).
-			Set("Time", clock.MockNow))
+			Set("Time", clock.Now()))
 		writer.Close()
 	}
 
 	result := ordereddict.NewDict()
 
 	rs_reader, err := result_sets.NewTimedResultSetReader(
-		self.Sm.Ctx, file_store_factory, path_manager)
+		self.Sm.Ctx, self.ConfigObj, path_manager)
 	assert.NoError(self.T(), err)
 
 	result.Set("Available Files", rs_reader.GetAvailableFiles(self.Sm.Ctx))

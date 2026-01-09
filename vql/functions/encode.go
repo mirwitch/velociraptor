@@ -27,6 +27,8 @@ type EncodeFunction struct{}
 func (self *EncodeFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "encode", args)()
+
 	arg := &EncodeFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -53,7 +55,7 @@ func (self *EncodeFunction) Call(ctx context.Context,
 		opts := vql_subsystem.EncOptsFromScope(scope)
 		serialized_content, err := json.MarshalIndentWithOptions(result, opts)
 		if err != nil {
-			scope.Log("serialize: %s", err.Error())
+			scope.Log("serialize: %v", err)
 			return vfilter.Null{}
 		}
 

@@ -57,10 +57,7 @@ type ACL_PERMISSION int
 const (
 	NO_PERMISSIONS ACL_PERMISSION = iota
 
-	// Issue all queries without restriction
-	ALL_QUERY
-
-	// Issue any query at all (ALL_QUERY implies ANY_QUERY).
+	// Issue any query at all.
 	ANY_QUERY
 
 	// Publish events to server side queues
@@ -74,6 +71,14 @@ const (
 
 	// Schedule or cancel new collections on clients.
 	COLLECT_CLIENT
+
+	// This is a special custom permission which allows the user to
+	// collect "basic" artifacts. For this to work the administrator
+	// needs to set the "basic" metadata on the artifact definition.
+	COLLECT_BASIC
+
+	// Allows the user to start a hunt
+	START_HUNT
 
 	// Schedule new artifact collections on velociraptor servers.
 	COLLECT_SERVER
@@ -105,11 +110,17 @@ const (
 	// Allowed to create files on the filesystem.
 	FILESYSTEM_WRITE
 
+	// Allowed to make network connections
+	NETWORK
+
 	// Allowed to collect state information from machines (e.g. pslist()).
 	MACHINE_STATE
 
 	// Allowed to create zip files.
 	PREPARE_RESULTS
+
+	// Allowed to delete results from the server
+	DELETE_RESULTS
 
 	// Allowed raw datastore access
 	DATASTORE_ACCESS
@@ -118,12 +129,18 @@ const (
 	// GetRolePermissions and acl.proto
 )
 
+func (self ACL_PERMISSION) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf("\"%s\"", self.String())), nil
+}
+
+func (self ACL_PERMISSION) MarshalYAML() (interface{}, error) {
+	return self.String(), nil
+}
+
 func (self ACL_PERMISSION) String() string {
 	switch self {
 	case NO_PERMISSIONS:
 		return "NO_PERMISSIONS"
-	case ALL_QUERY:
-		return "ALL_QUERY"
 	case ANY_QUERY:
 		return "ANY_QUERY"
 	case PUBLISH:
@@ -134,6 +151,10 @@ func (self ACL_PERMISSION) String() string {
 		return "LABEL_CLIENT"
 	case COLLECT_CLIENT:
 		return "COLLECT_CLIENT"
+	case COLLECT_BASIC:
+		return "COLLECT_BASIC"
+	case START_HUNT:
+		return "START_HUNT"
 	case COLLECT_SERVER:
 		return "COLLECT_SERVER"
 	case ARTIFACT_WRITER:
@@ -154,10 +175,14 @@ func (self ACL_PERMISSION) String() string {
 		return "FILESYSTEM_READ"
 	case FILESYSTEM_WRITE:
 		return "FILESYSTEM_WRITE"
+	case NETWORK:
+		return "NETWORK"
 	case MACHINE_STATE:
 		return "MACHINE_STATE"
 	case PREPARE_RESULTS:
 		return "PREPARE_RESULTS"
+	case DELETE_RESULTS:
+		return "DELETE_RESULTS"
 	case DATASTORE_ACCESS:
 		return "DATASTORE_ACCESS"
 
@@ -169,9 +194,6 @@ func GetPermission(name string) ACL_PERMISSION {
 	switch strings.ToUpper(name) {
 	case "NO_PERMISSIONS":
 		return NO_PERMISSIONS
-
-	case "ALL_QUERY":
-		return ALL_QUERY
 	case "ANY_QUERY":
 		return ANY_QUERY
 	case "PUBLISH":
@@ -182,6 +204,10 @@ func GetPermission(name string) ACL_PERMISSION {
 		return LABEL_CLIENT
 	case "COLLECT_CLIENT":
 		return COLLECT_CLIENT
+	case "COLLECT_BASIC":
+		return COLLECT_BASIC
+	case "START_HUNT":
+		return START_HUNT
 	case "COLLECT_SERVER":
 		return COLLECT_SERVER
 	case "ARTIFACT_WRITER":
@@ -202,10 +228,14 @@ func GetPermission(name string) ACL_PERMISSION {
 		return FILESYSTEM_READ
 	case "FILESYSTEM_WRITE":
 		return FILESYSTEM_WRITE
+	case "NETWORK":
+		return NETWORK
 	case "MACHINE_STATE":
 		return MACHINE_STATE
 	case "PREPARE_RESULTS":
 		return PREPARE_RESULTS
+	case "DELETE_RESULTS":
+		return DELETE_RESULTS
 	case "DATASTORE_ACCESS":
 		return DATASTORE_ACCESS
 

@@ -24,6 +24,8 @@ func (self AtExitFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
+	defer vql_subsystem.RegisterMonitor(ctx, "atexit", args)()
+
 	arg := &AtExitFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -38,28 +40,35 @@ func (self AtExitFunction) Call(
 
 	switch t := arg.Query.(type) {
 	case types.StoredQuery:
-		vql_subsystem.GetRootScope(scope).AddDestructor(func() {
-			scope.Log("Running AtExit query")
+		subscope := scope.Copy()
+		defer subscope.Close()
+
+		if arg.Env != nil {
+			subscope.AppendVars(arg.Env)
+		}
+
+		err := vql_subsystem.GetRootScope(scope).AddDestructor(func() {
+			scope.Log("Running AtExit query %v", vfilter.FormatToString(scope, t))
 
 			// We need to create a new context to run the
-			// desctructors in because the main context
+			// destructors in because the main context
 			// may already be cancelled.
 			ctx, cancel := context.WithTimeout(
 				context.Background(),
 				time.Duration(timeout)*time.Second)
 			defer cancel()
 
-			subscope := scope.Copy()
-			subscope.AppendVars(arg.Env)
-
 			for _ = range t.Eval(ctx, subscope) {
 			}
 		})
+		if err != nil {
+			scope.Log("atexit: %v", err)
+		}
 	default:
 		scope.Log("atexit: Query type %T not supported.", arg.Query)
 	}
 
-	return vfilter.Null{}
+	return true
 }
 
 func (self AtExitFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {

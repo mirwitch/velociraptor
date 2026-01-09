@@ -1,21 +1,29 @@
 package config
 
 import (
-	"bytes"
-	"compress/zlib"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"os/user"
-	"runtime"
+	"path/filepath"
+	"regexp"
 
 	"github.com/Velocidex/yaml/v2"
 	"github.com/go-errors/errors"
-	"google.golang.org/protobuf/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
+)
+
+var (
+	noEmbeddedConfig = errors.New(
+		"No embedded config - you can pack one with the `config repack` command")
+
+	embedded_re = regexp.MustCompile(`#{3}<Begin Embedded Config>\r?\n`)
+
+	EmbeddedFile = ""
 )
 
 // A hard error causes the loader to stop immediately.
@@ -64,30 +72,13 @@ func (self *Loader) WithTempdir(tmpdir string) *Loader {
 			// Expand the tmpdir if needed.
 			tmpdir = utils.ExpandEnv(tmpdir)
 
-			// Try to create a file in the directory to make sure
-			// we have permissions and the directory exists.
-			tmpfile, err := ioutil.TempFile(tmpdir, "tmp")
+			err := tempfile.SetTempDir(tmpdir)
 			if err != nil {
-				// No we dont have permission there, fall back
-				// to system default.
-				self.Log("Can not write in temp directory to <red>%v</red> - falling back to default %v",
-					tmpdir, os.Getenv("TMP"))
-				return nil
-			}
-			tmpfile.Close()
-
-			defer os.Remove(tmpfile.Name())
-
-			switch runtime.GOOS {
-			case "windows":
-				os.Setenv("TMP", tmpdir)
-				os.Setenv("TEMP", tmpdir)
-			case "linux", "darwin":
-				os.Setenv("TMP", tmpdir)
-				os.Setenv("TMPDIR", tmpdir)
+				self.Log("Can not write in temp directory to <red>%v</red>",
+					tmpdir)
+				return err
 			}
 			self.Log("Setting temp directory to <green>%v", tmpdir)
-
 			return nil
 		}})
 	return self
@@ -171,28 +162,6 @@ func (self *Loader) WithRequiredUser() *Loader {
 	return self
 }
 
-func (self *Loader) WithOverride(filename string) *Loader {
-	if filename == "" {
-		return self
-	}
-
-	self = self.Copy()
-	self.config_mutators = append(self.config_mutators, configMutator{
-		name: "WithOverride",
-		config_mutator_func: func(config_obj *config_proto.Config) error {
-			self.Log("Loading override config from file %v", filename)
-			override, err := read_config_from_file(filename)
-			if err != nil {
-				return HardError{err}
-			}
-
-			// Merge the json blob with the config
-			proto.Merge(config_obj, override)
-			return nil
-		}})
-	return self
-}
-
 func (self *Loader) WithRequiredCA() *Loader {
 	self = self.Copy()
 	self.validators = append(self.validators, validatorFunction{
@@ -223,14 +192,6 @@ func (self *Loader) WithRequiredLogging() *Loader {
 func (self *Loader) WithWriteback() *Loader {
 	self = self.Copy()
 	self.use_writeback = true
-	return self
-}
-
-func (self *Loader) WithCustomLoader(loader func(self *Loader) (*config_proto.Config, error)) *Loader {
-	self = self.Copy()
-	self.loaders = append(self.loaders, loaderFunction{
-		name:        "WithCustomLoader",
-		loader_func: loader})
 	return self
 }
 
@@ -290,6 +251,25 @@ func (self *Loader) WithFileLoader(filename string) *Loader {
 	return self
 }
 
+func (self *Loader) WithLiteralLoader(serialized []byte) *Loader {
+	if len(serialized) > 0 {
+		self = self.Copy()
+		self.loaders = append(self.loaders, loaderFunction{
+			name: "WithLiteralLoader",
+			loader_func: func(self *Loader) (*config_proto.Config, error) {
+				self.Log("Loading constant config")
+				result := &config_proto.Config{}
+				err := yaml.UnmarshalStrict(serialized, result)
+				if err != nil {
+					return nil, errors.Wrap(err, 0)
+				}
+				return result, nil
+			}})
+	}
+
+	return self
+}
+
 func (self *Loader) WithEnvLoader(env_var string) *Loader {
 	self = self.Copy()
 	self.loaders = append(self.loaders, loaderFunction{
@@ -327,16 +307,36 @@ func (self *Loader) WithEnvLiteralLoader(env_var string) *Loader {
 	return self
 }
 
-func (self *Loader) WithEmbedded() *Loader {
+func (self *Loader) WithEmbedded(embedded_file string) *Loader {
 	self = self.Copy()
 	self.loaders = append(self.loaders, loaderFunction{
 		name: "WithEmbedded",
 		loader_func: func(self *Loader) (*config_proto.Config, error) {
-			result, err := read_embedded_config()
-			if err == nil {
+			if embedded_file == "" {
+				result, err := read_embedded_config()
+				if err != nil {
+					return nil, err
+				}
+
 				self.Log("Loaded embedded config")
+
+				EmbeddedFile, err = os.Executable()
+				return result, err
+			}
+			// Ensure the "me" accessor uses this file for embedded zip.
+			full_path, err := filepath.Abs(embedded_file)
+			if err != nil {
+				return nil, err
+			}
+
+			EmbeddedFile = full_path
+
+			result, err := ExtractEmbeddedConfig(full_path)
+			if err == nil {
+				self.Log("Loaded embedded config from %v", full_path)
 			}
 			return result, err
+
 		}})
 	return self
 }
@@ -377,6 +377,7 @@ func (self *Loader) WithEnvApiLoader(env_var string) *Loader {
 func (self *Loader) Copy() *Loader {
 	return &Loader{
 		verbose:         self.verbose,
+		use_writeback:   self.use_writeback,
 		logger:          self.logger,
 		loaders:         append([]loaderFunction{}, self.loaders...),
 		validators:      append([]validatorFunction{}, self.validators...),
@@ -457,11 +458,21 @@ func (self *Loader) Validate(config_obj *config_proto.Config) error {
 	}
 
 	if config_obj.Client != nil {
+		// We only use the writeback for certain cases where is it
+		// needed:
+		// - Running as a client, pool client , service etc
+		//
+		// Other cases do not use the writeback and will fail to write
+		// on it. This stops us randomly writing the writeback when
+		// e.g. run as a command line tool, offline collector etc.
+		//
+		// The main programs will set this via WithWriteback()
+		// directive when they prepare the config loader.
 		if self.use_writeback {
-			err := self.loadWriteback(config_obj)
-			if err != nil {
-				return err
-			}
+			writeback_service := writeback.GetWritebackService()
+
+			// It is ok if writeback is not readable - we will create
+			_ = writeback_service.LoadWriteback(config_obj)
 		}
 		err := ValidateClientConfig(config_obj)
 		if err != nil {
@@ -488,33 +499,6 @@ func (self *Loader) LoadAndValidate() (*config_proto.Config, error) {
 		self.Log("%v", err)
 	}
 	return nil, errors.New("Unable to load config from any source.")
-}
-
-func read_embedded_config() (*config_proto.Config, error) {
-	idx := bytes.IndexByte(FileConfigDefaultYaml, '\n')
-	if FileConfigDefaultYaml[idx+1] == '#' {
-		return nil, errors.New(
-			"No embedded config - you can pack one with the `config repack` command")
-	}
-
-	r, err := zlib.NewReader(bytes.NewReader(FileConfigDefaultYaml[idx+1:]))
-	if err != nil {
-		return nil, err
-	}
-
-	b := &bytes.Buffer{}
-	_, err = io.Copy(b, r)
-	if err != nil {
-		return nil, err
-	}
-	r.Close()
-
-	result := &config_proto.Config{}
-	err = yaml.Unmarshal(b.Bytes(), result)
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
 }
 
 func read_config_from_file(filename string) (*config_proto.Config, error) {
@@ -548,5 +532,7 @@ func read_api_config_from_file(filename string) (*config_proto.Config, error) {
 }
 
 func debug(message string, args ...interface{}) {
-	logging.Prelog(message, args...)
+	return
+
+	// logging.Prelog(message, args...)
 }

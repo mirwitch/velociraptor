@@ -2,24 +2,28 @@ package notebook
 
 import (
 	"fmt"
+	"html"
 	"time"
 
 	"google.golang.org/protobuf/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/reporting"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 type progressReporter struct {
-	config_obj            *config_proto.Config
-	notebook_cell         *api_proto.NotebookCell
-	notebook_id, table_id string
-	last, start           time.Time
+	config_obj           *config_proto.Config
+	notebook_cell        *api_proto.NotebookCell
+	notebook_id, version string
+	last, start          time.Time
 
 	store NotebookStore
+	tmpl  *reporting.GuiTemplateEngine
 }
 
 func (self *progressReporter) Report(message string) {
-	now := time.Now()
+	now := utils.GetTime().Now()
 	if now.Before(self.last.Add(4 * time.Second)) {
 		return
 	}
@@ -33,14 +37,19 @@ func (self *progressReporter) Report(message string) {
    Calculating...  (%v after %v)
 </div>
 <div class="panel">
-   <grr-csv-viewer base-url="'v1/GetTable'"
-                   params='{"notebook_id":"%s","cell_id":"%s","table_id":1,"message": "%s"}' />
+   <velo-csv-viewer base-url="'v1/GetTable'"
+                   params='{"notebook_id":"%s","cell_id":"%s","table_id":1,"cell_version": "%s", "message": "%s"}' />
 </div>
 `,
-		message, duration,
-		self.notebook_id, self.notebook_cell.CellId, message)
-	notebook_cell.Timestamp = now.Unix()
+		html.EscapeString(message),
+		html.EscapeString(duration.String()),
+		html.EscapeString(self.notebook_id),
+		html.EscapeString(self.notebook_cell.CellId),
+		html.EscapeString(self.version),
+		html.EscapeString(message))
+	notebook_cell.Timestamp = now.UnixNano()
 	notebook_cell.Duration = int64(duration.Seconds())
+	notebook_cell.Messages = self.tmpl.Messages()
 
 	// Cant do anything if we can not set the notebook times
 	_ = self.store.SetNotebookCell(self.notebook_id, notebook_cell)

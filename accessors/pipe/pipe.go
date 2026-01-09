@@ -37,12 +37,17 @@ func (self *Pipe) Seek(offset int64, whence int) (int64, error) {
 	return 0, errors.New("Not Seekable")
 }
 
+func (self *Pipe) IsSeekable() bool {
+	return false
+}
+
 func (self *Pipe) Stat() (os.FileInfo, error) {
 	return nil, errors.New("Not implemented")
 }
 
 func (self *Pipe) Read(buff []byte) (int, error) {
 	select {
+
 	case <-self.ctx.Done():
 		return 0, io.EOF
 
@@ -53,11 +58,8 @@ func (self *Pipe) Read(buff []byte) (int, error) {
 
 		switch t := row.(type) {
 		case *ordereddict.Dict:
-			keys := t.Keys()
-			if len(keys) >= 1 {
-				value, _ := t.Get(keys[0])
-
-				switch t := value.(type) {
+			for _, v := range t.Values() {
+				switch t := v.(type) {
 				case string:
 					out := append([]byte(t), self.sep...)
 					return utils.MemCpy(buff, out), nil
@@ -67,7 +69,7 @@ func (self *Pipe) Read(buff []byte) (int, error) {
 						append(t, self.sep...)), nil
 
 				default:
-					data := fmt.Sprintf("%v", value)
+					data := fmt.Sprintf("%v", v)
 					out := append([]byte(data), self.sep...)
 					return utils.MemCpy(buff, out), nil
 				}
@@ -99,7 +101,7 @@ func (self *PipeFunction) Call(ctx context.Context,
 	}
 
 	if arg.Name == "" {
-		arg.Name = types.ToString(ctx, scope, arg.Query)
+		arg.Name = vfilter.FormatToString(scope, arg.Query)
 	}
 
 	key := "pipe:" + arg.Name
@@ -108,7 +110,7 @@ func (self *PipeFunction) Call(ctx context.Context,
 
 	defer vql_subsystem.CacheSet(scope, key, cached_pipe)
 
-	if !ok {
+	if !ok || utils.IsNil(cached_pipe) {
 		row_chan := arg.Query.Eval(ctx, scope)
 		cached_pipe = &Pipe{
 			output_chan: row_chan,
@@ -134,6 +136,13 @@ type PipeFilesystemAccessor struct {
 
 func (self PipeFilesystemAccessor) ParsePath(path string) (*accessors.OSPath, error) {
 	return accessors.NewLinuxOSPath(path)
+}
+
+func (self PipeFilesystemAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name:        "pipe",
+		Description: `Read from a VQL pipe.`,
+	}
 }
 
 func (self PipeFilesystemAccessor) New(scope vfilter.Scope) (
@@ -172,19 +181,24 @@ func (self PipeFilesystemAccessor) ReadDirWithOSPath(path *accessors.OSPath) (
 // The path is the name of the scope variable that holds the pipe object
 func (self PipeFilesystemAccessor) Open(variable string) (accessors.ReadSeekCloser, error) {
 	variable_data, pres := self.scope.Resolve(variable)
-	if !pres {
-		return nil, os.ErrNotExist
+	if !pres || utils.IsNil(variable_data) {
+		return nil, utils.NotFoundError
 	}
 	variable_data_lazy, ok := variable_data.(types.StoredExpression)
 	if ok {
 		ctx, cancel := context.WithCancel(context.Background())
-		vql_subsystem.GetRootScope(self.scope).AddDestructor(cancel)
+		err := vql_subsystem.GetRootScope(self.scope).AddDestructor(cancel)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+
 		variable_data = variable_data_lazy.Reduce(ctx, self.scope)
 	}
 
 	pipe, ok := variable_data.(*Pipe)
 	if !ok {
-		return nil, os.ErrNotExist
+		return nil, utils.NotFoundError
 	}
 
 	return pipe, nil
@@ -193,25 +207,12 @@ func (self PipeFilesystemAccessor) Open(variable string) (accessors.ReadSeekClos
 func (self PipeFilesystemAccessor) OpenWithOSPath(
 	path *accessors.OSPath) (accessors.ReadSeekCloser, error) {
 	if len(path.Components) != 1 {
-		return nil, os.ErrNotExist
+		return nil, utils.NotFoundError
 	}
 	return self.Open(path.Components[0])
 }
 
 func init() {
-	accessors.Register("pipe", &PipeFilesystemAccessor{},
-		`Read from a VQL pipe.
-
-A VQL pipe allows data to be generated from a VQL query, as the pipe is read, the query proceeds to feed more data to it.
-
-Example:
-
-  LET MyPipe = pipe(query={
-        SELECT _value FROM range(start=0, end=10, step=1)
-  }, sep="\n")
-
-  SELECT read_file(filename="MyPipe", accessor="pipe")
-  FROM scope()
-`)
+	accessors.Register(&PipeFilesystemAccessor{})
 	vql_subsystem.RegisterFunction(&PipeFunction{})
 }

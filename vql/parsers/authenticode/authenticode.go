@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -33,6 +33,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/readers"
 	"www.velocidex.com/golang/vfilter"
@@ -51,6 +52,8 @@ func (self *AuthenticodeFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
+	defer vql_subsystem.RegisterMonitor(ctx, "authenticode", args)()
+
 	err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
 	if err != nil {
 		scope.Log("authenticode: %s", err)
@@ -65,7 +68,7 @@ func (self *AuthenticodeFunction) Call(ctx context.Context,
 	}
 
 	lru_size := vql_subsystem.GetIntFromRow(scope, scope, constants.BINARY_CACHE_SIZE)
-	paged_reader, err := readers.NewPagedReader(
+	paged_reader, err := readers.NewAccessorReader(
 		scope, arg.Accessor, arg.Filename, int(lru_size))
 	if err != nil {
 		scope.Log("authenticode: %v", err)
@@ -73,7 +76,7 @@ func (self *AuthenticodeFunction) Call(ctx context.Context,
 	}
 	defer paged_reader.Close()
 
-	pe_file, err := pe.NewPEFile(paged_reader)
+	pe_file, err := pe.NewPEFileWithSize(paged_reader, paged_reader.MaxSize())
 	if err != nil {
 		// Suppress logging for invalid PE files.
 		// scope.Log("parse_pe: %v for %v", err, arg.Filename)
@@ -104,7 +107,7 @@ func (self *AuthenticodeFunction) Call(ctx context.Context,
 			Update("MoreInfoLink", utils.GetString(signer, "Signer.AuthenticatedAttributes.MoreInfo")).
 			Update("Timestamp", utils.GetAny(signer, "Signer.AuthenticatedAttributes.SigningTime")).
 			Update("Trusted", func() vfilter.Any {
-				return VerifyFileSignature(normalized_path)
+				return VerifyFileSignature(scope, normalized_path)
 			})
 
 		if arg.Verbose {
@@ -127,7 +130,7 @@ func (self *AuthenticodeFunction) Call(ctx context.Context,
 		}
 
 		cat_file, err := VerifyCatalogSignature(
-			config_obj, fd, normalized_path, output)
+			config_obj, scope, fd, normalized_path, output)
 		if err == nil {
 			_ = ParseCatFile(cat_file, output, arg.Verbose)
 		}
@@ -142,7 +145,8 @@ func (self AuthenticodeFunction) Info(
 		Name: "authenticode",
 		Doc: "This plugin uses the Windows API to extract authenticode " +
 			"signature details from PE files.",
-		ArgType: type_map.AddType(scope, &AuthenticodeArgs{}),
+		ArgType:  type_map.AddType(scope, &AuthenticodeArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 

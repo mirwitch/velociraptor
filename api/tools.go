@@ -1,9 +1,7 @@
 package api
 
 import (
-	context "golang.org/x/net/context"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"context"
 
 	"www.velocidex.com/golang/velociraptor/acls"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
@@ -12,6 +10,8 @@ import (
 
 func (self *ApiServer) GetToolInfo(ctx context.Context,
 	in *artifacts_proto.Tool) (*artifacts_proto.Tool, error) {
+
+	defer Instrument("GetToolInfo")()
 
 	users := services.GetUserManager()
 	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
@@ -22,7 +22,7 @@ func (self *ApiServer) GetToolInfo(ctx context.Context,
 	permissions := acls.READ_RESULTS
 	perm, err := services.CheckAccess(org_config_obj, user_record.Name, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to view tools.")
 	}
 
@@ -31,14 +31,17 @@ func (self *ApiServer) GetToolInfo(ctx context.Context,
 		return nil, Status(self.verbose, err)
 	}
 	if in.Materialize {
-		return inventory.GetToolInfo(ctx, org_config_obj, in.Name)
+		return inventory.GetToolInfo(ctx, org_config_obj, in.Name, in.Version)
 	}
 
-	return inventory.ProbeToolInfo(in.Name)
+	tool, err := inventory.ProbeToolInfo(ctx, org_config_obj, in.Name, in.Version)
+	return tool, Status(self.verbose, err)
 }
 
 func (self *ApiServer) SetToolInfo(ctx context.Context,
 	in *artifacts_proto.Tool) (*artifacts_proto.Tool, error) {
+
+	defer Instrument("SetToolInfo")()
 
 	users := services.GetUserManager()
 	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
@@ -52,7 +55,7 @@ func (self *ApiServer) SetToolInfo(ctx context.Context,
 	permissions := acls.ARTIFACT_WRITER
 	perm, err := services.CheckAccess(org_config_obj, user_record.Name, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to update tool definitions.")
 	}
 
@@ -64,7 +67,13 @@ func (self *ApiServer) SetToolInfo(ctx context.Context,
 		return nil, Status(self.verbose, err)
 	}
 
-	err = inventory.AddTool(org_config_obj, in,
+	// Clear internally managed fields the user should not be allowed
+	// to set.
+	in.Versions = nil
+	in.ServeUrl = ""
+	in.InvalidHash = ""
+
+	err = inventory.AddTool(ctx, org_config_obj, in,
 		services.ToolOptions{
 			AdminOverride: true,
 		})
@@ -75,7 +84,7 @@ func (self *ApiServer) SetToolInfo(ctx context.Context,
 	// If materialized we re-fetch the tool and send back the full
 	// record.
 	if materialize {
-		return inventory.GetToolInfo(ctx, org_config_obj, in.Name)
+		return inventory.GetToolInfo(ctx, org_config_obj, in.Name, in.Version)
 	}
 
 	return in, nil

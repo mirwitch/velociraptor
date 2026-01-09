@@ -7,6 +7,9 @@ import (
 
 	"github.com/go-errors/errors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	constants "www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 // Ensures client config is valid, fills in defaults for missing values etc.
@@ -30,9 +33,11 @@ func ValidateClientConfig(config_obj *config_proto.Config) error {
 		return errors.New("No Client.server_urls configured")
 	}
 
-	_, err := WritebackLocation(config_obj.Client)
-	if err != nil {
-		return err
+	// Rename fields as needed.
+	if config_obj.Client.ServerVersion == nil &&
+		config_obj.Client.Version != nil {
+		config_obj.Client.ServerVersion = config_obj.Client.Version
+		config_obj.Client.Version = nil
 	}
 
 	// Add defaults
@@ -51,16 +56,36 @@ func ValidateClientConfig(config_obj *config_proto.Config) error {
 		config_obj.Client.MaxPoll = 60 // One minute
 	}
 
-	if config_obj.Client.PinnedServerName == "" {
-		config_obj.Client.PinnedServerName = "VelociraptorServer"
-	}
-
 	if config_obj.Client.MaxUploadSize == 0 {
 		config_obj.Client.MaxUploadSize = 5242880
 	}
 
+	if config_obj.Client.Crypto != nil {
+		allowed_verification_modes := []string{
+			"", "PKI", "PKI_OR_THUMBPRINT", "THUMBPRINT_ONLY",
+		}
+		if !utils.InString(allowed_verification_modes,
+			strings.ToUpper(config_obj.Client.Crypto.CertificateVerificationMode)) {
+			return fmt.Errorf("Client.Crypto.certificate_verification_mode not valid! Should be one of %v",
+				allowed_verification_modes)
+		}
+	}
+
 	config_obj.Version = GetVersion()
-	config_obj.Client.Version = config_obj.Version
+
+	// The client's config contains the running version of the client
+	// itself.
+	config_obj.Client.Version = GetVersion()
+
+	// Ensure the writeback service is configured.
+	writeback_service := writeback.GetWritebackService()
+	writeback, err := writeback_service.GetWriteback(config_obj)
+	if err == nil && writeback.InstallTime != 0 {
+
+		// Sync the version InstallTime from the writeback. This way
+		// VQL can see that through the config VQL env variable.
+		config_obj.Version.InstallTime = writeback.InstallTime
+	}
 
 	for _, url := range config_obj.Client.ServerUrls {
 		if !strings.HasSuffix(url, "/") {
@@ -134,7 +159,21 @@ func ValidateFrontendConfig(config_obj *config_proto.Config) error {
 	}
 
 	if config_obj.API.PinnedGwName == "" {
-		config_obj.API.PinnedGwName = "GRPC_GW"
+		config_obj.API.PinnedGwName = constants.PinnedGwName
+	}
+
+	// The server should always update the client part to ensure new
+	// clients created from this server will keep the correct server
+	// version.
+	if config_obj.Client != nil {
+		version := GetVersion()
+
+		config_obj.Client.ServerVersion = &config_proto.Version{
+			Version:   version.Version,
+			BuildTime: version.BuildTime,
+			Commit:    version.Commit,
+		}
+
 	}
 
 	return nil

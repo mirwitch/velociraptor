@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package main
 
@@ -26,29 +26,38 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/pprof"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/Velocidex/yaml/v2"
 	errors "github.com/go-errors/errors"
+	"github.com/mccutchen/go-httpbin/v2/httpbin"
 	"github.com/sergi/go-diff/diffmatchpatch"
-	"github.com/shirou/gopsutil/v3/process"
+	proto "google.golang.org/protobuf/proto"
+	"gopkg.in/yaml.v3"
 	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/crypto/storage"
+	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 	"www.velocidex.com/golang/velociraptor/file_store"
+	"www.velocidex.com/golang/velociraptor/json"
 	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
 	"www.velocidex.com/golang/velociraptor/startup"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
+	"www.velocidex.com/golang/velociraptor/vql/psutils"
 	"www.velocidex.com/golang/velociraptor/vql/remapping"
+	"www.velocidex.com/golang/velociraptor/vtesting"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
@@ -80,12 +89,22 @@ var (
 		"(?i)Symbol .+ not found",
 		"(?i)Field .+ Expecting a .+ arg type, not",
 		"(?i)Artifact .+ not found",
+		"(?i)Order by column .+ not present in row",
+		"PANIC runtime error:",
+		"Extra unrecognized arg",
 	}
 )
 
+type queryDesc struct {
+	Comment string
+	Query   string
+}
+
 type testFixture struct {
-	Parameters map[string]string `json:"Parameters"`
-	Queries    []string          `json:"Queries"`
+	Parameters    map[string]string
+	Queries       []queryDesc
+	ConfigPatches []string
+	ConfigMerges  []string
 }
 
 // We want to emulate as closely as possible the logic in the artifact
@@ -125,12 +144,13 @@ func makeCtxWithTimeout(
 				// the goroutines and mutex and hard exit.
 			case <-time.After(time.Second):
 				if time.Now().Before(deadline) {
-					proc, _ := process.NewProcess(int32(os.Getpid()))
-					total_time, _ := proc.Percent(0)
-					memory, _ := proc.MemoryInfo()
+					pid := int32(os.Getpid())
+					total_time, _ := psutils.TimesWithContext(ctx, pid)
+					memory, _ := psutils.MemoryInfoWithContext(ctx, pid)
 
 					fmt.Printf("Not time to fire yet %v %v %v\n",
-						time.Now(), total_time, memory)
+						time.Now(), json.MustMarshalString(total_time),
+						json.MustMarshalString(memory))
 					continue
 				}
 
@@ -164,6 +184,22 @@ func makeCtxWithTimeout(
 func runTest(fixture *testFixture, sm *services.Service,
 	config_obj *config_proto.Config) (string, error) {
 
+	config_obj = proto.Clone(config_obj).(*config_proto.Config)
+
+	err := applyMergesAndPatches(config_obj,
+		nil, fixture.ConfigMerges,
+		nil, fixture.ConfigPatches)
+	if err != nil {
+		return "", err
+	}
+
+	gen := utils.IncrementalIdGenerator(0)
+	defer utils.SetIdGenerator(&gen)()
+
+	// Freeze the time for consistent golden tests Monday, May 31, 2020 3:28:05 PM
+	closer := utils.MockTime(utils.NewMockClock(time.Unix(1590938885, 10)))
+	defer closer()
+
 	ctx := sm.Ctx
 
 	// Limit each test for maxmimum time
@@ -174,8 +210,22 @@ func runTest(fixture *testFixture, sm *services.Service,
 		ctx = sub_ctx
 	}
 
+	// Set this to emulate a working client.
+	storage.SetCurrentServerPem([]byte(config_obj.Frontend.Certificate))
+
+	writeback_service := writeback.GetWritebackService()
+	err = writeback_service.LoadWriteback(config_obj)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = crypto_utils.VerifyConfig(config_obj)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Create an output container.
-	tmpfile, err := ioutil.TempFile("", "golden")
+	tmpfile, err := tempfile.TempFile("golden")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -195,6 +245,8 @@ func runTest(fixture *testFixture, sm *services.Service,
 		Uploader:   container,
 		Env: ordereddict.NewDict().
 			Set("GoldenOutput", tmpfile.Name()).
+			Set("config", config_obj.Client).
+			Set("_SessionId", "F.Golden").
 			Set(constants.SCOPE_MOCK, &remapping.MockingScopeContext{}),
 	}
 
@@ -225,11 +277,15 @@ func runTest(fixture *testFixture, sm *services.Service,
 		return "", err
 	}
 
+	// Build the result of the query into a golden file.
 	result := ""
 	for _, query := range fixture.Queries {
-		result += query
-		scope.Log("Running query %v", query)
-		vql, err := vfilter.Parse(query)
+		if query.Comment != "" {
+			result += query.Comment + "\n"
+		}
+		result += fmt.Sprintf("Query: %v\n", query.Query)
+		scope.Log("Running query %v", query.Query)
+		vql, err := vfilter.Parse(query.Query)
 		if err != nil {
 			return "", err
 		}
@@ -243,7 +299,7 @@ func runTest(fixture *testFixture, sm *services.Service,
 			if !ok {
 				break
 			}
-			result += string(query_result.Payload)
+			result += fmt.Sprintf("Output: %v\n\n", string(query_result.Payload))
 		}
 	}
 
@@ -258,9 +314,16 @@ func runTest(fixture *testFixture, sm *services.Service,
 }
 
 func doGolden() error {
+	closer := utils.MockTime(utils.NewMockClock(time.Unix(1590938885, 10)))
+	defer closer()
+
+	logging.DisableLogging()
+	services.AllowFrontendPlugins.Store(true)
+
 	vql_subsystem.RegisterPlugin(&MemoryLogPlugin{})
 	vql_subsystem.RegisterFunction(&WriteFilestoreFunction{})
 	vql_subsystem.RegisterFunction(&MockTimeFunciton{})
+	vql_subsystem.RegisterFunction(&HTTPBinFunction{})
 
 	config_obj, err := makeDefaultConfigLoader().LoadAndValidate()
 	if err != nil {
@@ -299,13 +362,9 @@ func doGolden() error {
 		return err
 	}
 
-	err = filepath.Walk(*golden_command_directory, func(file_path string, info os.FileInfo, err error) error {
-		select {
-		case <-sm.Ctx.Done():
-			return errors.New("Cancelled!")
-		default:
-		}
+	var file_paths []string
 
+	err = filepath.Walk(*golden_command_directory, func(file_path string, info os.FileInfo, err error) error {
 		if *golden_command_filter != "" &&
 			!strings.HasPrefix(filepath.Base(file_path), *golden_command_filter) {
 			return nil
@@ -313,6 +372,21 @@ func doGolden() error {
 
 		if !strings.HasSuffix(file_path, ".in.yaml") {
 			return nil
+		}
+
+		file_paths = append(file_paths, file_path)
+		return nil
+	})
+
+	// Run the test cases in a predictable way
+	sort.Strings(file_paths)
+	logger.Info("<green>Testing %v test cases</>", len(file_paths))
+
+	for _, file_path := range file_paths {
+		select {
+		case <-sm.Ctx.Done():
+			return errors.New("Cancelled!")
+		default:
 		}
 
 		logger := log.New(os.Stderr, "golden: ", 0)
@@ -323,15 +397,14 @@ func doGolden() error {
 			return fmt.Errorf("Reading file: %w", err)
 		}
 
-		fixture := testFixture{}
-		err = yaml.Unmarshal(data, &fixture)
+		fixture, err := parseFixture(data)
 		if err != nil {
 			return fmt.Errorf("Unmarshal input file: %w", err)
 		}
 
 		result, err := runTest(&fixture, sm, config_obj)
 		if err != nil {
-			return fmt.Errorf("Running test %v: %w", fixture, err)
+			return fmt.Errorf("Running test %v: %w", file_path, err)
 		}
 
 		outfile := strings.Replace(file_path, ".in.", ".out.", -1)
@@ -361,8 +434,7 @@ func doGolden() error {
 				return fmt.Errorf("Unable to write golden file: %w", err)
 			}
 		}
-		return nil
-	})
+	}
 
 	if err != nil {
 		return fmt.Errorf("golden error FAIL: %w", err)
@@ -493,12 +565,16 @@ func (self WriteFilestoreFunction) Call(ctx context.Context,
 	pathspec := paths.FSPathSpecFromClientPath(arg.FSPath)
 	writer, err := file_store_factory.WriteFile(pathspec)
 	if err != nil {
-		scope.Log("write_filestore: %s", err)
+		scope.Log("write_filestore: %v", err)
 		return &vfilter.Null{}
 	}
 	defer writer.Close()
 
-	writer.Write([]byte(arg.Data))
+	_, err = writer.Write([]byte(arg.Data))
+	if err != nil {
+		scope.Log("write_filestore: %v", err)
+		return &vfilter.Null{}
+	}
 
 	return true
 }
@@ -529,7 +605,7 @@ func (self MockTimeFunciton) Call(ctx context.Context,
 		return &vfilter.Null{}
 	}
 
-	clock := &utils.MockClock{time.Unix(arg.Now, 0)}
+	clock := utils.NewMockClock(time.Unix(arg.Now, 0))
 	cancel := utils.MockTime(clock)
 	err = vql_subsystem.GetRootScope(scope).AddDestructor(cancel)
 	if err != nil {
@@ -545,5 +621,62 @@ func (self MockTimeFunciton) Info(
 	return &vfilter.FunctionInfo{
 		Name:    "mock_time",
 		ArgType: type_map.AddType(scope, &MockTimeFuncitonArgs{}),
+	}
+}
+
+func parseFixture(data []byte) (res testFixture, err error) {
+	type tmpType struct {
+		ConfigMerges  []string          `yaml:"ConfigMerges"`
+		ConfigPatches []string          `yaml:"ConfigPatches"`
+		Parameters    map[string]string `yaml:"Parameters"`
+		Queries       []yaml.Node       `yaml:"Queries"`
+	}
+
+	var n tmpType
+	err = yaml.Unmarshal(data, &n)
+	if err != nil {
+		return res, err
+	}
+
+	res.ConfigMerges = n.ConfigMerges
+	res.ConfigPatches = n.ConfigPatches
+	res.Parameters = n.Parameters
+	for _, node := range n.Queries {
+		if node.Kind != yaml.ScalarNode {
+			continue
+		}
+
+		res.Queries = append(res.Queries, queryDesc{
+			Query:   node.Value,
+			Comment: node.HeadComment,
+		})
+	}
+
+	return res, err
+}
+
+// A helper function to spin up go-httpbin for testing http
+// connections.
+type HTTPBinFunction struct{}
+
+func (self HTTPBinFunction) Call(ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	app := httpbin.New()
+	testServer := vtesting.NewServer(app, 8006)
+
+	err := vql_subsystem.GetRootScope(scope).AddDestructor(testServer.Close)
+	if err != nil {
+		scope.Log("httpbin: %v", err)
+	}
+	return testServer.URL
+}
+
+func (self HTTPBinFunction) Info(
+	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+	return &vfilter.FunctionInfo{
+		Name: "httpbin",
+		Doc:  "Start HTTPBin and return the URL",
 	}
 }

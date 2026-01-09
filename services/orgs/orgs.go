@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/protobuf/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
@@ -16,6 +18,14 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
+)
+
+var (
+	orgStartCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "org_start_count",
+			Help: "Number of orgs start started their services",
+		})
 )
 
 type OrgContext struct {
@@ -29,9 +39,6 @@ type OrgContext struct {
 
 type OrgManager struct {
 	mu sync.Mutex
-
-	// Sync the scan
-	scan_mu sync.Mutex
 
 	// The root org's ctx and wg
 	ctx context.Context
@@ -59,8 +66,8 @@ func (self *OrgManager) ListOrgs() []*api_proto.OrgRecord {
 	for _, item := range self.orgs {
 		copy := proto.Clone(item.record).(*api_proto.OrgRecord)
 		if utils.IsRootOrg(copy.Id) {
-			copy.Id = "root"
-			copy.Name = "<root>"
+			copy.Id = services.ROOT_ORG_ID
+			copy.Name = services.ROOT_ORG_NAME
 			if self.config_obj.Client != nil {
 				copy.Nonce = self.config_obj.Client.Nonce
 			}
@@ -80,6 +87,8 @@ func (self *OrgManager) GetOrgConfig(org_id string) (*config_proto.Config, error
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
+	org_id = utils.NormalizedOrgId(org_id)
+
 	// An empty org id corresponds to the root org.
 	if utils.IsRootOrg(org_id) {
 		return self.config_obj, nil
@@ -87,7 +96,7 @@ func (self *OrgManager) GetOrgConfig(org_id string) (*config_proto.Config, error
 
 	result, pres := self.orgs[org_id]
 	if !pres {
-		return nil, services.NotFoundError
+		return nil, services.OrgNotFoundError
 	}
 	return result.config_obj, nil
 }
@@ -96,13 +105,11 @@ func (self *OrgManager) GetOrg(org_id string) (*api_proto.OrgRecord, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	if utils.IsRootOrg(org_id) {
-		org_id = ""
-	}
+	org_id = utils.NormalizedOrgId(org_id)
 
 	result, pres := self.orgs[org_id]
 	if !pres {
-		return nil, services.NotFoundError
+		return nil, services.OrgNotFoundError
 	}
 	return result.record, nil
 }
@@ -119,27 +126,33 @@ func (self *OrgManager) OrgIdByNonce(nonce string) (string, error) {
 
 	result, pres := self.org_id_by_nonce[nonce]
 	if !pres {
-		return "", services.NotFoundError
+		return "", services.OrgNotFoundError
 	}
 	return result, nil
 }
 
-func (self *OrgManager) CreateNewOrg(name, id string) (
+func (self *OrgManager) CreateNewOrg(name, id, nonce string) (
 	*api_proto.OrgRecord, error) {
 
 	if id == "" {
 		id = self.NewOrgId()
 	}
 
+	id = utils.NormalizedOrgId(id)
+
 	_, err := self.GetOrg(id)
 	if err == nil {
 		return nil, errors.New("CreateNewOrg: Org ID already in use")
 	}
 
+	if nonce == services.RandomNonce {
+		nonce = NewNonce()
+	}
+
 	org_record := &api_proto.OrgRecord{
 		Name:  name,
 		Id:    id,
-		Nonce: NewNonce(),
+		Nonce: nonce,
 	}
 
 	// Check if the org already exists
@@ -172,9 +185,14 @@ func (self *OrgManager) CreateNewOrg(name, id string) (
 func (self *OrgManager) makeNewConfigObj(
 	record *api_proto.OrgRecord) *config_proto.Config {
 
-	result := proto.Clone(self.config_obj).(*config_proto.Config)
+	// The root org carries the real global config, but other orgs'
+	// config will be derived from the root org.
+	result := self.config_obj
+	if !utils.IsRootOrg(record.Id) {
+		result = proto.Clone(self.config_obj).(*config_proto.Config)
+	}
 
-	result.OrgId = record.Id
+	result.OrgId = utils.NormalizedOrgId(record.Id)
 	result.OrgName = record.Name
 
 	if result.Client != nil {
@@ -183,7 +201,12 @@ func (self *OrgManager) makeNewConfigObj(
 		result.Client.Nonce = record.Nonce
 	}
 
-	if result.Datastore != nil && record.Id != "" {
+	// Adjust the datastore directories to point at a per-org
+	// location:
+
+	// The root location remains at the top level but suborgs will
+	// live in <fs>/orgs/<orgid>
+	if result.Datastore != nil && !utils.IsRootOrg(record.Id) {
 		result.Datastore.Location = filepath.Join(
 			result.Datastore.Location, "orgs", record.Id)
 		result.Datastore.FilestoreDirectory = filepath.Join(
@@ -227,6 +250,12 @@ func (self *OrgManager) Scan() error {
 
 		delete(existing, org_id)
 
+		if org_record.Id == "" || org_record.Nonce == "" {
+			logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+			logger.Info("<yellow>Org is corrupted %v</>", org_id)
+			continue
+		}
+
 		_, err = self.GetOrgConfig(org_id)
 		if err != nil {
 			err = self.startOrg(org_record)
@@ -238,6 +267,8 @@ func (self *OrgManager) Scan() error {
 
 	// Now shut down the orgs that were removed
 	for org_id := range existing {
+		org_id = utils.NormalizedOrgId(org_id)
+
 		// Do not remove the root org
 		if utils.IsRootOrg(org_id) {
 			continue
@@ -276,8 +307,8 @@ func (self *OrgManager) Start(
 
 	// First start all services for the root org
 	err := self.startOrg(&api_proto.OrgRecord{
-		Id:    "",
-		Name:  "<root org>",
+		Id:    services.ROOT_ORG_ID,
+		Name:  services.ROOT_ORG_NAME,
 		Nonce: nonce,
 	})
 	if err != nil {
@@ -306,8 +337,11 @@ func (self *OrgManager) Start(
 			case <-ctx.Done():
 				return
 
-			case <-time.After(10 * time.Second):
-				self.Scan()
+			case <-time.After(utils.Jitter(10 * time.Second)):
+				err := self.Scan()
+				if err != nil {
+					logger.Error("<red>OrgManager Scan</> %v", err)
+				}
 			}
 		}
 

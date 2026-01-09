@@ -23,13 +23,19 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/debug"
 	"www.velocidex.com/golang/velociraptor/services/journal"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
 
-type VFSService struct{}
+type VFSService struct {
+	mu sync.Mutex
+
+	stats        []*VFSServiceStats
+	current_stat *VFSServiceStats
+}
 
 func (self *VFSService) Start(
 	ctx context.Context,
@@ -68,6 +74,13 @@ func (self *VFSService) Start(
 		return err
 	}
 
+	debug.RegisterProfileWriter(debug.ProfileWriterInfo{
+		Name:          "VFS Service",
+		Description:   "The VFS service post processes results from VFS operations.",
+		ProfileWriter: self.WriteProfile,
+		Categories:    []string{"Org", services.GetOrgName(config_obj), "Services"},
+	})
+
 	return nil
 }
 
@@ -84,12 +97,11 @@ func (self *VFSService) ProcessDownloadFile(
 	ts, _ := row.GetInt64("_ts")
 
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("VFSService: Processing System.VFS.DownloadFile from %v", client_id)
+	logger.Debug("VFSService: Processing System.VFS.DownloadFile from %v %v",
+		client_id, flow_id)
 
 	flow_path_manager := paths.NewFlowPathManager(client_id, flow_id)
-	client_path_manager := paths.NewClientPathManager(client_id)
-
-	artifact_path_manager, err := artifacts.NewArtifactPathManager(config_obj,
+	artifact_path_manager, err := artifacts.NewArtifactPathManager(ctx, config_obj,
 		client_id, flow_id, "System.VFS.DownloadFile")
 	if err != nil {
 		logger.Error("Unable to read artifact: %v", err)
@@ -108,20 +120,34 @@ func (self *VFSService) ProcessDownloadFile(
 	for row := range reader.Rows(ctx) {
 		Accessor, _ := row.GetString("Accessor")
 		Path, _ := row.GetString("Path")
-
+		Components, _ := row.GetStrings("_Components")
 		MD5, _ := row.GetString("Md5")
 		SHA256, _ := row.GetString("Sha256")
+		Error, _ := row.GetString("Error")
 
 		// Figure out where the file was uploaded to.
 		uploaded_file_manager := flow_path_manager.GetUploadsFile(
-			Accessor, Path)
+			Accessor, Path, Components)
 
 		// Check to make sure the file actually exists.
 		file_store_factory := file_store.GetFileStore(config_obj)
 		_, err := file_store_factory.StatFile(uploaded_file_manager.Path())
 		if err != nil {
-			logger.Error(
-				"Unable to save flow %v: %v", Path, err)
+			if Error == "" {
+				Error = err.Error()
+			}
+			// Record an error in the download info.
+			err = self.WriteDownloadInfo(ctx, config_obj, client_id, Accessor,
+				Components, &flows_proto.VFSDownloadInfo{
+					Mtime:    uint64(ts) * 1000000,
+					FlowId:   flow_id,
+					InFlight: false,
+					Error:    Error,
+				})
+			if err != nil {
+				logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+				logger.Error("VFSService WriteDownloadInfo: %v", err)
+			}
 			continue
 		}
 
@@ -130,28 +156,24 @@ func (self *VFSService) ProcessDownloadFile(
 			uploaded_file_manager.IndexPath())
 		has_index_file := err == nil
 
-		// We store a place holder in the VFS pointing at the
-		// read vfs_path of the download.
-		db, err := datastore.GetDB(config_obj)
-		if err != nil {
-			return
-		}
-
-		err = db.SetSubject(config_obj,
-			client_path_manager.VFSDownloadInfoFromClientPath(
-				Accessor, Path),
-			&flows_proto.VFSDownloadInfo{
+		// Now record the file has completed upload.
+		err = self.WriteDownloadInfo(ctx, config_obj, client_id, Accessor,
+			Components, &flows_proto.VFSDownloadInfo{
 				Components: uploaded_file_manager.
 					Path().Components(),
-				Mtime:  uint64(ts) * 1000000,
-				Sparse: has_index_file, // If index file exists we have an index.
-				Size:   vql_subsystem.GetIntFromRow(scope, row, "Size"),
-				MD5:    MD5,
-				SHA256: SHA256,
+				Mtime:    uint64(ts) * 1000000,
+				Sparse:   has_index_file, // If index file exists we have an index.
+				Size:     vql_subsystem.GetIntFromRow(scope, row, "Size"),
+				MD5:      MD5,
+				SHA256:   SHA256,
+				FlowId:   flow_id,
+				InFlight: false,
 			})
 		if err != nil {
-			logger.Error("Unable to save flow %v: %v", Path, err)
+			logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+			logger.Error("VFSService WriteDownloadInfo: %v", err)
 		}
+
 	}
 }
 
@@ -197,7 +219,8 @@ func (self *VFSService) ProcessListDirectoryLegacy(
 	scope vfilter.Scope, row *ordereddict.Dict,
 	basic_flow *flows_proto.ArtifactCollectorContext) {
 
-	flow, err := journal.GetFlowFromQueue(config_obj, row)
+	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+	flow, err := journal.GetFlowFromQueue(ctx, config_obj, row)
 	if err != nil {
 		return
 	}
@@ -211,9 +234,6 @@ func (self *VFSService) ProcessListDirectoryLegacy(
 	client_id, _ := row.GetString("ClientId")
 	flow_id, _ := row.GetString("FlowId")
 	ts, _ := row.GetInt64("_ts")
-
-	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("VFSService: Processing System.VFS.ListDirectory from %v", client_id)
 
 	path_manager := artifacts.NewArtifactPathManagerWithMode(
 		config_obj, client_id, flow_id, "System.VFS.ListDirectory",
@@ -229,6 +249,8 @@ func (self *VFSService) ProcessListDirectoryLegacy(
 		return
 	}
 	defer reader.Close()
+
+	logger.Debug("VFSService: Processing Legacy System.VFS.ListDirectory from %v", client_id)
 
 	var current_vfs_components []string = nil
 
@@ -283,8 +305,6 @@ func (self *VFSService) ProcessListDirectoryLegacy(
 		logger.Error("Unable to save directory: %v", err)
 		return
 	}
-
-	start_row = count
 }
 
 func findParam(name string, flow *flows_proto.ArtifactCollectorContext) string {
@@ -341,8 +361,12 @@ func (self *VFSService) ProcessListDirectory(
 	flow_id, _ := row.GetString("FlowId")
 	ts, _ := row.GetInt64("_ts")
 
+	// Record stats of this operation
+	defer self.startNewOperation(client_id, flow_id)()
+
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("VFSService: Processing System.VFS.ListDirectory/Stats from %v", client_id)
+	logger.Info("VFSService: Processing System.VFS.ListDirectory/Stats from %v %v",
+		client_id, flow_id)
 
 	path_manager := artifacts.NewArtifactPathManagerWithMode(
 		config_obj, client_id, flow_id, "System.VFS.ListDirectory/Stats",
@@ -386,6 +410,8 @@ func (self *VFSService) ProcessListDirectory(
 			StartIdx:  row_obj.Stats.StartIdx,
 			EndIdx:    row_obj.Stats.EndIdx,
 		}
+
+		self.current_stat.ChargeDir(int(stats.TotalRows))
 
 		db, err := datastore.GetDB(config_obj)
 		if err != nil {

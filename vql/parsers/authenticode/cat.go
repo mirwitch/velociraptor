@@ -1,3 +1,4 @@
+//go:build windows && amd64
 // +build windows,amd64
 
 package authenticode
@@ -5,7 +6,6 @@ package authenticode
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"syscall"
 	"unsafe"
@@ -14,9 +14,11 @@ import (
 	"github.com/Velocidex/pkcs7"
 	"www.velocidex.com/golang/go-pe"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/utils"
+	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	windows "www.velocidex.com/golang/velociraptor/vql/windows"
+	"www.velocidex.com/golang/vfilter"
 )
 
 const (
@@ -36,8 +38,16 @@ var (
 
 func VerifyCatalogSignature(
 	config_obj *config_proto.Config,
+	scope vfilter.Scope,
 	fd *os.File, normalized_path string,
 	output *ordereddict.Dict) (string, error) {
+
+	if vql_subsystem.GetBoolFromRow(scope, scope,
+		constants.DISABLE_DANGEROUS_API_CALLS) {
+		output.Update("Trusted", "Unknown")
+		return "", nil
+	}
+
 	err := windows.HasWintrustDll()
 	if err != nil {
 		return "", err
@@ -49,26 +59,19 @@ func VerifyCatalogSignature(
 		return "", err
 	}
 
-	// Make sure the filename is null terminated.
-	filename = append(filename, 0)
-
 	var CatAdminHandle syscall.Handle
 	err = windows.CryptCATAdminAcquireContext2(&CatAdminHandle, nil, nil, nil, 0)
 	if err != nil {
-		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
-		logger.Error("CryptCATAdminAcquireContext2 %v\n", err)
 		return "", err
 	}
 	defer windows.CryptCATAdminReleaseContext(CatAdminHandle, 0)
 
 	hash_length := uint32(100)
-	hash := make([]byte, 100)
+	hash := utils.AllocateBuff(100)
 
 	err = windows.CryptCATAdminCalcHashFromFileHandle2(CatAdminHandle, fd.Fd(),
-		&hash_length, (*byte)(unsafe.Pointer(&hash[0])), 0)
+		&hash_length, &hash[0], 0)
 	if err != nil {
-		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
-		logger.Error("CryptCATAdminCalcHashFromFileHandle2 %v\n", err)
 		return "", err
 	}
 
@@ -76,7 +79,7 @@ func VerifyCatalogSignature(
 	var CatInfoHandle syscall.Handle
 	CatInfoHandle = windows.CryptCATAdminEnumCatalogFromHash(
 		CatAdminHandle,
-		(*byte)(unsafe.Pointer(&hash[0])),
+		&hash[0],
 		hash_length,
 		0,
 		nil)
@@ -102,46 +105,42 @@ func VerifyCatalogSignature(
 		return "", err
 	}
 
-	// Report the cat file itself. Convert the static byte array
-	// from UTF16 to a string
-	p := (*[unsafe.Sizeof(catalogInfo.WszCatalogFile) / 2]uint16)(
-		unsafe.Pointer(&catalogInfo.WszCatalogFile[0]))
-	cat_file := windows.UTF16ToString(p[:])
+	cat_file := windows.UTF16ToString(catalogInfo.WszCatalogFile[:])
 
 	// Calculate the member tag - it is usually the hex
 	// string of the hash but not always.
 	tag := fmt.Sprintf("%X\x00", hash[:hash_length])
-	tag_bytes := []byte(tag)
+	tag_bytes, _ := windows.UTF16PtrFromString(tag)
 
 	// Now figure out the signer from the cat file.
 	ci := new(windows.WINTRUST_CATALOG_INFO)
 	ci.CbStruct = uint32(unsafe.Sizeof(*ci))
-	ci.PcwszCatalogFilePath = (uintptr)(unsafe.Pointer(&catalogInfo.WszCatalogFile[0]))
-	ci.PcwszMemberFilePath = (uintptr)(unsafe.Pointer(&filename[0]))
-	ci.HMemberFile = fd.Fd()
-	ci.PcwszMemberTag = (uintptr)(unsafe.Pointer(&tag_bytes[0]))
-	ci.PbCalculatedFileHash = (uintptr)(unsafe.Pointer(&hash[0]))
+	ci.PcwszCatalogFilePath = &catalogInfo.WszCatalogFile[0]
+	ci.PcwszMemberFilePath = &filename[0]
+	ci.HMemberFile = syscall.Handle(fd.Fd())
+	ci.PcwszMemberTag = tag_bytes
+	ci.PbCalculatedFileHash = &hash[0]
 	ci.CbCalculatedFileHash = hash_length
 	ci.HCatAdmin = CatAdminHandle
 
-	trustData := new(windows.WINTRUST_DATA)
+	trustData := new(windows.WINTRUST_DATA_CATALOG_INFO)
 	trustData.CbStruct = uint32(unsafe.Sizeof(*trustData))
 	trustData.DwUIChoice = windows.WTD_UI_NONE
 	trustData.FdwRevocationChecks = windows.WTD_REVOKE_NONE
 	trustData.DwUnionChoice = windows.WTD_CHOICE_CATALOG
-	trustData.Union = (uintptr)(unsafe.Pointer(ci))
+	trustData.PCatalog = ci
 	trustData.DwStateAction = windows.WTD_STATEACTION_VERIFY
 	trustData.DwProvFlags = windows.WTD_SAFER_FLAG
 
-	ret, _ := windows.WinVerifyTrust(windows.INVALID_HANDLE_VALUE, &DRIVER_ACTION_VERIFY,
-		trustData)
+	ret, _ := windows.WinVerifyTrust(windows.INVALID_HANDLE_VALUE,
+		&WINTRUST_ACTION_GENERIC_VERIFY_V2, trustData)
 	output.Update("Trusted", WinVerifyTrustErrors(ret))
 
 	// Any hWVTStateData must be released by a call with close.
 	trustData.DwStateAction = windows.WTD_STATEACTION_CLOSE
 
 	windows.WinVerifyTrust(windows.INVALID_HANDLE_VALUE,
-		&DRIVER_ACTION_VERIFY, trustData)
+		&WINTRUST_ACTION_GENERIC_VERIFY_V2, trustData)
 
 	return cat_file, nil
 }
@@ -157,7 +156,7 @@ func ParseCatFile(cat_file string, output *ordereddict.Dict, verbose bool) error
 	if err != nil {
 		return err
 	}
-	data, err := ioutil.ReadAll(cat_fd)
+	data, err := utils.ReadAllWithLimit(cat_fd, constants.MAX_MEMORY)
 	if err != nil {
 		return err
 	}
@@ -191,7 +190,7 @@ func WinVerifyTrustErrors(ret uint32) string {
 	case TRUST_E_SUBJECT_FORM_UNKNOWN:
 		return "TRUST_E_SUBJECT_FORM_UNKNOWN"
 	default:
-		return "TRUST_E_ACTION_UNKNOWN"
+		return fmt.Sprintf("TRUST_E_ACTION_UNKNOWN %#x", ret)
 	}
 
 }

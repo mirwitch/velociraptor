@@ -34,16 +34,12 @@ precondition:
   SELECT * FROM info() where OS = 'windows'
 
 parameters:
-  - name: SearchFilesGlob
-    default: C:\Users\*
-    description: Use a glob to define the files that will be searched.
-
   - name: SearchFilesGlobTable
     type: csv
     default: |
       Glob
       C:/Users/SomeUser/*
-    description: Alternative specify multiple globs in a table
+    description: Specify multiple globs to search for.
 
   - name: Accessor
     default: auto
@@ -54,6 +50,7 @@ parameters:
       - registry
       - file
       - ntfs
+      - ntfs_vss
 
   - name: YaraRule
     type: yara
@@ -76,10 +73,21 @@ parameters:
     default: ""
     type: timestamp
 
+  - name: VSS_MAX_AGE_DAYS
+    type: int
+    description: |
+      If larger than 0 we restrict VSS age to this many days
+      ago. Otherwise we find all VSS.
+
+  - name: UPLOAD_IS_RESUMABLE
+    type: bool
+    default: N
+    description: |
+      If set, file uploads will be asynchronous and resumable.
 
 sources:
   - query: |
-      LET file_search = SELECT FullPath,
+      LET file_search = SELECT OSPath,
                get(item=Data, field="mft") as Inode,
                Mode.String AS Mode, Size,
                Mtime AS MTime,
@@ -87,7 +95,7 @@ sources:
                Btime AS BTime,
                Ctime AS CTime, "" AS Keywords,
                IsDir, Data
-        FROM glob(globs=SearchFilesGlobTable.Glob + SearchFilesGlob,
+        FROM glob(globs=SearchFilesGlobTable.Glob,
                   accessor=Accessor)
 
       LET more_recent = SELECT * FROM if(
@@ -114,23 +122,23 @@ sources:
                WHERE NOT IsDir
             },
             query={
-               SELECT FullPath, Inode, Mode,
+               SELECT OSPath, Inode, Mode,
                       Size, MTime, ATime, CTime, BTime,
                       str(str=String.Data) As Keywords, IsDir, Data
 
-               FROM yara(files=FullPath,
+               FROM yara(files=OSPath,
                          key="A",
                          rules=YaraRule,
                          accessor=Accessor)
             })
         }, else=modified_before)
 
-      SELECT FullPath, Inode, Mode, Size, MTime, ATime,
+      SELECT OSPath, Inode, Mode, Size, MTime, ATime,
              CTime, BTime, Keywords, IsDir,
                if(condition=Upload_File and NOT IsDir,
-                  then=upload(file=FullPath, accessor=Accessor)) AS Upload,
+                  then=upload(file=OSPath, accessor=Accessor)) AS Upload,
                if(condition=Calculate_Hash and NOT IsDir,
-                  then=hash(path=FullPath, accessor=Accessor)) AS Hash,
+                  then=hash(path=OSPath, accessor=Accessor)) AS Hash,
             Data
       FROM keyword_search
 

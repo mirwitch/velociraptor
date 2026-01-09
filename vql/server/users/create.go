@@ -4,10 +4,9 @@ import (
 	"context"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sirupsen/logrus"
 	acl_proto "www.velocidex.com/golang/velociraptor/acls/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/users"
+	"www.velocidex.com/golang/velociraptor/services"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -35,6 +34,12 @@ func (self UserCreateFunction) Call(
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("user_create: %v", err)
+		return vfilter.Null{}
+	}
+
 	org_config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
 		scope.Log("user_create: Command can only run on the server")
@@ -51,16 +56,29 @@ func (self UserCreateFunction) Call(
 		Roles: arg.Roles,
 	}
 
-	err = users.AddUserToOrg(ctx, users.AddNewUser,
+	users_manager := services.GetUserManager()
+	err = users_manager.AddUserToOrg(ctx, services.AddNewUser,
 		principal, arg.Username, arg.OrgIds, policy)
 	if err != nil {
 		scope.Log("user_create: %s", err)
 		return vfilter.Null{}
 	}
 
+	err = services.LogAudit(ctx,
+		org_config_obj, principal, "user_create",
+		ordereddict.NewDict().
+			Set("username", arg.Username).
+			Set("acl", policy).
+			Set("org_ids", arg.OrgIds))
+	if err != nil {
+		logger := logging.GetLogger(org_config_obj, &logging.FrontendComponent)
+		logger.Error("<red>user_create</> %v: %v %v", principal,
+			arg.Username, policy)
+	}
+
 	if arg.Password != "" {
 		// Write the user record.
-		err = users.SetUserPassword(
+		err = users_manager.SetUserPassword(
 			ctx, org_config_obj, principal, arg.Username, arg.Password, "")
 		if err != nil {
 			scope.Log("user_create: %s", err)
@@ -68,12 +86,6 @@ func (self UserCreateFunction) Call(
 		}
 	}
 
-	logging.LogAudit(org_config_obj, principal, "user_create",
-		logrus.Fields{
-			"Username": arg.Username,
-			"Roles":    arg.Roles,
-			"OrgIds":   arg.OrgIds,
-		})
 	return arg.Username
 }
 

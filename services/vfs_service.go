@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
@@ -20,6 +21,7 @@ type VFSPartition struct {
 // parse them and write to the datastore.
 type VFSListRow struct {
 	FullPath   string            `json:"FullPath"`
+	OSPath     *accessors.OSPath `json:"OSPath"`
 	Components []string          `json:"Components"`
 	Accessor   string            `json:"Accessor"`
 	Data       *ordereddict.Dict `json:"Data"`
@@ -31,6 +33,7 @@ type VFSListRow struct {
 	Atime      time.Time         `json:"atime"`
 	Ctime      time.Time         `json:"ctime"`
 	Btime      time.Time         `json:"btime"`
+	Idx        uint64            `json:"Idx"`
 }
 
 func GetVFSService(config_obj *config_proto.Config) (VFSService, error) {
@@ -73,4 +76,12 @@ type VFSService interface {
 		client_id string,
 		accessor string,
 		path_components []string) (*flows_proto.VFSDownloadInfo, error)
+
+	WriteDownloadInfo(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string,
+		accessor string,
+		client_components []string,
+		record *flows_proto.VFSDownloadInfo) error
 }

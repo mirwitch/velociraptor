@@ -22,8 +22,17 @@ import { faHome, faCrosshairs, faWrench, faEye, faServer, faBook, faLaptop,
          faCompressAlt, faBackward, faMedkit, faVirusSlash, faBookmark, faHeart,
          faFileCode, faFlag, faTrashAlt, faClock, faLock, faLockOpen, faCloud,
          faCloudDownloadAlt, faUserEdit, faFilter, faSortAlphaUp, faSortAlphaDown,
-         faInfo, faBug, faUser, faList, faIndent, faTextHeight
+         faInfo, faBug, faUser, faList, faIndent, faTextHeight, faBars,
+         faUserLargeSlash, faTriangleExclamation, faCircle, faAnglesLeft, faMaximize,
+         faMinimize, faNoteSticky, faArrowsUpDown, faBan, faFileExport,
+         faCircleExclamation, faTable, faHouse, faRotateLeft, faRotateRight,
+         faChevronRight, faEllipsis, faLayerGroup, faBullseye, faPersonRunning,
+         faQuestion, faCalendarPlus, faForwardFast, faBackwardFast, faSliders,
+         faRepeat, faBorderAll, faBell,
        } from '@fortawesome/free-solid-svg-icons';
+
+import { faSquare, faSquareCheck, faSquareMinus,
+       } from '@fortawesome/free-regular-svg-icons';
 
 library.add(faHome, faCrosshairs, faWrench, faEye, faServer, faBook, faLaptop,
             faSearch, faSpinner, faSearchPlus, faTasks, faTerminal,
@@ -37,7 +46,14 @@ library.add(faHome, faCrosshairs, faWrench, faEye, faServer, faBook, faLaptop,
             faForward, faCalendarAlt, faCompressAlt, faBackward, faMedkit, faVirusSlash,
             faBookmark, faHeart, faFileCode, faFlag, faTrashAlt, faClock, faLock, faLockOpen,
             faCloud, faCloudDownloadAlt, faUserEdit, faFilter, faBug,
-            faSortAlphaUp, faSortAlphaDown, faInfo, faUser, faList, faIndent, faTextHeight
+            faSortAlphaUp, faSortAlphaDown, faInfo, faUser, faList, faIndent,
+            faTextHeight, faBars, faUserLargeSlash, faTriangleExclamation,
+            faCircle, faAnglesLeft, faMaximize, faMinimize, faNoteSticky,
+            faArrowsUpDown, faBan, faFileExport, faCircleExclamation,
+            faTable, faHouse, faRotateLeft, faRotateRight, faChevronRight,
+            faEllipsis, faLayerGroup, faBullseye, faPersonRunning, faQuestion,
+            faCalendarPlus, faForwardFast, faBackwardFast, faSquareCheck, faSquare,
+            faSquareMinus, faSliders, faRepeat, faBorderAll, faBell,
            );
 
 ReactDOM.render(

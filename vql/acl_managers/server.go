@@ -1,23 +1,29 @@
 package acl_managers
 
 import (
+	"fmt"
 	"sync"
 
 	"www.velocidex.com/golang/velociraptor/acls"
 	acl_proto "www.velocidex.com/golang/velociraptor/acls/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+)
+
+var (
+	lockedDownError = fmt.Errorf("%w: Server locked down", acls.PermissionDenied)
 )
 
 // ServerACLManager is used when running server side VQL to control
 // ACLs on various VQL plugins.
 type ServerACLManager struct {
-	principal  string
-	config_obj *config_proto.Config
+	principal string
 
 	// Cache principal's token for each org_id
 	mu         sync.Mutex
+	config_obj *config_proto.Config
 	TokenCache map[string]*acl_proto.ApiClientACL
 }
 
@@ -25,13 +31,60 @@ func (self *ServerACLManager) GetPrincipal() string {
 	return self.principal
 }
 
+// Check against the lockdown token if available. If there is no
+// lockdown token (i.e. we are not in lockdown mode) we allow this
+// request and further checks are performed.
+func (self *ServerACLManager) handleLockdown(
+	permissions []acls.ACL_PERMISSION) (bool, error) {
+	// Not in lockdown mode, permit access
+	lockdown_token := acls.LockdownToken()
+
+	if lockdown_token == nil {
+		return true, nil
+	}
+
+	// If any of the permissions are denied by the lockdown token then
+	// block access.
+	for _, perm := range permissions {
+		// Lockdown permissions subtract from user permission so if
+		// the lockdown token has a permission, this means reject the
+		// operation.
+		ok, err := services.CheckAccessWithToken(lockdown_token, perm)
+		if err == nil && ok {
+			return false, lockedDownError
+		}
+	}
+
+	// If we get here all permissions are allowed.
+	return true, nil
+}
+
 // Token must have *ALL* the specified permissions.
 func (self *ServerACLManager) CheckAccess(
 	permissions ...acls.ACL_PERMISSION) (bool, error) {
 
-	policy, err := self.getPolicyInOrg(self.config_obj.OrgId)
-	if err != nil {
+	// Check against the lockdown token and immediately reject
+	// permission
+	allowed, err := self.handleLockdown(permissions)
+	if err != nil || !allowed {
 		return false, err
+	}
+
+	self.mu.Lock()
+	config_obj := self.config_obj
+	org_id := self.config_obj.OrgId
+	self.mu.Unlock()
+
+	// If the principal is the super user we allow them everything.
+	if self.principal == utils.GetSuperuserName(config_obj) {
+		return true, nil
+	}
+
+	// Check access against the policy
+	policy, err := self.GetPolicyInOrg(org_id)
+	if err != nil {
+		// If policy is missing then permission denied.
+		return false, acls.PermissionDenied
 	}
 
 	for _, permission := range permissions {
@@ -44,7 +97,7 @@ func (self *ServerACLManager) CheckAccess(
 	return true, nil
 }
 
-func (self *ServerACLManager) getPolicyInOrg(org_id string) (*acl_proto.ApiClientACL, error) {
+func (self *ServerACLManager) GetPolicyInOrg(org_id string) (*acl_proto.ApiClientACL, error) {
 	self.mu.Lock()
 	policy, pres := self.TokenCache[org_id]
 	self.mu.Unlock()
@@ -76,7 +129,7 @@ func (self *ServerACLManager) getPolicyInOrg(org_id string) (*acl_proto.ApiClien
 
 func (self *ServerACLManager) CheckAccessInOrg(
 	org_id string, permissions ...acls.ACL_PERMISSION) (bool, error) {
-	policy, err := self.getPolicyInOrg(org_id)
+	policy, err := self.GetPolicyInOrg(org_id)
 	if err != nil {
 		return false, err
 	}
@@ -90,9 +143,22 @@ func (self *ServerACLManager) CheckAccessInOrg(
 	return true, nil
 }
 
+// NOOP because we always use the same token for all comparisons.
+func (self *ServerACLManager) SwitchDefaultOrg(config_obj *config_proto.Config) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.config_obj = config_obj
+}
+
 func (self *ServerACLManager) CheckAccessWithArgs(
 	permission acls.ACL_PERMISSION, args ...string) (bool, error) {
-	policy, err := self.getPolicyInOrg(self.config_obj.OrgId)
+
+	self.mu.Lock()
+	org_id := self.config_obj.OrgId
+	self.mu.Unlock()
+
+	policy, err := self.GetPolicyInOrg(org_id)
 	if err != nil {
 		return false, err
 	}

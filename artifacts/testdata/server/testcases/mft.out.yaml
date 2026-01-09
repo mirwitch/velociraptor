@@ -1,4 +1,9 @@
-LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts/testdata/files/test.ntfs.dd', srcDir+'/artifacts/testdata/files/test.ntfs.dd', ]), clear=TRUE)[]SELECT * FROM Artifact.Windows.NTFS.MFT( MFTDrive='''\\.\C:''', FileRegex='just_a_file\\.txt')[
+Query: LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts/testdata/files/test.ntfs.dd', srcDir+'/artifacts/testdata/files/test.ntfs.dd', ]), clear=TRUE)
+Output: []
+
+# Test MFT output
+Query: SELECT * FROM Artifact.Windows.NTFS.MFT( MFTDrive='''\\.\C:''', FileRegex='just_a_file\\.txt')
+Output: [
  {
   "EntryNumber": 49,
   "InUse": true,
@@ -21,7 +26,7 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
   "LastAccess0x30": "2022-03-18T04:15:18.5166156Z",
   "HasADS": false,
   "SI_Lt_FN": false,
-  "uSecZeros": false,
+  "USecZeros": false,
   "Copied": true,
   "FileNames": [
    "just_a_file.txt"
@@ -29,7 +34,11 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
   "FileNameTypes": "POSIX",
   "_Source": "Windows.NTFS.MFT"
  }
-]SELECT * FROM Artifact.Windows.NTFS.MFT(MFTDrive='''\\.\C:''', FileRegex='\\.txt',DateBefore='2018-12-31')[
+]
+
+# Test time contraints
+Query: SELECT * FROM Artifact.Windows.NTFS.MFT(MFTDrive='''\\.\C:''', FileRegex='\\.txt',DateBefore='2018-12-31')
+Output: [
  {
   "EntryNumber": 46,
   "InUse": true,
@@ -52,7 +61,7 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
   "LastAccess0x30": "2018-09-24T07:55:29.7664719Z",
   "HasADS": true,
   "SI_Lt_FN": false,
-  "uSecZeros": false,
+  "USecZeros": false,
   "Copied": false,
   "FileNames": [
    "Hello world text document.txt"
@@ -82,7 +91,7 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
   "LastAccess0x30": "2018-09-24T07:55:29.7664719Z",
   "HasADS": true,
   "SI_Lt_FN": false,
-  "uSecZeros": false,
+  "USecZeros": false,
   "Copied": false,
   "FileNames": [
    "Hello world text document.txt:goodbye.txt"
@@ -90,7 +99,10 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
   "FileNameTypes": "POSIX",
   "_Source": "Windows.NTFS.MFT"
  }
-]SELECT * FROM Artifact.Windows.NTFS.MFT(MFTDrive='''\\.\C:''', FileRegex='\\.txt',DateAfter='2021-07-01')[
+]
+
+Query: SELECT * FROM Artifact.Windows.NTFS.MFT(MFTDrive='''\\.\C:''', FileRegex='\\.txt',DateAfter='2021-07-01')
+Output: [
  {
   "EntryNumber": 37,
   "InUse": true,
@@ -113,7 +125,7 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
   "LastAccess0x30": "2022-03-18T04:22:20.4341459Z",
   "HasADS": false,
   "SI_Lt_FN": false,
-  "uSecZeros": false,
+  "USecZeros": false,
   "Copied": false,
   "FileNames": [
    "another_file.txt"
@@ -143,7 +155,7 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
   "LastAccess0x30": "2022-03-18T04:15:18.5166156Z",
   "HasADS": false,
   "SI_Lt_FN": false,
-  "uSecZeros": false,
+  "USecZeros": false,
   "Copied": true,
   "FileNames": [
    "just_a_file.txt"
@@ -151,7 +163,10 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
   "FileNameTypes": "POSIX",
   "_Source": "Windows.NTFS.MFT"
  }
-]SELECT * FROM Artifact.Windows.NTFS.MFT(MFTDrive='''\\.\C:''', FileRegex='\\.txt',DateAfter='2021-07-01', DateBefore='2022-02-01',AllNtfs='Y')[
+]
+
+Query: SELECT * FROM Artifact.Windows.NTFS.MFT(MFTDrive='''\\.\C:''', FileRegex='\\.txt',DateAfter='2021-07-01', DateBefore='2022-02-01',AllNtfs='Y')
+Output: [
  {
   "EntryNumber": 49,
   "InUse": true,
@@ -174,7 +189,7 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
   "LastAccess0x30": "2022-03-18T04:15:18.5166156Z",
   "HasADS": false,
   "SI_Lt_FN": false,
-  "uSecZeros": false,
+  "USecZeros": false,
   "Copied": true,
   "FileNames": [
    "just_a_file.txt"
@@ -214,7 +229,8 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
      "Id": 0,
      "Inode": "49-16-0",
      "Size": 72,
-     "Name": ""
+     "Name": "",
+     "Resident": true
     },
     {
      "Type": "$FILE_NAME",
@@ -222,7 +238,8 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
      "Id": 2,
      "Inode": "49-48-2",
      "Size": 96,
-     "Name": ""
+     "Name": "",
+     "Resident": true
     },
     {
      "Type": "$DATA",
@@ -230,7 +247,8 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
      "Id": 1,
      "Inode": "49-128-1",
      "Size": 12,
-     "Name": ""
+     "Name": "",
+     "Resident": true
     },
     {
      "Type": "$EA_INFORMATION",
@@ -238,7 +256,8 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
      "Id": 3,
      "Inode": "49-208-3",
      "Size": 8,
-     "Name": ""
+     "Name": "",
+     "Resident": true
     },
     {
      "Type": "$EA",
@@ -246,14 +265,17 @@ LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts
      "Id": 4,
      "Inode": "49-224-4",
      "Size": 10268,
-     "Name": ""
+     "Name": "",
+     "Resident": false
     }
    ],
    "Hardlinks": [
     "just_a_file.txt"
    ],
-   "Device": "\\\\.\\C:"
+   "Device": "\\\\.\\C:",
+   "OSPath": "\\\\.\\C:\\just_a_file.txt"
   },
   "_Source": "Windows.NTFS.MFT"
  }
 ]
+

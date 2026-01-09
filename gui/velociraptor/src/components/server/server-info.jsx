@@ -1,93 +1,46 @@
 import React, { Component } from 'react';
-
-import _ from 'lodash';
+import PropTypes from 'prop-types';
 
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { withRouter }  from "react-router-dom";
+import { withRouter, Link }  from "react-router-dom";
 import ShellViewer from "../clients/shell-viewer.jsx";
-import VeloForm from '../forms/form.jsx';
+import MetadataEditor from "../clients/metadata.jsx";
+import classNames from "classnames";
 
-import ToggleButtonGroup from 'react-bootstrap/ToggleButtonGroup';
-import ToggleButton from 'react-bootstrap/ToggleButton';
-import CardDeck from 'react-bootstrap/CardDeck';
+import Button from 'react-bootstrap/Button';
+import T from '../i8n/i8n.jsx';
 import Card from 'react-bootstrap/Card';
+import Row from 'react-bootstrap/Row';
+import ToolTip from '../widgets/tooltip.jsx';
+import Navbar from 'react-bootstrap/Navbar';
+import ButtonGroup from 'react-bootstrap/ButtonGroup';
 
-import { Link } from  "react-router-dom";
-import api from '../core/api-service.jsx';
-import axios from 'axios';
-import { parseCSV } from '../utils/csv.jsx';
+import {CancelToken} from 'axios';
 import "../clients/host-info.css";
 
-const POLL_TIME = 5000;
-
-
 class ServerInfo extends Component {
-    static propTypes = {}
+    static propTypes = {
+        // React router props.
+        match: PropTypes.object,
+        history: PropTypes.object,
+    }
 
     state = {
         // The mode of the host info tab set.
         mode: this.props.match.params.action || 'brief',
 
-        metadata: "Key,Value\n,\n",
-
         loading: false,
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
-        this.interval = setInterval(this.fetchMetadata, POLL_TIME);
-        this.fetchMetadata();
+        this.source = CancelToken.source();
     }
 
     componentWillUnmount() {
         this.source.cancel();
-        clearInterval(this.interval);
         if (this.interrogate_interval) {
             clearInterval(this.interrogate_interval);
         }
-    }
-
-    fetchMetadata = () => {
-        this.setState({loading: true});
-
-        this.source.cancel();
-        this.source = axios.CancelToken.source();
-
-        api.get("v1/GetClientMetadata/server",
-                {}, this.source.token).then(response=>{
-                    if (response.cancel) return;
-
-                    let metadata = "Key,Value\n";
-                    var rows = 0;
-                    var items = response.data["items"] || [];
-                    for (var i=0; i<items.length; i++) {
-                        var key = items[i]["key"] || "";
-                        var value = items[i]["value"] || "";
-                        if (!_.isUndefined(key)) {
-                            metadata += key + "," + value + "\n";
-                            rows += 1;
-                        }
-                    };
-                    if (rows === 0) {
-                        metadata = "Key,Value\n,\n";
-                    };
-                    this.setState({metadata: metadata, loading: false});
-                });
-    }
-
-    setMetadata = (value) => {
-        var data = parseCSV(value);
-        let items = _.map(data.data, (x) => {
-            return {key: x.Key, value: x.Value};
-        });
-
-        var params = {
-            client_id: "server",
-            items: items,
-        };
-        api.post("v1/SetClientMetadata", params).then(() => {
-            this.fetchMetadata();
-        }, this.source.token);
     }
 
     setMode = (mode) => {
@@ -103,25 +56,30 @@ class ServerInfo extends Component {
     renderContent = () => {
         if (this.state.mode === 'brief') {
             return (
-                <CardDeck className="dashboard">
+                <Row className="dashboard">
                   <Card>
-                    <Card.Header>Server configuration</Card.Header>
+                    <Card.Header>{T("Server configuration")}</Card.Header>
                     <Card.Body>
-                      <VeloForm
-                        param={{type: "csv", name: "Server Metadata"}}
-                        value={this.state.metadata}
-                        setValue={this.setMetadata}
-                      />
+                      <MetadataEditor
+                        valueRenderer={(cell, row)=>{
+                            return <ToolTip tooltip={T("Click to view or edit")}>
+                                     <Button variant="default-outline" size="sm">
+                                       <FontAwesomeIcon icon="wrench"/>
+                                     </Button>
+                                   </ToolTip>;
+                        }}
+                        client_id="server" />
                     </Card.Body>
                   </Card>
-                </CardDeck>
+                </Row>
             );
         };
 
         if (this.state.mode === 'shell') {
             return (
                 <div className="client-details shell">
-                  <ShellViewer client={{client_id: "server"}}
+                  <ShellViewer
+                    client={{client_id: "server"}}
                     default_shell="Bash"
                   />
                 </div>
@@ -135,32 +93,31 @@ class ServerInfo extends Component {
         return (
             <>
               <div className="full-width-height">
-                <div className="client-info">
-                  <div className="btn-group float-left toolbar" data-toggle="buttons">
+                <Navbar className="toolbar">
+                  <ButtonGroup className="" data-toggle="buttons">
                     <Link to={"/collected/server"}
                           role="button" className="btn btn-default">
                       <i><FontAwesomeIcon icon="history"/></i>
-                      <span className="button-label">Collected</span>
+                      <span className="button-label">{T("Collected")}</span>
                     </Link>
-                  </div>
-
-                  <ToggleButtonGroup type="radio"
-                                     name="mode"
-                                     defaultValue={this.state.mode}
-                                     onChange={(mode) => this.setMode(mode)}
-                                     className="mb-2">
-                    <ToggleButton variant="default"
-                                  value='brief'>
+                  </ButtonGroup>
+                  <ButtonGroup className="float-right">
+                    <Button variant="default"
+                            className={classNames({
+                                active: this.state.mode === "brief"})}
+                            onClick={(mode) => this.setMode("brief")}>
                       <FontAwesomeIcon icon="laptop"/>
-                      <span className="button-label">Overview</span>
-                    </ToggleButton>
-                    <ToggleButton variant="default"
-                                  value='shell'>
+                      <span className="button-label">{T("Overview")}</span>
+                    </Button>
+                    <Button variant="default"
+                            className={classNames({
+                                active: this.state.mode === "shell"})}
+                            onClick={(mode) => this.setMode("shell")}>
                       <FontAwesomeIcon icon="terminal"/>
-                      <span className="button-label">Server Shell</span>
-                    </ToggleButton>
-                  </ToggleButtonGroup>
-                </div>
+                      <span className="button-label">{T("Server Shell")}</span>
+                    </Button>
+                  </ButtonGroup>
+              </Navbar>
                 <div className="clearfix"></div>
                 { this.renderContent() }
               </div>

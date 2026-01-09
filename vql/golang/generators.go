@@ -15,12 +15,12 @@ import (
 
 type Generator struct {
 	name                   string
+	description            string
 	disable_file_buffering bool
 }
 
 // Give Generator the vfilter.StoredQuery interface so it can return
 // events.
-
 func (self Generator) Eval(ctx context.Context, scope types.Scope) <-chan types.Row {
 	result := make(chan vfilter.Row)
 
@@ -29,7 +29,7 @@ func (self Generator) Eval(ctx context.Context, scope types.Scope) <-chan types.
 
 		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
-			scope.Log("Command can only run on the server")
+			scope.Log("generate: Command can only run on the server")
 			return
 		}
 
@@ -41,6 +41,7 @@ func (self Generator) Eval(ctx context.Context, scope types.Scope) <-chan types.
 
 		output_chan, cancel, err := b.Watch(ctx, self.name, api.QueueOptions{
 			DisableFileBuffering: self.disable_file_buffering,
+			OwnerName:            self.description,
 		})
 		if err != nil {
 			scope.Log("generate: %v", err)
@@ -69,6 +70,7 @@ type GeneratorArgs struct {
 	Delay             int64             `vfilter:"optional,field=delay,doc=Wait before starting the query"`
 	WithFileBuffering bool              `vfilter:"optional,field=with_file_buffer,doc=Enable file buffering"`
 	FanOut            int64             `vfilter:"optional,field=fan_out,doc=Wait for this many listeners to connect before starting the query"`
+	Description       string            `vfilter:"optional,field=description,doc=A description to add to debug server"`
 }
 
 type GeneratorFunction struct{}
@@ -76,6 +78,9 @@ type GeneratorFunction struct{}
 func (self *GeneratorFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "generate", args)()
+
 	arg := &GeneratorArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -85,12 +90,12 @@ func (self *GeneratorFunction) Call(ctx context.Context,
 
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("generate: Command can only run on the server")
 		return false
 	}
 
 	if arg.Name == "" {
-		arg.Name = types.ToString(ctx, scope, arg.Query)
+		arg.Name = vfilter.FormatToString(scope, arg.Query)
 	}
 
 	b, err := services.GetBroadcastService(config_obj)
@@ -108,6 +113,7 @@ func (self *GeneratorFunction) Call(ctx context.Context,
 	if err == services.AlreadyRegisteredError {
 		return Generator{
 			name:                   arg.Name,
+			description:            arg.Description,
 			disable_file_buffering: !arg.WithFileBuffering,
 		}
 	}
@@ -117,10 +123,14 @@ func (self *GeneratorFunction) Call(ctx context.Context,
 	sub_ctx, cancel := context.WithCancel(ctx)
 
 	// Remove the generator when the scope destroys.
-	scope.AddDestructor(func() {
+	err = vql_subsystem.GetRootScope(scope).AddDestructor(func() {
 		scope.Log("generate: Removing generator %v", arg.Name)
 		cancel()
 	})
+	if err != nil {
+		scope.Log("generate: %v", err)
+		cancel()
+	}
 
 	go func() {
 		defer close(generator_chan)
@@ -139,10 +149,11 @@ func (self *GeneratorFunction) Call(ctx context.Context,
 		}
 
 		for item := range arg.Query.Eval(sub_ctx, scope) {
+			materialized := vfilter.MaterializedLazyRow(ctx, item, scope)
 			select {
 			case <-sub_ctx.Done():
 				return
-			case generator_chan <- vfilter.MaterializedLazyRow(ctx, item, scope):
+			case generator_chan <- materialized:
 			}
 		}
 	}()

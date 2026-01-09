@@ -1,10 +1,11 @@
 import React from 'react';
 import PropTypes from 'prop-types';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 import api from '../core/api-service.jsx';
 import NotebookRenderer from '../notebooks/notebook-renderer.jsx';
 import _ from 'lodash';
 import T from '../i8n/i8n.jsx';
+import Spinner from '../utils/spinner.jsx';
 
 const POLL_TIME = 5000;
 
@@ -20,7 +21,7 @@ export default class HuntNotebook extends React.Component {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.interval = setInterval(this.fetchNotebooks, POLL_TIME);
         this.fetchNotebooks();
     }
@@ -47,10 +48,21 @@ export default class HuntNotebook extends React.Component {
         }
 
         let notebook_id = "N." + hunt_id;
-        this.setState({loading: true});
+
+        // Only show the loading sign when we load a new notebook not
+        // for periodic refresh.
+        let old_notebook_id = this.state.notebook &&
+            this.state.notebook.notebook_id;
+        if (notebook_id !== old_notebook_id) {
+            this.setState({loading: true});
+        }
+
         api.get("v1/GetNotebooks", {
             notebook_id: notebook_id,
+            include_uploads: true,
         }, this.source.token).then(response=>{
+            this.setState({loading: false});
+
             if (response.cancel) return;
             let notebooks = response.data.items || [];
 
@@ -64,37 +76,42 @@ export default class HuntNotebook extends React.Component {
                 description: this.props.hunt.description ||
                     T("This is a notebook for processing a hunt."),
                 notebook_id: notebook_id,
-                context: {
-                    type: "Hunt",
-                    hunt_id: hunt_id,
-                },
+
                 // Hunt notebooks are all public.
                 public: true,
-                env: [
-                    {key: "HuntId", value: hunt_id},
-                ],
             };
 
-            api.post('v1/NewNotebook', request, this.source.token).then((response) => {
-                if (response.cancel) return;
-                let cell_metadata = response.data && response.data.cell_metadata;
-                if (_.isEmpty(cell_metadata)) {
-                    return;
-                }
+            this.setState({loading: true});
+            api.post('v1/NewNotebook', request,
+                     this.source.token).then((response) => {
+                         this.setState({loading: false});
+                         if (response.cancel) return;
+                         let cell_metadata = response.data &&
+                             response.data.cell_metadata;
+                         if (_.isEmpty(cell_metadata)) {
+                             return;
+                         }
 
-                this.fetchNotebooks();
-            });
+                         this.fetchNotebooks();
+                     });
         });
     }
 
     render() {
+        let hunt_id = this.props.hunt && this.props.hunt.hunt_id;
+
         return (
-            <> {!_.isEmpty(this.state.notebook) &&
-                <NotebookRenderer
-                  notebook={this.state.notebook}
-                  fetchNotebooks={this.fetchNotebooks}
-                />
-               }
+            <>
+              <Spinner loading={this.state.loading } />
+              {!_.isEmpty(this.state.notebook) &&
+               <NotebookRenderer
+                 env={{
+                     hunt_id: hunt_id,
+                 }}
+                 notebook={this.state.notebook}
+                 updateVersion={this.fetchNotebooks}
+               />
+              }
             </>
         );
     }

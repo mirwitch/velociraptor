@@ -3,16 +3,22 @@ import PropTypes from 'prop-types';
 import _ from 'lodash';
 import Modal from 'react-bootstrap/Modal';
 import Form from 'react-bootstrap/Form';
+import Container from  'react-bootstrap/Container';
+import Row from 'react-bootstrap/Row';
+import Col from 'react-bootstrap/Col';
 import Button from 'react-bootstrap/Button';
 import InputGroup from 'react-bootstrap/InputGroup';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import classNames from "classnames";
 import api from '../core/api-service.jsx';
-import BootstrapTable from 'react-bootstrap-table-next';
-import axios from 'axios';
-import filterFactory from 'react-bootstrap-table2-filter';
-import { formatColumns } from "../core/table.jsx";
+import {CancelToken} from 'axios';
 import T from '../i8n/i8n.jsx';
+import Alert from 'react-bootstrap/Alert';
+import ToolTip from '../widgets/tooltip.jsx';
+import VeloTable from '../core/table.jsx';
+
+import "./artifacts-upload.css";
+
 
 export default class ArtifactsUpload extends React.Component {
     static propTypes = {
@@ -21,104 +27,246 @@ export default class ArtifactsUpload extends React.Component {
 
     state = {
         pack_file: null,
+        prefix: "",
+        tags: "",
         loading: false,
         uploaded: [],
+        filter: "",
+
+        // after upload the server will cache the file here.
+        vfs_path: [],
+        errors: [],
     }
 
     componentDidMount() {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
+        this.setState({id: crypto.randomUUID()});
+
     }
 
     componentWillUnmount() {
         this.source.cancel("unmounted");
     }
 
+    componentDidUpdate = (prevProps, prevState, rootNode) => {
+        if(!_.isEqual(prevState.filter, this.state.filter) ||
+           !_.isEqual(prevState.prefix, this.state.prefix) ||
+           !_.isEqual(prevState.tags, this.state.tags) ||
+           !_.isEqual(prevState.vfs_path, this.state.vfs_path)) {
+            this.updateFile();
+            return true;
+        }
+        return false;
+    }
+
+    // The first call uploads the file and records the cached
+    // filestore path
     uploadFile = () => {
-        if (!this.state.pack_file) {
+        if (!this.state.pack_file.name) {
             return;
         }
 
-        var reader = new FileReader();
-        reader.onload = (event) => {
-            var request = {
-                data: reader.result.split(",")[1],
-            };
+        this.setState({loading: true});
+        api.upload("v1/UploadFormFile",
+                   {file: this.state.pack_file},
+                   {name: "ArtifactPack", type: "upload_file"}).then(
+                       response=>{
+                           let url = response.data.url;
+                           this.setState({
+                               loading: false,
+                               upload_info: response.data,
+                           }, this.updateFile);
 
-            this.setState({loading: true});
-            api.post("v1/LoadArtifactPack", request,
-                     this.source.token).then(response => {
-                let uploaded = _.map(response.data.successful_artifacts,
-                                     (x, idx)=>{
-                                         return {name: x, id: idx};
-                                     });
-                this.setState({loading:false, uploaded: uploaded});
-            });
-        };
-        reader.readAsDataURL(this.state.pack_file);
+                       }).catch(response=>{
+                           return this.setState({
+                               loading:false, upload_info: {}});
+                       });
     }
 
+    tags = ()=>{
+        return _.filter(_.map(this.state.tags.split(" "), x=>x.trim()));
+    }
+
+    updateFile = () => {
+        if (this.state.loading) {
+            return;
+        }
+
+        this.setState({loading: true});
+        var request = {
+            prefix: this.state.prefix,
+            tags: this.tags(),
+            filter: this.state.filter,
+            vfs_path: this.state.upload_info.VfsPath,
+        };
+        api.post("v1/LoadArtifactPack", request,
+                 this.source.token).then(response => {
+                     if (response.data.cancel) {
+                         return ;
+                     }
+                     let uploaded = _.map(
+                         response.data.successful_artifacts,
+                         (x, idx)=>{
+                             return {name: x, id: idx};
+                         });
+
+                     this.setState({loading:false,
+                                    vfs_path: response.data.vfs_path,
+                                    uploaded: uploaded});
+                 });
+    };
+
+    // Called when the user really wants the import.
+    importFile = () => {
+        var request = {
+            prefix: this.state.prefix,
+            tags: this.tags(),
+            filter: this.state.filter,
+            vfs_path: this.state.vfs_path,
+            really_do_it: true,
+        };
+        api.post("v1/LoadArtifactPack", request,
+                 this.source.token).then(response => {
+                     if (response.data.cancel) {
+                         return ;
+                     }
+                     this.props.onClose();
+                 });
+    };
+
     render() {
-        let columns = formatColumns([
-            {dataField: "name", text: T("Artifact Name"),
-             sort: true, filtered: true}
-        ]);
+        let headers = {
+            name: T("Artifact Name"),
+        };
 
         return (
             <>
-              <Modal show={true} onHide={this.props.onClose}>
+              <Modal show={true}
+                     dialogClassName="modal-90w"
+                     onHide={this.props.onClose}>
                 <Modal.Header closeButton>
                   <Modal.Title>{T("Upload artifacts from a Zip pack")}</Modal.Title>
                 </Modal.Header>
                 <Modal.Body>
-                  { _.isEmpty(this.state.uploaded) ?
-                    <Form className="selectable">
-                      <InputGroup className="mb-3">
-                        <InputGroup.Prepend>
-                          <InputGroup.Text
-                            className={classNames({"disabled": !this.state.pack_file})}
-                            onClick={this.uploadFile}>
+                  <Form className="selectable">
+                    <Form.Group as={Row}>
+                      <Col sm="12">
+                        <InputGroup className="full-width custom-file-button">
+                          <Button variant="default"
+                            className={classNames({
+                                "disabled": !this.state.pack_file
+                            })}
+                            onClick={()=>this.uploadFile()}>
                             { this.state.loading ?
                               <FontAwesomeIcon icon="spinner" spin/> :
-                              "Upload" }
-                          </InputGroup.Text>
-                        </InputGroup.Prepend>
-                        <Form.File
-                          label={T("Select artifact pack (Zip file with YAML definitions)")}
-                          custom>
-                          <Form.File.Input
-                            onChange={e => {
-                                if (!_.isEmpty(e.currentTarget.files)) {
-                                    this.setState({pack_file: e.currentTarget.files[0]});
-                                }
-                            }}
+                              T("Click to Upload") }
+                          </Button>
+                          <Form.Control type="file" id={this.state.id}
+                                        onChange={e => {
+                                            if (!_.isEmpty(e.currentTarget.files)) {
+                                                this.setState({
+                                                    upload_info: {},
+                                                    pack_file: e.currentTarget.files[0]});
+                                            }
+                                        }}
                           />
-                          <Form.File.Label data-browse="Select file">
-                            { this.state.pack_file ? this.state.pack_file.name :
-                              T("Click to upload artifact pack file")}
-                          </Form.File.Label>
-                        </Form.File>
-                      </InputGroup>
-                    </Form>
+                          <ToolTip tooltip={T("Select artifact pack (Zip file with YAML definitions)")}>
+                            <Button variant="default-outline"
+                                    className="flush-right">
+                              <Form.Label data-browse="Select file" htmlFor="upload">
+                                {this.state.pack_file ? this.state.pack_file.name :
+                                 T("Select artifact pack (Zip file with YAML definitions)")}
+                              </Form.Label>
+                            </Button>
+                          </ToolTip>
 
-                    :
+                        </InputGroup>
+                        { this.state.current_error &&
+                          <Alert variant="danger" className="text-center">
+                            {this.state.current_error}
+                          </Alert> }
+                      </Col>
+                    </Form.Group>
+                  </Form>
 
-                    <BootstrapTable
-                      hover
-                      condensed
-                      keyField="id"
-                      bootstrap4
-                      headerClasses="alert alert-secondary"
-                      bodyClasses="fixed-table-body"
-                      data={this.state.uploaded}
-                      columns={columns}
-                      filter={ filterFactory() }
-                    />
+                  { !_.isEmpty(this.state.vfs_path) &&
+                    <Form>
+                      <Form.Group as={Row}>
+                        <Form.Label column sm="3">{T("Prefix")}</Form.Label>
+                        <Col sm="8">
+                          <Form.Control as="input" rows={3}
+                                        placeholder={T("Append prefix to all artifact names")}
+                                        spellCheck="false"
+                                        value={this.state.prefix}
+                                        onChange={e => {
+                                            this.setState({prefix: e.target.value});
+                                        }}
+                          />
+                        </Col>
+                      </Form.Group>
+                      <Form.Group as={Row}>
+                        <Form.Label column sm="3">{T("Tags")}</Form.Label>
+                        <Col sm="8">
+                          <Form.Control as="input" rows={3}
+                                        placeholder={T("Set these tags on all artifacts")}
+                                        spellCheck="false"
+                                        value={this.state.tags}
+                                        onChange={e => {
+                                            this.setState({tags: e.target.value});
+                                        }}
+                          />
+                        </Col>
+                      </Form.Group>
+                     <Form.Group as={Row}>
+                        <Form.Label column sm="3">{T("Filter")}</Form.Label>
+                        <Col sm="8">
+                          <Form.Control as="input"
+                                        placeholder={T("Filter name of artifacts to load")}
+                                        spellCheck="false"
+                                        value={this.state.filter}
+                                        onChange={e => {
+                                            this.setState({filter: e.target.value});
+                                        }}
+                          />
+                        </Col>
+                      </Form.Group>
 
-                  }
-              </Modal.Body>
-              <Modal.Footer>
-                <Button variant="secondary" onClick={this.props.onClose}>
-                  {T("Close")}
+                      <VeloTable
+                        rows={this.state.uploaded}
+                        columns={["name"]}
+                        header_renderers={headers}
+                        no_toolbar={true}
+                      />
+                    </Form> }
+
+                  { this.state.errors.length > 0 &&
+                    <Container className="artifact-import-errors">
+                      <Alert variant="danger">
+                        {T("Errors")}
+                      </Alert>
+                      <Alert variant="warning">
+                        <dl className="row" >
+                          {_.map(this.state.errors, (msg, idx) => {
+                              return <React.Fragment key={idx}>
+                                       <dt className="col-4">{msg.filename}</dt>
+                                       <dd className="col-8">
+                                         <div className="error-message">{msg.error}</div>
+                                       </dd>
+                                     </React.Fragment>;
+                          })}
+                        </dl>
+                      </Alert>
+                  </Container>}
+
+                </Modal.Body>
+                <Modal.Footer>
+                  <Button variant="secondary" onClick={this.props.onClose}>
+                    {T("Cancel")}
+                  </Button>
+                <Button variant="secondary"
+                        disabled={_.isEmpty(this.state.uploaded)}
+                        onClick={()=>this.importFile()}>
+                  {T("Import Artifacts", this.state.uploaded && this.state.uploaded.length)}
                 </Button>
               </Modal.Footer>
             </Modal>

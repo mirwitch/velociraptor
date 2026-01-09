@@ -5,10 +5,10 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sync"
 
+	"github.com/Velocidex/ordereddict"
 	"github.com/go-errors/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
@@ -19,6 +19,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/responder"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/vfilter"
 )
 
 const (
@@ -26,7 +27,18 @@ const (
 	FirstRecordOffset = 50
 )
 
+var (
+	// This controls the access level to the buffer file so tests can
+	// read it and check it. Normally the file is opened with
+	// exclusive access but this disables that and allows us to check
+	// the file.
+	PREPARE_FOR_TESTS = false
+)
+
 type IRingBuffer interface {
+	ProfileWriter(ctx context.Context, scope vfilter.Scope,
+		output_chan chan vfilter.Row)
+
 	Enqueue(item []byte)
 
 	// How many bytes are currently available to be sent.
@@ -41,6 +53,9 @@ type IRingBuffer interface {
 	TotalSize() uint64
 
 	Commit()
+	Rollback()
+
+	// Clear the buffer
 	Reset()
 	Close()
 }
@@ -94,7 +109,13 @@ type ReadWriterAt interface {
 	Truncate(size int64) error
 }
 
+type transaction struct {
+	LeasedPointer int64
+	LeasedBytes   int64
+}
+
 type FileBasedRingBuffer struct {
+	id         uint64
 	config_obj *config_proto.Config
 
 	mu sync.Mutex
@@ -111,6 +132,24 @@ type FileBasedRingBuffer struct {
 	leased_pointer int64
 
 	log_ctx *logging.LogContext
+
+	flow_manager *responder.FlowManager
+
+	current_transaction transaction
+}
+
+func (self *FileBasedRingBuffer) ProfileWriter(
+	ctx context.Context, scope vfilter.Scope,
+	output_chan chan vfilter.Row) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	output_chan <- ordereddict.NewDict().
+		Set("Type", "FileBasedRingBuffer").
+		Set("Filename", self.fd.Name()).
+		Set("Header", self.header).
+		Set("Closed", self.closed).
+		Set("Transaction", self.current_transaction)
 }
 
 func (self *FileBasedRingBuffer) Enqueue(item []byte) {
@@ -124,12 +163,12 @@ func (self *FileBasedRingBuffer) Enqueue(item []byte) {
 	binary.LittleEndian.PutUint64(self.write_buf, uint64(len(item)))
 	_, err := self.fd.WriteAt(self.write_buf, int64(self.header.WritePointer))
 	if err != nil {
-		self.Reset()
+		self._Truncate()
 		return
 	}
 	n, err := self.fd.WriteAt(item, int64(self.header.WritePointer+8))
 	if err != nil {
-		self.Reset()
+		self._Truncate()
 		return
 	}
 
@@ -139,7 +178,7 @@ func (self *FileBasedRingBuffer) Enqueue(item []byte) {
 	serialized, _ := self.header.MarshalBinary()
 	_, err = self.fd.WriteAt(serialized, 0)
 	if err != nil {
-		self.Reset()
+		self._Truncate()
 		return
 	}
 
@@ -216,6 +255,11 @@ func (self *FileBasedRingBuffer) Lease(size uint64) []byte {
 
 	result := []byte{}
 
+	// Take a snapshot of the current file state.
+	if self.current_transaction.LeasedPointer == 0 {
+		self.current_transaction.LeasedPointer = self.leased_pointer
+	}
+
 	for self.header.WritePointer > self.leased_pointer {
 		n, err := self.fd.ReadAt(self.read_buf, self.leased_pointer)
 		if err == nil && n == len(self.read_buf) {
@@ -223,10 +267,12 @@ func (self *FileBasedRingBuffer) Lease(size uint64) []byte {
 
 			// File might be corrupt - just reset the entire file.
 			if length > constants.MAX_MEMORY*2 || length <= 0 {
-				self.log_ctx.Error("Possible corruption detected - item length is too large.")
+				self.log_ctx.Error(
+					"Possible corruption detected - item length is too large.")
 				self._Truncate()
 				return nil
 			}
+
 			item := make([]byte, length)
 			n, err := self.fd.ReadAt(item, self.leased_pointer+8)
 			if err != nil || int64(n) != length {
@@ -239,7 +285,7 @@ func (self *FileBasedRingBuffer) Lease(size uint64) []byte {
 
 			// Filter the item from any blacklisted flow ids
 			filtered_item := FilterBlackListedItems(
-				context.Background(), self.config_obj, item)
+				context.Background(), self.flow_manager, self.config_obj, item)
 			result = append(result, filtered_item...)
 
 			// Skip the full length of the unfiltered item to maintain
@@ -247,6 +293,8 @@ func (self *FileBasedRingBuffer) Lease(size uint64) []byte {
 			self.leased_pointer += 8 + int64(n)
 			self.header.LeasedBytes += int64(n)
 			self.header.AvailableBytes -= int64(n)
+
+			self.current_transaction.LeasedBytes += int64(n)
 
 			if uint64(len(result)) > size {
 				break
@@ -257,7 +305,6 @@ func (self *FileBasedRingBuffer) Lease(size uint64) []byte {
 			self._Truncate()
 		}
 	}
-
 	return result
 }
 
@@ -269,6 +316,8 @@ func (self *FileBasedRingBuffer) _Truncate() {
 	self.header.WritePointer = FirstRecordOffset
 	self.header.AvailableBytes = 0
 	self.header.LeasedBytes = 0
+	self.current_transaction.LeasedBytes = 0
+	self.current_transaction.LeasedPointer = 0
 
 	self.leased_pointer = FirstRecordOffset
 	serialized, _ := self.header.MarshalBinary()
@@ -297,6 +346,23 @@ func (self *FileBasedRingBuffer) Close() {
 	// Unblock any blocked writers to let them know this file is now
 	// closed.
 	self.c.Broadcast()
+
+	Tracker.Register(self.id, nil)
+}
+
+// Undo the actions of Leased() and put the data back.
+func (self *FileBasedRingBuffer) Rollback() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.log_ctx.Debug("<red>FileBasedRingBuffer: Rollback %v bytes.",
+		self.current_transaction.LeasedBytes)
+
+	self.leased_pointer = self.current_transaction.LeasedPointer
+	self.header.AvailableBytes += self.current_transaction.LeasedBytes
+	self.header.LeasedBytes -= self.current_transaction.LeasedBytes
+	self.current_transaction.LeasedBytes = 0
+	self.current_transaction.LeasedPointer = 0
 }
 
 func (self *FileBasedRingBuffer) Commit() {
@@ -313,6 +379,8 @@ func (self *FileBasedRingBuffer) Commit() {
 
 	self.header.ReadPointer = self.leased_pointer
 	self.header.LeasedBytes = 0
+	self.current_transaction.LeasedBytes = 0
+	self.current_transaction.LeasedPointer = 0
 
 	serialized, _ := self.header.MarshalBinary()
 	_, _ = self.fd.WriteAt(serialized, 0)
@@ -326,6 +394,7 @@ func (self *FileBasedRingBuffer) Commit() {
 func OpenFileBasedRingBuffer(
 	ctx context.Context,
 	config_obj *config_proto.Config,
+	flow_manager *responder.FlowManager,
 	log_ctx *logging.LogContext) (*FileBasedRingBuffer, error) {
 
 	filename := getLocalBufferName(config_obj)
@@ -338,58 +407,35 @@ func OpenFileBasedRingBuffer(
 		return nil, err
 	}
 
-	return newFileBasedRingBuffer(fd, config_obj, log_ctx)
+	return newFileBasedRingBuffer(fd, config_obj,
+		filename, flow_manager, log_ctx)
 }
 
 func NewFileBasedRingBuffer(
 	ctx context.Context,
 	config_obj *config_proto.Config,
+	filename string,
+	flow_manager *responder.FlowManager,
 	log_ctx *logging.LogContext) (*FileBasedRingBuffer, error) {
 
-	if config_obj.Client == nil || config_obj.Client.LocalBuffer == nil {
-		return nil, errors.New("Local buffer not configured")
-	}
-
-	filename := getLocalBufferName(config_obj)
 	if filename == "" {
 		return nil, errors.New("Unsupport platform")
 	}
 
-	// Reset the buffer file by removing old data. We prevent symlink
-	// attacks by replacing any existing file with a new file. In this
-	// case we do not want to use a random file name because the
-	// Velociraptor client is often killed without warning and
-	// restarted (e.g. system reboot). This means we dont always get a
-	// chance to cleanup and after a lot of restarts random file names
-	// will accumulate.  By default the temp directory is created
-	// inside a protected directory
-	// (`C:\Program Files\Velociraptor\Tools`) so symlink attacks are
-	// mitigated but in case Velociraptor is misconfigured we are
-	// extra careful.
-	fd, err := os.CreateTemp(filepath.Dir(filename), "")
+	fd, err := createFile(filename)
 	if err != nil {
 		return nil, err
 	}
 
-	err = os.Rename(fd.Name(), filename)
-	if err != nil {
-		// On Windows the above rename operation does not work because
-		// the file is still open.
-		fd.Close()
-		os.Remove(fd.Name())
-
-		fd, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0700)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return newFileBasedRingBuffer(fd, config_obj, log_ctx)
+	return newFileBasedRingBuffer(fd, config_obj,
+		filename, flow_manager, log_ctx)
 }
 
 func newFileBasedRingBuffer(
 	fd *os.File,
 	config_obj *config_proto.Config,
+	filename string,
+	flow_manager *responder.FlowManager,
 	log_ctx *logging.LogContext) (*FileBasedRingBuffer, error) {
 
 	header := &Header{
@@ -433,6 +479,7 @@ func newFileBasedRingBuffer(
 	}
 
 	result := &FileBasedRingBuffer{
+		id:             utils.GetId(),
 		config_obj:     config_obj,
 		fd:             fd,
 		header:         header,
@@ -440,6 +487,7 @@ func newFileBasedRingBuffer(
 		write_buf:      make([]byte, 8),
 		leased_pointer: header.ReadPointer,
 		log_ctx:        log_ctx,
+		flow_manager:   flow_manager,
 	}
 
 	result.c = sync.NewCond(&result.mu)
@@ -447,12 +495,16 @@ func newFileBasedRingBuffer(
 	log_ctx.WithFields(logrus.Fields{
 		"filename": fd.Name(),
 		"max_size": result.header.MaxSize,
-	}).Info("Ring Buffer: Creation")
+	}).Info("FileBasedRingBuffer: Creation")
+
+	Tracker.Register(result.id, result)
 
 	return result, nil
 }
 
 type RingBuffer struct {
+	id         uint64
+	name       string
 	config_obj *config_proto.Config
 
 	// We serialize messages into the messages queue as they
@@ -476,6 +528,23 @@ type RingBuffer struct {
 
 	// The maximum size of the ring buffer
 	Size uint64
+
+	flow_manager *responder.FlowManager
+}
+
+func (self *RingBuffer) ProfileWriter(
+	ctx context.Context, scope vfilter.Scope,
+	output_chan chan vfilter.Row) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	output_chan <- ordereddict.NewDict().
+		Set("Type", self.name).
+		Set("Messages", len(self.messages)).
+		Set("LeasedIdx", self.leased_idx).
+		Set("LeasedLength", self.leased_length).
+		Set("MaxSize", self.Size).
+		Set("CurrentSize", self.total_length)
 }
 
 func (self *RingBuffer) Reset() {
@@ -536,6 +605,7 @@ func (self *RingBuffer) AvailableBytes() uint64 {
 // their corresponding flow is cancelled.
 func FilterBlackListedItems(
 	ctx context.Context,
+	flow_manager *responder.FlowManager,
 	config_obj *config_proto.Config, item []byte) []byte {
 
 	message_list := &crypto_proto.MessageList{}
@@ -545,7 +615,6 @@ func FilterBlackListedItems(
 	}
 
 	modified := false
-	flow_manager := responder.GetFlowManager(ctx, config_obj)
 	result := &crypto_proto.MessageList{}
 	for _, message := range message_list.Job {
 		// Always allow log messages through - even after a flow has
@@ -595,7 +664,7 @@ func (self *RingBuffer) Lease(size uint64) []byte {
 
 	for _, item := range self.messages[self.leased_idx:] {
 		filtered := FilterBlackListedItems(
-			context.Background(), self.config_obj, item)
+			context.Background(), self.flow_manager, self.config_obj, item)
 
 		leased = append(leased, filtered...)
 
@@ -640,6 +709,7 @@ func (self *RingBuffer) Close() {
 	self.total_length = 0
 	self.messages = nil
 	self.c.Broadcast()
+	Tracker.Register(self.id, nil)
 }
 
 // Commits by removing the read messages from the ring buffer.
@@ -668,13 +738,22 @@ func (self *RingBuffer) Commit() {
 	self.c.Broadcast()
 }
 
-func NewRingBuffer(config_obj *config_proto.Config, size uint64) *RingBuffer {
+func NewRingBuffer(
+	config_obj *config_proto.Config,
+	flow_manager *responder.FlowManager,
+	size uint64,
+	name string) *RingBuffer {
 	result := &RingBuffer{
-		messages:   make([][]byte, 0),
-		Size:       size,
-		config_obj: config_obj,
+		id:           utils.GetId(),
+		name:         name,
+		messages:     make([][]byte, 0),
+		Size:         size,
+		config_obj:   config_obj,
+		flow_manager: flow_manager,
 	}
 	result.c = sync.NewCond(&result.mu)
+
+	Tracker.Register(result.id, result)
 
 	return result
 }
@@ -682,11 +761,11 @@ func NewRingBuffer(config_obj *config_proto.Config, size uint64) *RingBuffer {
 func getLocalBufferName(config_obj *config_proto.Config) string {
 	switch runtime.GOOS {
 	case "windows":
-		return os.ExpandEnv(config_obj.Client.LocalBuffer.FilenameWindows)
+		return utils.ExpandEnv(config_obj.Client.LocalBuffer.FilenameWindows)
 	case "linux":
-		return os.ExpandEnv(config_obj.Client.LocalBuffer.FilenameLinux)
+		return utils.ExpandEnv(config_obj.Client.LocalBuffer.FilenameLinux)
 	case "darwin":
-		return os.ExpandEnv(config_obj.Client.LocalBuffer.FilenameDarwin)
+		return utils.ExpandEnv(config_obj.Client.LocalBuffer.FilenameDarwin)
 	default:
 		return ""
 	}
@@ -694,16 +773,27 @@ func getLocalBufferName(config_obj *config_proto.Config) string {
 
 func NewLocalBuffer(
 	ctx context.Context,
+	flow_manager *responder.FlowManager,
 	config_obj *config_proto.Config) IRingBuffer {
-	if config_obj.Client.LocalBuffer.DiskSize > 0 &&
-		getLocalBufferName(config_obj) != "" {
 
-		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
-		rb, err := NewFileBasedRingBuffer(ctx, config_obj, logger)
-		if err == nil {
-			return rb
+	if config_obj.Client.LocalBuffer.DiskSize > 0 {
+		local_buffer_name := getLocalBufferName(config_obj)
+		if local_buffer_name != "" {
+			logger := logging.GetLogger(config_obj, &logging.ClientComponent)
+			rb, err := NewFileBasedRingBuffer(ctx, config_obj,
+				local_buffer_name, flow_manager, logger)
+			if err == nil {
+				// Creating the file worked! let's go.
+				return rb
+			}
+
+			// Could not create the file, just use memory instead.
+			logger.Error(
+				"Unable to create a file based ring buffer on %v - "+
+					"using in memory only: %v",
+				local_buffer_name, err)
 		}
-		logger.Error("Unable to create a file based ring buffer - using in memory only.")
 	}
-	return NewRingBuffer(config_obj, config_obj.Client.LocalBuffer.MemorySize)
+	return NewRingBuffer(config_obj, flow_manager,
+		config_obj.Client.LocalBuffer.MemorySize, "FlowBuffer")
 }

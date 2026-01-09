@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -16,7 +16,8 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-/* Plugin FIFO.
+/*
+	Plugin FIFO.
 
 The fifo plugin collects the more recent rows from a subquery and holds
 them in memory. Subsequent calls to it will return the entire cached
@@ -29,7 +30,6 @@ group (For example, what were the last X failed logon events).
 Note that the fifo() lifetime is tied with the root scope - it will
 remain active for the entire query duration but will be torn down when
 the query is cancelled.
-
 */
 package common
 
@@ -44,7 +44,6 @@ import (
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
-	"www.velocidex.com/golang/vfilter/types"
 )
 
 type _FIFOCacheEntry struct {
@@ -191,6 +190,7 @@ func (self _FIFOPlugin) Call(ctx context.Context,
 	wg.Add(1)
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "fifo", args)()
 
 		arg := &_FIFOPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -212,7 +212,7 @@ func (self _FIFOPlugin) Call(ctx context.Context,
 		fifo_cache := vql_subsystem.CacheGet(scope, key)
 		if fifo_cache == nil {
 			scope.Log("Creating FIFO Cache for %v\n",
-				types.ToString(ctx, scope, arg.Query))
+				vfilter.FormatToString(scope, arg.Query))
 			fifo_cache = NewFIFOCache(
 				ctx, scope,
 				time.Duration(arg.MaxAge)*time.Second,

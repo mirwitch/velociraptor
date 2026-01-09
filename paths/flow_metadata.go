@@ -92,6 +92,10 @@ func (self FlowPathManager) UploadMetadata() api.FSPathSpec {
 	return self.Path().AddChild("uploads").AsFilestorePath()
 }
 
+func (self FlowPathManager) UploadTransactions() api.FSPathSpec {
+	return self.Path().AddChild("upload_transactions").AsFilestorePath()
+}
+
 func (self FlowPathManager) UploadContainer() api.FSPathSpec {
 	return self.Path().AddUnsafeChild("uploads").
 		AsFilestorePath().
@@ -138,10 +142,19 @@ func (self FlowPathManager) GetReportsFile(hostname string) api.FSPathSpec {
 
 // Where to store the uploaded file in the filestore.
 func (self FlowPathManager) GetUploadsFile(
-	accessor, client_path string) *UploadFile {
+	accessor,
+	client_path string,
+	components []string) *UploadFile {
 	// Apply the default accessor if not specified.
 	if accessor == "" {
 		accessor = "file"
+	}
+
+	// In case no components were specified, we split the Path into
+	// components. Newer clients should send the components list
+	// directly to remove splitting ambiguities.
+	if components == nil {
+		components = ExtractClientPathComponents(client_path)
 	}
 
 	base_path := CLIENTS_ROOT.AddUnsafeChild(self.client_id, "collections",
@@ -151,7 +164,7 @@ func (self FlowPathManager) GetUploadsFile(
 	return &UploadFile{
 		client_path: client_path,
 		path: base_path.AddUnsafeChild(accessor).
-			AddChild(ExtractClientPathComponents(client_path)...),
+			AddUnsafeChild(components...),
 	}
 }
 

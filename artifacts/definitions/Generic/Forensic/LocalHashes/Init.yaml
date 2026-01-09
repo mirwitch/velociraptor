@@ -8,6 +8,9 @@ parameters:
     description: Name of the local hash database
     default: hashdb.sqlite
 
+implied_permissions:
+  - FILESYSTEM_WRITE
+
 sources:
   - query: |
       LET SQL = "
@@ -30,4 +33,4 @@ sources:
          SELECT * FROM sqlite(file=hash_db, query=Line)
       })
 
-      SELECT hash_db AS FullPath FROM scope()
+      SELECT hash_db AS OSPath FROM scope()

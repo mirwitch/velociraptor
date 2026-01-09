@@ -3,7 +3,7 @@ import PropTypes from 'prop-types';
 import { withRouter }  from "react-router-dom";
 
 import api from '../core/api-service.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 
 
 // A component that syncs a client id to a client record.
@@ -11,6 +11,9 @@ class ClientSetterFromRoute extends Component {
     static propTypes = {
         client: PropTypes.object,
         setClient: PropTypes.func.isRequired,
+
+        // React router props.
+        match: PropTypes.object,
     }
 
     componentDidUpdate() {
@@ -18,7 +21,7 @@ class ClientSetterFromRoute extends Component {
     }
 
     componentDidMount() {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.maybeUpdateClientInfo();
     }
 
@@ -51,14 +54,14 @@ class ClientSetterFromRoute extends Component {
                 client_id: client_id,
             });
 
-            api.get('/v1/SearchClients', {
-                query: client_id,
-            }, this.source.token).then(resp => {
-                if (resp.data && resp.data.items) {
-                    window.globals.client = resp.data.items[0];
-                    this.props.setClient(resp.data.items[0]);
-                }
-            });
+            api.get('v1/GetClient/' + client_id, {},
+                    this.source.token).then(resp => {
+                        if (resp.cancel) return;
+                        if (resp.data && resp.data.client_id === client_id) {
+                            window.globals.client = resp.data;
+                            this.props.setClient(resp.data);
+                        }
+                    });
         }
     }
 

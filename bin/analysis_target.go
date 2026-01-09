@@ -6,10 +6,9 @@ import (
 	"io/ioutil"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/Velocidex/yaml/v2"
 	"www.velocidex.com/golang/velociraptor/accessors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/velociraptor/vql/remapping"
@@ -20,7 +19,7 @@ var (
 		"remap", "A remapping configuration file for dead disk analysis.").String()
 )
 
-func applyAnalysisTarget(config_obj *config_proto.Config) error {
+func applyRemapping(config_obj *config_proto.Config) error {
 	if remapping_flag == nil || *remapping_flag == "" {
 		return nil
 	}
@@ -32,11 +31,11 @@ func applyAnalysisTarget(config_obj *config_proto.Config) error {
 	}
 
 	remapping_config := []*config_proto.RemappingConfig{}
-	err = yaml.Unmarshal(data, remapping_config)
+	err = utils.YamlUnmarshalStrict(data, remapping_config)
 	if err != nil {
 		// It might be a regular config file
 		full_config := &config_proto.Config{}
-		err := yaml.Unmarshal(data, full_config)
+		err := utils.YamlUnmarshalStrict(data, full_config)
 		if err != nil {
 			return err
 		}
@@ -46,7 +45,7 @@ func applyAnalysisTarget(config_obj *config_proto.Config) error {
 		return nil
 	}
 
-	logging.Prelog("Applying remapping from %v", *remapping_flag)
+	Prelog("Applying remapping from %v", *remapping_flag)
 
 	// Apply the remapping once to check for syntax errors so we can
 	// fail early.

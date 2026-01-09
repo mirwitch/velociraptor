@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/types"
 )
@@ -23,7 +24,7 @@ type ProgressThrottler struct {
 
 func (self *ProgressThrottler) ChargeOp() {
 	self.mu.Lock()
-	self.heartbeat = time.Now()
+	self.heartbeat = utils.Now()
 	self.mu.Unlock()
 	self.delegate.ChargeOp()
 }
@@ -41,7 +42,7 @@ func (self *ProgressThrottler) Start(
 
 		case <-time.After(self.progress_timeout):
 			self.mu.Lock()
-			now := time.Now()
+			now := utils.Now()
 			if self.progress_timeout.Nanoseconds() > 0 &&
 				now.After(self.heartbeat.Add(self.progress_timeout)) {
 				self.mu.Unlock()
@@ -60,14 +61,14 @@ func (self *ProgressThrottler) exitWithError(scope vfilter.Scope) {
 	buf := bytes.Buffer{}
 	p := pprof.Lookup("goroutine")
 	if p != nil {
-		p.WriteTo(&buf, 1)
+		_ = p.WriteTo(&buf, 1)
 		scope.Log("Goroutine dump: %v", buf.String())
 	}
 
 	buf = bytes.Buffer{}
 	p = pprof.Lookup("mutex")
 	if p != nil {
-		p.WriteTo(&buf, 1)
+		_ = p.WriteTo(&buf, 1)
 		scope.Log("Mutex dump: %v", buf.String())
 	}
 

@@ -9,7 +9,7 @@ import Row from 'react-bootstrap/Row';
 import Select from 'react-select';
 import T from '../i8n/i8n.jsx';
 import InputGroup from 'react-bootstrap/InputGroup';
-
+import Button from 'react-bootstrap/Button';
 
 
 export default class OrgSelector extends Component {
@@ -49,19 +49,16 @@ export default class OrgSelector extends Component {
 
         return (
             <InputGroup className="mb-3">
-              <InputGroup.Prepend>
-                <InputGroup.Text
-                  as="button"
-                  className="btn btn-default"
-                  onClick={e=>{
-                      this.props.onChange(_.map(orgs, x=>x.id));
-                      e.preventDefault();
-                      return false;
-                  }}
-                >
-                  {T("All Orgs")}
-                </InputGroup.Text>
-              </InputGroup.Prepend>
+              <Button
+                className="btn btn-default"
+                onClick={e=>{
+                    this.props.onChange(_.map(orgs, x=>x.id));
+                    e.preventDefault();
+                    return false;
+                }}
+              >
+                {T("All Orgs")}
+              </Button>
               <Select
                 className="org-selector"
                 isMulti

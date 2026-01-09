@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -28,6 +28,13 @@ import (
 )
 
 type DataFilesystemAccessor struct{}
+
+func (self DataFilesystemAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name:        "data",
+		Description: `Makes a string appears as an in memory file. Path is taken as a literal string to use as the file's data`,
+	}
+}
 
 func (self DataFilesystemAccessor) New(
 	scope vfilter.Scope) (accessors.FileSystemAccessor, error) {
@@ -86,6 +93,5 @@ func (self DataFilesystemAccessor) OpenWithOSPath(
 }
 
 func init() {
-	accessors.Register("data", &DataFilesystemAccessor{},
-		`Makes a string appears as an in memory file. Path is taken as a literal string to use as the file's data`)
+	accessors.Register(&DataFilesystemAccessor{})
 }

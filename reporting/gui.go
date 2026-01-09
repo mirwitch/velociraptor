@@ -10,7 +10,6 @@ import (
 	"log"
 	"regexp"
 	"strings"
-	"sync"
 	"text/template"
 	"time"
 
@@ -22,15 +21,16 @@ import (
 	chroma_html "github.com/alecthomas/chroma/formatters/html"
 	"github.com/microcosm-cc/bluemonday"
 	blackfriday "github.com/russross/blackfriday/v2"
+	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/timelines"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
@@ -55,7 +55,7 @@ type GuiTemplateEngine struct {
 	*BaseTemplateEngine
 	tmpl         *template.Template
 	ctx          context.Context
-	log_writer   *notebooCellLogger
+	log_writer   *notebookCellLogger
 	path_manager *paths.NotebookCellPathManager
 	Data         map[string]*actions_proto.VQLResponse
 	Progress     utils.ProgressReporter
@@ -65,7 +65,8 @@ type GuiTemplateEngine struct {
 // Go templates can call functions which take args. The pipeline is
 // always called last, so any options must come before it. This
 // function takes care of parsing the args in a consistent way -
-// keyword options are
+// keyword options are extracted first and argv contains non keyword
+// options.
 func parseOptions(values []interface{}) (*ordereddict.Dict, []interface{}) {
 	result := []interface{}{}
 	dict := ordereddict.NewDict()
@@ -91,7 +92,7 @@ func parseOptions(values []interface{}) (*ordereddict.Dict, []interface{}) {
 // When rendering a table the user can introduce options into the
 // scope.
 func (self *GuiTemplateEngine) getTableOptions() (*ordereddict.Dict, error) {
-	column_types, pres := self.Scope.Resolve("ColumnTypes")
+	column_types, pres := self.Scope.Resolve(constants.COLUMN_TYPES)
 	if !pres {
 		return nil, errors.New("Not found")
 	}
@@ -166,7 +167,7 @@ func (self *GuiTemplateEngine) Expand(values ...interface{}) interface{} {
 }
 
 func (self *GuiTemplateEngine) Import(artifact, name string) interface{} {
-	definition, pres := self.BaseTemplateEngine.Repository.Get(
+	definition, pres := self.BaseTemplateEngine.Repository.Get(self.ctx,
 		self.config_obj, artifact)
 	if !pres {
 		self.Error("Unknown artifact %v", artifact)
@@ -213,40 +214,25 @@ func (self *GuiTemplateEngine) Table(values ...interface{}) interface{} {
 		for _, item := range t {
 			options := item.Params()
 			options.Set("TableOptions", table_options)
-			options.Set("Version", time.Now().Unix())
+			options.Set("Version", utils.GetTime().Now().Unix())
 
 			result += fmt.Sprintf(
-				`<div class="panel"><grr-csv-viewer base-url="'v1/GetTable'" `+
+				`<div class="panel"><velo-csv-viewer base-url="'v1/GetTable'" `+
 					`params='%s' /></div>`,
 				utils.QueryEscape(options.String()))
 		}
 		return result
-
-	case []*ordereddict.Dict:
-		if len(t) == 0 { // No rows returned.
-			self.Scope.Log("Query produced no rows.")
-			return ""
-		}
-
-		opts := vql_subsystem.EncOptsFromScope(self.Scope)
-		encoded_rows, err := json.MarshalWithOptions(t, opts)
-		if err != nil {
-			return self.Error("Error: %v", err)
-		}
-
-		key := fmt.Sprintf("table%d", len(self.Data))
-		self.Data[key] = &actions_proto.VQLResponse{
-			Response: string(encoded_rows),
-			Columns:  self.Scope.GetMembers(t[0]),
-		}
-		return fmt.Sprintf(
-			`<div class="panel"><inline-table-viewer value="%s" /></div>`,
-			utils.QueryEscape(key))
 	}
 }
 
+func (self *GuiTemplateEngine) SigmaEditor(values ...interface{}) string {
+	options, _ := parseOptions(values)
+	return fmt.Sprintf(
+		`<velo-sigma-editor params="%s" />`, utils.QueryEscape(options.String()))
+}
+
 func (self *GuiTemplateEngine) LineChart(values ...interface{}) string {
-	return self.genericChart("grr-line-chart", "notebook-line-chart", values...)
+	return self.genericChart("velo-line-chart", "notebook-line-chart", values...)
 }
 
 func (self *GuiTemplateEngine) TimeChart(values ...interface{}) string {
@@ -278,7 +264,7 @@ func (self *GuiTemplateEngine) genericChart(
 		for _, item := range t {
 			params := item.Params()
 			params.MergeFrom(options)
-			params.Set("Version", time.Now().Unix())
+			params.Set("Version", utils.GetTime().Now().Unix())
 
 			result += fmt.Sprintf(
 				`<div class="panel"><%s base-url="'v1/GetTable'" `+
@@ -328,24 +314,39 @@ func (self *GuiTemplateEngine) Timeline(values ...interface{}) string {
 		return ""
 
 	case string:
-		timeline_path_manager := self.path_manager.Notebook().
-			SuperTimeline(t)
-		parameters := "{}"
-		reader, err := timelines.NewSuperTimelineReader(self.config_obj, timeline_path_manager, nil)
-		if err == nil {
-			parameters = json.MustMarshalString(reader.Stat())
+		notebook_manager, err := services.GetNotebookManager(self.config_obj)
+		if err != nil {
+			return ""
 		}
 
+		timelines, err := notebook_manager.Timelines(self.ctx,
+			self.path_manager.NotebookId())
+		if err != nil {
+			return ""
+		}
+
+		for _, timeline := range timelines {
+			if timeline.Name == t {
+				parameters := json.MustMarshalString(timeline)
+				return fmt.Sprintf(
+					`<div class="panel"><velo-timeline name='%s' `+
+						`params='%s' /></div>`, utils.QueryEscape(t),
+					utils.QueryEscape(parameters))
+			}
+		}
+
+		// If we get here the timeline does not exist, we just make it
+		// up
 		return fmt.Sprintf(
-			`<div class="panel"><grr-timeline name='%s' `+
+			`<div class="panel"><velo-timeline name='%s' `+
 				`params='%s' /></div>`, utils.QueryEscape(t),
-			utils.QueryEscape(parameters))
+			utils.QueryEscape("{}"))
 
 	case []*paths.NotebookCellQuery:
 		result := ""
 		for _, item := range t {
 			result += fmt.Sprintf(
-				`<div class="panel"><grr-timeline base-url="'v1/GetTable'" `+
+				`<div class="panel"><velo-timeline base-url="'v1/GetTable'" `+
 					`params='%s' /></div>`,
 				utils.QueryEscape(item.Params().String()))
 		}
@@ -372,7 +373,7 @@ func (self *GuiTemplateEngine) Timeline(values ...interface{}) string {
 			Columns:  self.Scope.GetMembers(t[0]),
 		}
 		return fmt.Sprintf(
-			`<grr-timeline value="data['%s']" params='%s' />`,
+			`<velo-timeline value="data['%s']" params='%s' />`,
 			key, utils.QueryEscape(string(parameters)))
 	}
 }
@@ -530,6 +531,18 @@ func (self *GuiTemplateEngine) queryRows(queries ...string) []*ordereddict.Dict 
 	return result
 }
 
+// Render the special GUI markup for given value.
+func (self *GuiTemplateEngine) renderFunction(a interface{}, opts ...interface{}) interface{} {
+	switch t := a.(type) {
+	case time.Time:
+		res := fmt.Sprintf(`<velo-value value="%v"></velo-value>`,
+			t.Format(time.RFC3339))
+		return res
+	}
+
+	return a
+}
+
 func (self *GuiTemplateEngine) Error(fmt_str string, argv ...interface{}) string {
 	self.Scope.Log(fmt_str, argv...)
 	return ""
@@ -546,33 +559,9 @@ func (self *GuiTemplateEngine) MoreMessages() bool {
 func (self *GuiTemplateEngine) Close() {
 	if self.log_writer != nil {
 		self.log_writer.Flush()
+		self.log_writer.Close()
 	}
 	self.BaseTemplateEngine.Close()
-}
-
-type logWriter struct {
-	mu       sync.Mutex
-	messages []string
-}
-
-func (self *logWriter) Write(b []byte) (int, error) {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	// Do not allow the log messages to accumulate too much.
-	self.messages = append(self.messages, string(b))
-	if len(self.messages) > 1000 {
-		self.messages = nil
-	}
-
-	return len(b), nil
-}
-
-func (self *logWriter) Messages() []string {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	return self.messages[:]
 }
 
 func NewGuiTemplateEngine(
@@ -586,18 +575,19 @@ func NewGuiTemplateEngine(
 	*GuiTemplateEngine, error) {
 
 	uploader := &NotebookUploader{
-		config_obj:  config_obj,
-		PathManager: notebook_cell_path_manager,
+		config_obj:                 config_obj,
+		notebook_cell_path_manager: notebook_cell_path_manager,
 	}
 
 	base_engine, err := newBaseTemplateEngine(
-		config_obj, scope, acl_manager, uploader, repository, artifact_name)
+		ctx, config_obj, scope, acl_manager,
+		uploader, repository, artifact_name)
 	if err != nil {
 		return nil, err
 	}
 
 	// Write logs to this result set.
-	log_writer, err := newNotebookCellLogger(
+	log_writer, err := newNotebookCellLogger(ctx,
 		config_obj, notebook_cell_path_manager.Logs())
 	if err != nil {
 		return nil, err
@@ -621,11 +611,21 @@ func NewGuiTemplateEngine(
 			"LineChart":    template_engine.LineChart,
 			"ScatterChart": template_engine.ScatterChart,
 			"TimeChart":    template_engine.TimeChart,
+			"SigmaEditor":  template_engine.SigmaEditor,
 			"Timeline":     template_engine.Timeline,
-			"Get":          template_engine.getFunction,
+			"Get":          template_engine.GetFunction,
+			"Render":       template_engine.renderFunction,
 			"Expand":       template_engine.Expand,
 			"import":       template_engine.Import,
-			"str":          strval,
+			"str":          utils.ToString,
+
+			// Remove sprig's functions
+			"env": func() string {
+				return ""
+			},
+			"expandenv": func() string {
+				return ""
+			},
 		})
 	return template_engine, nil
 }
@@ -638,20 +638,21 @@ func NewBlueMondayPolicy() *bluemonday.Policy {
 	p.AllowURLSchemes("http", "https", "data")
 
 	// Directives for the GUI.
-	p.AllowAttrs("value", "params").OnElements("grr-csv-viewer")
-	p.AllowAttrs("value", "params").OnElements("inline-table-viewer")
-	p.AllowAttrs("value", "params").OnElements("grr-line-chart")
+	p.AllowAttrs("value", "params").OnElements("velo-csv-viewer")
+	p.AllowAttrs("value", "params").OnElements("velo-line-chart")
+	p.AllowAttrs("value", "params").OnElements("velo-sigma-editor")
 	p.AllowAttrs("value", "params").OnElements("bar-chart")
 	p.AllowAttrs("value", "params").OnElements("scatter-chart")
 	p.AllowAttrs("value", "params").OnElements("time-chart")
+	p.AllowAttrs("value").OnElements("velo-value")
 
 	//p.AllowNoAttrs().OnElements("accordion")
 	p.AllowAttrs("params").OnElements("notebook-bar-chart")
 	p.AllowAttrs("params").OnElements("notebook-line-chart")
 	p.AllowAttrs("params").OnElements("notebook-scatter-chart")
 	p.AllowAttrs("params").OnElements("notebook-time-chart")
-	p.AllowAttrs("name", "params").OnElements("grr-timeline")
-	p.AllowAttrs("name").OnElements("grr-tool-viewer")
+	p.AllowAttrs("name", "params").OnElements("velo-timeline")
+	p.AllowAttrs("name", "version").OnElements("velo-tool-viewer")
 
 	// Required for syntax highlighting.
 	p.AllowAttrs("class").OnElements("span")
@@ -664,6 +665,10 @@ func NewBlueMondayPolicy() *bluemonday.Policy {
 
 func (self *GuiTemplateEngine) RunQuery(vql *vfilter.VQL,
 	result []*paths.NotebookCellQuery) ([]*paths.NotebookCellQuery, error) {
+	query_log := actions.QueryLog.AddQuery(
+		vfilter.FormatToString(self.Scope, vql))
+	defer query_log.Close()
+
 	if result == nil {
 		result = []*paths.NotebookCellQuery{}
 	}
@@ -729,8 +734,10 @@ func (self *GuiTemplateEngine) RunQuery(vql *vfilter.VQL,
 		// Report progress even if no row is emitted
 		case <-time.After(4 * time.Second):
 			rs_writer.Flush()
-			self.Progress.Report(fmt.Sprintf(
-				"Total Rows %v", row_idx))
+			if self.Progress != nil {
+				self.Progress.Report(fmt.Sprintf(
+					"Total Rows %v", row_idx))
+			}
 			next_progress = time.Now().Add(4 * time.Second)
 
 		}

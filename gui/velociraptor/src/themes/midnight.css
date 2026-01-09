@@ -69,6 +69,8 @@
   --color-scrollbar-track: var(--color-canvas-background);
   --color-scrollbar-thumb: var(--color-accent-50);
   --color-scrollbar-thumb-hover: var(--color-accent-100);
+  --color-scrollbar-main: var(--color-accent-25);
+  --color-scrollbar-background: rgba(var(--color-accent), 0.1);
 
   --color-btn-border: #850000;
   --color-btn-default-border: #850000;
@@ -113,6 +115,8 @@
   --color-level-error: #ff0000;
 
   --color-danger-emphasis: #dd4b3920;
+
+  --invalid-form-control-error: #ff7f00;
 }
 
 .midnight img.velo-logo {
@@ -199,18 +203,6 @@ body.midnight {
   color: var(--color-sidebar-foreground);
 }
 
-.midnight #client-search-bar {
-  background: var(--color-canvas-background);
-  border: 1px solid var(--color-btn-default-border);
-  border-radius: 0;
-  color: var(--color-foreground);
-  font-family: var(--font-family-sans-serif);
-  padding-top: 5px;
-  padding-bottom: 5px;
-  margin-left: 5px;
-  height: 26px;
-}
-
 .midnight .dropdown .dropdown-toggle.btn.btn-default {
   border-radius: 0;
   border-left-width: 0;
@@ -250,7 +242,6 @@ body.midnight {
 }
 
 .midnight .react-autosuggest__suggestions-container--open {
-  margin-left: 5px;
   background: var(--color-form-control-background);
   font-family: var(--font-family-sans-serif);
   font-size: var(--font-size-base);
@@ -283,14 +274,21 @@ body.midnight {
   padding-bottom: 1em;
 }
 
-.midnight .navigator.nav-pills.nav li:hover {
+.midnight nav.navigator .nav-pills .nav-link {
+  padding: 0;
+}
+
+.midnight .navigator.nav-pills.nav li:hover > a:not(.active) {
   color: var(--color-sidebar-inactive-foreground-hover);
   background: var(--color-sidebar-inactive-background-hover);
 }
 
-.midnight a.active .navigator.nav-pills.nav li {
-  color: var(--color-sidebar-active-foreground);
+.midnight .navigator.nav-pills.nav li:has(a.active) {
   background: var(--color-sidebar-active-background);
+}
+
+.midnight .navigator.nav-pills.nav li a.active {
+  color: var(--color-sidebar-active-foreground);
 }
 
 .midnight .navigator.nav-pills.nav .nav-link.disabled {
@@ -497,6 +495,7 @@ body.midnight {
 
 .midnight .react-bootstrap-table-pagination-total {
   color: var(--color-foreground);
+  padding-left: 15px;
 }
 
 /* Tables */
@@ -551,13 +550,14 @@ body.midnight {
   border: none;
 }
 
-.midnight .table-hover tbody tr:hover {
+.midnight .paged-table.table tbody tr:hover td {
   background: var(--color-table-row-hover);
-  color: unset;
+  color: var(--color-foreground);
 }
 
-.midnight .table tbody tr.row-selected,
-.midnight .table tbody tr.row_selected td {
+.midnight .paged-table.table tbody tr.row-selected,
+.midnight .paged-table.table tbody tr.row-selected:hover,
+.midnight .paged-table.table tbody tr.row-selected td {
   background: var(--color-table-row-selected);
   color: var(--color-table-row-selected-text);
   font-weight: 700;
@@ -653,6 +653,7 @@ body.midnight {
 
 .midnight .card-header {
   font-weight: 700;
+  color: #FFD500;
   border-bottom: 3px solid var(--color-accent-50);
 }
 
@@ -684,6 +685,12 @@ body.midnight {
 .midnight div.pretty-json-container {
   font-family: var(--font-family-monospace);
   filter: invert(0);
+}
+
+.midnight .invalid.form-control,
+.midnight .invalid.form-control:focus {
+  color: #FFFF00;
+  background: var(--invalid-form-control-error);
 }
 
 /* Tabs */
@@ -809,6 +816,14 @@ body.midnight {
   font-weight: 500 !important;
 }
 
+.midnight .ace_placeholder {
+  font-family: var(--font-family-sans-serif);
+  font-size: var(--font-size-large);
+  letter-spacing: 0.4px;
+  color: var(--color-foreground) !important;
+  font-weight: 500 !important;
+}
+
 .midnight .velo__multi-value {
   border: 1px solid var(--color-accent-100);
   border-radius: 0;
@@ -816,9 +831,11 @@ body.midnight {
 }
 
 .midnight .velo__multi-value__label {
-  color: var(--color-foreground);
+  color: var(--color-foreground-inverse);
+  background-color: var(--color-accent-100);
   border: none;
   border-radius: 0;
+  font-size: var(--font-size-small);
 }
 
 .midnight .velo__multi-value__remove {
@@ -896,12 +913,13 @@ body.midnight {
 }
 
 .midnight .report-viewer pre {
-  border-radius: 0;
-  border: 0.5px solid var(--color-btn-border);
-  padding-top: 2px;
-  padding-bottom: 2px;
-  padding-left: 4px;
-  padding-right: 4px;
+    border-radius: 0;
+    background: rgba(255,255,255,.05);
+    border: 0.5px solid var(--color-btn-border);
+    padding-top: 2px;
+    padding-bottom: 2px;
+    padding-left: 4px;
+    padding-right: 4px;
 }
 
 .midnight .report-viewer code {
@@ -930,7 +948,7 @@ body.midnight {
   background: var(--color-table-row-hover);
 }
 
-.midnight .artifact-search-table.selectable.container tr.row-selected,
+.midnight .artifact-search-table.selectable.container tr.row-selected .link-button,
 .midnight .artifact-search-table.selectable.container tr.row-selected:hover,
 .midnight .artifact-search-table.selectable.container tr.row_selected > td {
   background: var(--color-table-row-selected);
@@ -955,15 +973,16 @@ body.midnight {
   background: #200000;
 }
 
-.midnight .modal-header .close {
-  color: var(--color-foreground);
-  opacity: 1;
+.midnight .modal-header .btn-close {
+  color: var(--color-foreground-dimmed);
+  opacity: 0.8;
+  filter: brightness(0) saturate(100%) invert(16%) sepia(62%) saturate(7115%) hue-rotate(358deg) brightness(96%) contrast(122%);
   text-shadow: none;
   outline: none;
 }
 
-.midnight .modal-header .close:hover,
-.midnight .modal-header .close:focus {
+.midnight .modal-header .btn-close:hover,
+.midnight .modal-header .btn-close:focus {
   color: var(--color-foreground);
   opacity: 1;
   text-shadow: none;
@@ -1012,8 +1031,62 @@ body.midnight {
 }
 
 /* react timelines */
+.midnight .react-calendar-timeline .rct-sidebar,
+.midnight .react-calendar-timeline .rct-dateHeader {
+  color: var(--color-foreground);
+  font-size: var(--font-size-small);
+}
+
 .midnight .react-calendar-timeline .rct-sidebar {
-    color: var(--color-foreground);
+  border-right: 1px solid var(--color-foreground-dimmed);
+}
+
+.midnight .react-calendar-timeline .rct-sidebar.rct-sidebar-right {
+  border-right: 0;
+  border-left: 1px solid var(--color-foreground-dimmed);
+}
+
+.midnight .react-calendar-timeline .rct-sidebar .rct-sidebar-row {
+  border-bottom: 1px solid var(--color-foreground-dimmed);
+}
+
+.midnight .react-calendar-timeline .rct-vertical-lines .rct-vl {
+  position: absolute;
+  border-left: 1px solid var(--color-foreground-dimmed);
+}
+
+.midnight .react-calendar-timeline .rct-horizontal-lines .rct-hl-even,
+.midnight .react-calendar-timeline .rct-horizontal-lines .rct-hl-odd {
+  border-bottom: 1px solid var(--color-foreground-dimmed);
+}
+
+.midnight .react-calendar-timeline .rct-dateHeader {
+  border-left: 2px solid var(--color-foreground-dimmed);
+  border-bottom: 1px solid var(--color-foreground-dimmed);
+}
+
+.midnight .react-calendar-timeline .rct-dateHeader-primary {
+  background-color: initial;
+  border-left: 1px solid var(--color-foreground-dimmed);
+  border-right: 1px solid var(--color-foreground-dimmed);
+  color: var(--color-foreground);
+}
+
+.midnight .react-calendar-timeline .rct-header-root {
+  border-bottom: 1px solid var(--color-foreground-dimmed);
+}
+
+.midnight .react-calendar-timeline .rct-calendar-header {
+  border: 1px solid var(--color-foreground-dimmed);
+}
+
+.midnight .react-calendar-timeline .timeline-marker {
+  color: #FFD500;
+}
+
+.midnight .react-calendar-timeline .rct-item * {
+  border: none;
+  background: #FFD500;
 }
 
 /* file tree */
@@ -1041,72 +1114,6 @@ body.midnight {
 .midnight .dropdown-item {
   font-family: var(--font-family-sans-serif);
   font-size: var(--font-size-base);
-}
-
-/* Datepicker */
-
-.midnight .react-datetime-picker__wrapper {
-  border: 1px solid var(--color-btn-border);
-  color: var(--color-foreground);
-}
-
-.midnight .react-datepicker,
-.midnight .react-datetime-picker__calendar .react-calendar,
-.midnight .react-datetime-picker {
-  font-family: var(--font-family-sans-serif);
-  background: var(--color-canvas-background);
-  color: var(--color-foreground);
-  border: 1px solid var(--color-btn-border);
-  z-index: 10;
-}
-
-.midnight .react-datetime-picker__inputGroup__input,
-.midnight .react-datetime-picker__button {
-  filter: invert(10%) sepia(75%) saturate(6094%) hue-rotate(359deg) brightness(133%) contrast(118%);
-  stroke: var(--color-foreground) !important;
-}
-
-.midnight .react-datetime-picker__button:enabled:hover .react-datetime-picker__button__icon,
-.midnight .react-datetime-picker__button:enabled:focus .react-datetime-picker__button__icon,
-.midnight .react-datetime-picker__button:hover {
-  stroke: #FFD500 !important;
-  filter: none;
-}
-
-.midnight .react-calendar__navigation button,
-.midnight .react-calendar__tile {
-  color: var(--color-foreground);
-}
-
-.midnight .react-calendar__navigation button:enabled:hover {
-  background-color: var(--color-accent-25);
-  border: none;
-}
-
-.midnight .react-calendar__navigation button:disabled,
-.midnight .react-calendar__navigation button:enabled:focus {
-  background-color: unset;
-}
-
-.midnight .react-calendar__tile:enabled:hover {
-  background-color: var(--color-accent-25);
-  border: none;
-}
-
-.midnight .react-calendar .react-calendar__tile--now {
-  background-color: var(--color-accent-50);
-  color: black;
-}
-
-.midnight .react-calendar .react-calendar__tile--active,
-.midnight .react-calendar .react-calendar__tile--active:hover {
-  background-color: var(--color-accent-100);
-  font-weight: 700;
-  color: #FFD500;
-}
-
-.midnight .react-calendar__month-view__days__day--neighboringMonth {
-  color: darkorange;
 }
 
 /* Footer */
@@ -1145,8 +1152,9 @@ body.midnight {
 }
 
 /* Shell output */
-.midnight .notebook-output pre {
-  filter: invert(1);
+.midnight .notebook-output pre,
+.midnight .notebook-input pre {
+  background-color: unset;
   border-color: var(--color-btn-border);
   font-size: inherit;
 }
@@ -1193,14 +1201,8 @@ body.midnight {
   border: 1px solid var(--color-btn-border);
 }
 
-.midnight .btn-tooltip[data-tooltip]::before {
-  border-radius: 0;
-  color: var(--color-foreground);
-}
-
 .midnight .tooltip.show {
   background: var(--color-canvas-background);
-  border: 1px solid var(--color-btn-border);
   color: var(--color-foreground);
   font-family: var(--font-family-sans-serif);
   font-size: var(--font-size-base);
@@ -1208,9 +1210,21 @@ body.midnight {
 
 .midnight .tooltip-inner {
   color: #FFD500;
+  background-color: var(--color-tooltip-background);
   font-family: var(--font-family-sans-serif);
   font-size: var(--font-size-base);
   font-weight: 700;
+}
+
+.midnight .tooltip.bs-tooltip-top {
+  font-family: var(--font-family-sans-serif);
+  font-size: var(--font-size-base);
+  font-weight: 700;
+  color: var(--color-foreground);
+}
+
+.midnight .bs-tooltip-top .tooltip-arrow::before {
+  border-top-color: var(--color-tooltip-background);
 }
 
 .midnight .file-hex-view td,
@@ -1230,19 +1244,6 @@ body.midnight {
   opacity: 0.8;
 }
 
-/* Disable 'filters' while checked since they impact 'accent-color'. */
-.midnight input[type='checkbox']:checked {
-  filter: none;
-  box-shadow: none;
-}
-
-.midnight input[type='checkbox'] {
-  transform: scale(1.2);
-  accent-color: var(--accent-color);
-  filter: brightness(0%) saturate(100%) invert(16%) sepia(93%) saturate(5000%) hue-rotate(356deg) brightness(99%) contrast(122%);
-  box-shadow: none;
-}
-
 .midnight .no-content {
   text-align: center;
   margin-top: 50px;
@@ -1258,11 +1259,48 @@ body.midnight {
   border-color: var(--color-btn-border);
 }
 
-.midnight .error-message {
+.midnight div.error-message {
   color: #daaa3f !important;
+}
+
+.midnight div.info-message {
+  color: grey !important;
 }
 
 .midnight .alert {
   text-shadow: none;
   box-shadow: none;
+}
+
+.midnight .custom-file-input:focus ~ .custom-file-label {
+  box-shadow: none;
+  color: #FFD500;
+}
+
+.midnight .json-index {
+    color: #d90429;
+}
+
+.midnight .json-key {
+    color: #ec7505;
+}
+
+.midnight .json-string {
+    padding-left: 5px;
+    color: #e89005;
+}
+
+.midnight .json-number {
+    padding-left: 5px;
+    color: #FFD500;
+}
+
+.midnight .json-null {
+  padding-left: 5px;
+  color: #6a040f;
+}
+
+.midnight .json-boolean {
+  padding-left: 5px;
+  color: #FFD500;
 }

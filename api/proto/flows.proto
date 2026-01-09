@@ -7,6 +7,12 @@ package proto;
 
 option go_package = "www.velocidex.com/golang/velociraptor/api/proto";
 
+message ContainerMemberStats {
+    string name = 1;
+    uint64 uncompressed_size = 2;
+    uint64 compressed_size = 3;
+}
+
 // Stats about exported containers
 message ContainerStats {
     // Seconds since epoch
@@ -34,13 +40,21 @@ message ContainerStats {
     repeated string components = 7;
 
     string type = 10;
+
+    string error = 11;
+
+    // A string representation of the file path
+    string vfs_path = 12;
+
+    repeated ContainerMemberStats active_members = 13;
+
 }
 
 message AvailableDownloadFile {
     string name = 1;
     string path = 5;
 
-    // Deprecated thiese are now stored in the stats.
+    // Deprecated things are now stored in the stats.
     string type = 6;
     bool complete = 2;
     uint64 size = 3;
@@ -88,5 +102,6 @@ message ApiFlowRequest {
 }
 
 message ApiFlowResponse {
+    uint64 total = 1;
     repeated ArtifactCollectorContext items = 2;
 }

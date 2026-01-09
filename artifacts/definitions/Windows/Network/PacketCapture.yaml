@@ -15,6 +15,10 @@ tools:
     - name: etl2pcapng
       url: https://github.com/microsoft/etl2pcapng/releases/download/v1.4.0/etl2pcapng.zip
 
+implied_permissions:
+  - FILESYSTEM_WRITE
+  - EXECVE
+
 parameters:
     - name: StartTrace
       type: bool
@@ -33,7 +37,7 @@ sources:
         LET etl2pcapbin <= SELECT
             copy(
               filename=pathspec(
-                 DelegatePath=tool_zip[0].FullPath,
+                 DelegatePath=tool_zip[0].OSPath,
                  Path="etl2pcapng/x64/etl2pcapng.exe"),
               dest=ExePath,
               accessor='zip'

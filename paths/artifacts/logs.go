@@ -29,7 +29,7 @@ func (self *ArtifactLogPathManager) GetRootPath() api.FSPathSpec {
 			self.FlowId, "logs").AsFilestorePath().
 			SetType(api.PATH_TYPE_FILESTORE_JSON)
 
-	case paths.MODE_SERVER:
+	case paths.MODE_SERVER, paths.MODE_NOTEBOOK:
 		return paths.CLIENTS_ROOT.AddChild(
 			"server", "collections",
 			self.FlowId, "logs").AsFilestorePath().
@@ -61,7 +61,7 @@ func (self *ArtifactLogPathManager) GetPathForWriting() (api.FSPathSpec, error) 
 			self.ClientId, "collections",
 			self.FlowId, "logs").AsFilestorePath(), nil
 
-	case paths.MODE_SERVER:
+	case paths.MODE_SERVER, paths.MODE_NOTEBOOK:
 		return paths.CLIENTS_ROOT.AddChild(
 			"server", "collections",
 			self.FlowId, "logs").AsFilestorePath(), nil
@@ -122,15 +122,24 @@ func (self *ArtifactLogPathManager) GetAvailableFiles(
 }
 
 func NewArtifactLogPathManager(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	client_id, flow_id, full_artifact_name string) (
 	*ArtifactLogPathManager, error) {
 
-	path_manager, err := NewArtifactPathManager(config_obj,
+	path_manager, err := NewArtifactPathManager(ctx, config_obj,
 		client_id, flow_id, full_artifact_name)
 	if err != nil {
 		return nil, err
 	}
 
 	return &ArtifactLogPathManager{path_manager}, nil
+}
+
+func NewArtifactLogPathManagerWithMode(
+	config_obj *config_proto.Config,
+	client_id, flow_id, full_artifact_name string,
+	mode int) *ArtifactLogPathManager {
+	path_manager := NewArtifactPathManagerWithMode(config_obj,
+		client_id, flow_id, full_artifact_name, mode)
+	return &ArtifactLogPathManager{path_manager}
 }

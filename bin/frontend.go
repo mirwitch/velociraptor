@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package main
 
@@ -22,7 +22,6 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"www.velocidex.com/golang/velociraptor/config"
-	assets "www.velocidex.com/golang/velociraptor/gui/velociraptor"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/server"
 	"www.velocidex.com/golang/velociraptor/services"
@@ -36,7 +35,7 @@ var (
 		"Disables artifact compressions").Bool()
 	frontend_cmd_minion = frontend_cmd.Flag("minion", "This is a minion frontend").Bool()
 
-	frontend_cmd_node = frontend_cmd.Flag("node", "The name of a minion - selects from available frontend configurations").String()
+	frontend_cmd_node = frontend_cmd.Flag("node", "The name of a minion - selects from available frontend configurations (DEPRECATED: ignored)").String()
 
 	frontend_disable_panic_guard = frontend_cmd.Flag("disable-panic-guard",
 		"Disabled the panic guard mechanism (not recommended)").Bool()
@@ -48,6 +47,9 @@ func doFrontendWithPanicGuard() error {
 		if err != nil {
 			return err
 		}
+		// Do the banner again as it will get flushed with the pre
+		// logs.
+		doBanner()
 	}
 	return doFrontend()
 }
@@ -86,11 +88,6 @@ func doFrontend() error {
 	if *compression_flag {
 		logger.Info("Disabling artifact compression.")
 		config_obj.Frontend.DoNotCompressArtifacts = true
-	}
-
-	// Load the assets into memory if we are the master node.
-	if services.IsMaster(config_obj) {
-		assets.Init()
 	}
 
 	// Increase resource limits.

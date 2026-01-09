@@ -19,6 +19,7 @@ message VQLRequest {
 message VQLEnv {
     string key = 1;
     string value = 2;
+    string comment = 3;
 }
 
 // This is the most common type of message - it specifies a query to
@@ -40,6 +41,10 @@ message VQLCollectorArgs {
     // each query.
     string principal = 28;
 
+    // The effective ACLs that will be used for this query. This is
+    // usually set by the artifact's suid field.
+    string effective_principal = 38;
+
     repeated VQLEnv env = 3 [(sem_type) = {
             description: "Environment variables to be provided for the query.",
         }];
@@ -54,6 +59,13 @@ message VQLCollectorArgs {
             "will be split across multiple responses.",
             default: "1000",
         }];
+
+    // If the row buffer size gets above this size we send the payload
+    // anyway. This is a fairer measure than max_rows of how large the
+    // payload is likely to be before compression because rows come in
+    // all different sizes. Default value is 5mb to match the typical
+    // max_upload_bytes
+    uint64 max_row_buffer_size = 37;
 
     uint64 max_wait = 6 [(sem_type) = {
             friendly_name: "Batch requests that take this long.",
@@ -104,6 +116,16 @@ message VQLResponse {
     string JSONLResponse = 10 [(sem_type) = {
             description: "JSON encoded response.",
         }];
+
+    bytes CompressedJsonResponse = 15;
+
+    // If uncompressed_size > 0 then the above JSONLResponse is
+    // compressed and this field contains the uncompressed size.
+    uint64 uncompressed_size = 13;
+
+    // The offset in the file stream of the uncompressed JSONLResponse
+    // buffer.
+    uint64 byte_offset = 14;
 
     repeated string Columns = 2 [(sem_type) = {
             description: "A list of column headings produced by the query.",
@@ -181,9 +203,15 @@ message ClientInfo {
     uint64 first_seen_at = 20;
     string build_time = 24;
     string build_url = 25;
+    uint64 install_time = 26;
 
     repeated string labels = 15;
     repeated string mac_addresses = 22;
+
+    // A hint if tasks are available. This does not have to be
+    // accurate - checking the task queue will yield the correct
+    // tasks.
+    bool has_tasks = 27;
 
     string last_interrogate_flow_id = 16;
 
@@ -194,4 +222,13 @@ message ClientInfo {
     uint64 last_hunt_timestamp = 17;
     uint64 last_event_table_version = 18;
     uint64 labels_timestamp = 23;
+
+    // A List of flows that are currently in flight and their last
+    // update epoch time.
+    map<string, int64> in_flight_flows = 28;
+
+
+    // A list of indexed metadata fields. There are not all metadata
+    // fields, only the ones that are important enough to be indexed.
+    map<string, string> metadata = 29;
 }

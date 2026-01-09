@@ -1,6 +1,8 @@
 syntax = "proto3";
 
+import "actions/proto/vql.proto";
 import "artifacts/proto/artifact.proto";
+import "flows/proto/artifact_collector.proto";
 import "flows.proto";
 
 
@@ -10,8 +12,8 @@ option go_package = "www.velocidex.com/golang/velociraptor/api/proto";
 
 message ReformatVQLMessage {
     string vql = 1;
+    string artifact = 2;
 }
-
 
 message Env {
     string key = 1;
@@ -21,12 +23,18 @@ message Env {
 message NotebookExportRequest {
     string notebook_id = 1;
     string type = 2;
+    string preferred_name = 3;
 }
 
+// Message sent to the notebook processor ro request a cell recalc.
 message NotebookCellRequest {
     string notebook_id = 1;
     string cell_id = 2;
+    string version = 12;
+    repeated string available_versions = 13;
+
     string input = 3;
+    string output = 14;
     string name = 11;
 
     uint64 offset = 4;
@@ -38,6 +46,10 @@ message NotebookCellRequest {
     repeated Env env = 9;
 
     bool include_uploads = 10;
+    bool include_timelines = 16;
+
+    // If this is set schedule the calculation syncronously.
+    bool sync = 15;
 }
 
 message NotebookContext {
@@ -50,6 +62,7 @@ message NotebookContext {
     int64 end_time = 7;
 }
 
+// Represents an entire notebook.
 message NotebookMetadata {
     string name = 1;
     string description = 2;
@@ -60,6 +73,21 @@ message NotebookMetadata {
 
     // A list of usernames that have access to this notebook.
     repeated string collaborators = 12;
+
+    // A list of NOTEBOOK artifacts to create the notebook with.
+    repeated string artifacts = 20;
+
+    // Each notebook template can be passed parameters
+    repeated ArtifactSpec specs = 21;
+
+    // Notebooks can have typed parameters which are injected into
+    // every cell.
+    repeated ArtifactParameter parameters = 22;
+
+    // These queries will be run before each cell is evaluated in
+    // order to set up the parameters.
+    repeated VQLCollectorArgs requests = 23;
+
 
     // If this is set, the notebook is public.
     bool public = 13;
@@ -100,8 +128,12 @@ message Notebooks {
 }
 
 message NotebookCell {
+    string notebook_id = 16;
     string input = 1;
     string output = 2;
+
+    // A short summary of the notebook cell.
+    string summary = 17;
     string data  = 3;
     string cell_id = 4;
     repeated string messages = 5;
@@ -121,14 +153,24 @@ message NotebookCell {
     bool calculating = 9;
 
     repeated Env env = 11;
+
+    string error = 13;
+
+    string current_version = 14;
+    repeated string available_versions = 15;
 }
 
 message NotebookFileUploadRequest {
     string data = 1;
     string filename = 2;
+    bool disable_attachment_id = 6;
+    repeated string components = 4;
     string notebook_id = 3;
+    string cell_id = 5;
 }
 
 message NotebookFileUploadResponse {
     string url = 1;
+    string filename = 2;
+    string mime_type = 3;
 }

@@ -6,7 +6,9 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -27,6 +29,7 @@ func (self FlowsPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "flows", args)()
 
 		err := vql_subsystem.CheckAccess(scope, acls.READ_RESULTS)
 		if err != nil {
@@ -41,9 +44,29 @@ func (self FlowsPlugin) Call(
 			return
 		}
 
+		err = services.RequireFrontend()
+		if err != nil {
+			scope.Log("flows: %v", err)
+			return
+		}
+
 		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
-			scope.Log("Command can only run on the server")
+			scope.Log("flows: Command can only run on the server")
+			return
+		}
+
+		client_info_manager, err := services.GetClientInfoManager(config_obj)
+		if err != nil {
+			scope.Log("flows: %v", err)
+			return
+		}
+
+		// Check the client exists at all.
+		_, err = client_info_manager.Get(ctx, arg.ClientId)
+		if err != nil {
+			scope.Log("flows: unable to get client %v: %v",
+				arg.ClientId, err)
 			return
 		}
 
@@ -56,7 +79,10 @@ func (self FlowsPlugin) Call(
 		// The user only cares about one flow
 		if arg.FlowId != "" {
 			flow_details, err := launcher.GetFlowDetails(
-				config_obj, arg.ClientId, arg.FlowId)
+				ctx, config_obj, services.GetFlowOptions{
+					Downloads: true,
+				},
+				arg.ClientId, arg.FlowId)
 			if err == nil {
 				item := json.ConvertProtoToOrderedDict(
 					flow_details.Context)
@@ -71,12 +97,13 @@ func (self FlowsPlugin) Call(
 			return
 		}
 
-		length := uint64(1000)
-		offset := uint64(0)
+		length := int64(1000)
+		offset := int64(0)
 
 		for {
-			result, err := launcher.GetFlows(config_obj,
-				arg.ClientId, true, nil, offset, length)
+			options := result_sets.ResultSetOptions{}
+			result, err := launcher.GetFlows(ctx, config_obj,
+				arg.ClientId, options, offset, length)
 			if err != nil {
 				scope.Log("flows: %v", err)
 				return
@@ -94,7 +121,7 @@ func (self FlowsPlugin) Call(
 				}
 			}
 
-			offset += uint64(len(result.Items))
+			offset += int64(len(result.Items))
 		}
 	}()
 
@@ -103,9 +130,10 @@ func (self FlowsPlugin) Call(
 
 func (self FlowsPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "flows",
-		Doc:     "Retrieve the flows launched on each client.",
-		ArgType: type_map.AddType(scope, &FlowsPluginArgs{}),
+		Name:     "flows",
+		Doc:      "Retrieve the flows launched on each client.",
+		ArgType:  type_map.AddType(scope, &FlowsPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 
@@ -133,9 +161,15 @@ func (self *CancelFlowFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("cancel_flow: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("cancel_flow: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -156,9 +190,10 @@ func (self *CancelFlowFunction) Call(ctx context.Context,
 
 func (self CancelFlowFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "cancel_flow",
-		Doc:     "Cancels the flow.",
-		ArgType: type_map.AddType(scope, &FlowsPluginArgs{}),
+		Name:     "cancel_flow",
+		Doc:      "Cancels the flow.",
+		ArgType:  type_map.AddType(scope, &FlowsPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_SERVER, acls.COLLECT_CLIENT).Build(),
 	}
 }
 
@@ -172,6 +207,7 @@ func (self EnumerateFlowPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "enumerate_flow", args)()
 
 		err := vql_subsystem.CheckAccess(scope, acls.READ_RESULTS)
 		if err != nil {
@@ -186,9 +222,15 @@ func (self EnumerateFlowPlugin) Call(
 			return
 		}
 
+		err = services.RequireFrontend()
+		if err != nil {
+			scope.Log("enumerate_flow: %v", err)
+			return
+		}
+
 		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
-			scope.Log("Command can only run on the server")
+			scope.Log("enumerate_flow: Command can only run on the server")
 			return
 		}
 
@@ -198,8 +240,9 @@ func (self EnumerateFlowPlugin) Call(
 			return
 		}
 
-		responses, err := launcher.DeleteFlow(ctx, config_obj,
-			arg.ClientId, arg.FlowId, false /* really_do_it */)
+		responses, err := launcher.Storage().DeleteFlow(ctx, config_obj,
+			arg.ClientId, arg.FlowId,
+			services.NoAuditLogging, services.DryRunOnly)
 		if err != nil {
 			scope.Log("delete_flow: %v", err)
 			return
@@ -219,9 +262,10 @@ func (self EnumerateFlowPlugin) Call(
 
 func (self EnumerateFlowPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "enumerate_flow",
-		Doc:     "Enumerate all the files that make up a flow.",
-		ArgType: type_map.AddType(scope, &FlowsPluginArgs{}),
+		Name:     "enumerate_flow",
+		Doc:      "Enumerate all the files that make up a flow.",
+		ArgType:  type_map.AddType(scope, &FlowsPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 
@@ -249,6 +293,12 @@ func (self *GetFlowFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("get_flow: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
 		scope.Log("get_flow: Command can only run on the server")
@@ -260,7 +310,11 @@ func (self *GetFlowFunction) Call(ctx context.Context,
 		scope.Log("get_flow: %v", err)
 		return vfilter.Null{}
 	}
-	res, err := launcher.GetFlowDetails(config_obj, arg.ClientId, arg.FlowId)
+	res, err := launcher.GetFlowDetails(
+		ctx, config_obj, services.GetFlowOptions{
+			Downloads: true,
+		},
+		arg.ClientId, arg.FlowId)
 	if err != nil {
 		scope.Log("get_flow: %v", err)
 		return vfilter.Null{}
@@ -272,9 +326,10 @@ func (self *GetFlowFunction) Call(ctx context.Context,
 
 func (self GetFlowFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "get_flow",
-		Doc:     "Gets flow details.",
-		ArgType: type_map.AddType(scope, &FlowsPluginArgs{}),
+		Name:     "get_flow",
+		Doc:      "Gets flow details.",
+		ArgType:  type_map.AddType(scope, &FlowsPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_CLIENT, acls.COLLECT_SERVER).Build(),
 	}
 }
 

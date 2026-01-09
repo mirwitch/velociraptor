@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package main
 
@@ -26,10 +26,12 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	errors "github.com/go-errors/errors"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
-	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/executor/throttler"
 	"www.velocidex.com/golang/velociraptor/file_store/csv"
 	"www.velocidex.com/golang/velociraptor/grpc_client"
 	"www.velocidex.com/golang/velociraptor/json"
@@ -49,6 +51,10 @@ var (
 	query   = app.Command("query", "Run a VQL query")
 	queries = query.Arg("queries", "The VQL Query to run.").
 		Required().Strings()
+
+	query_command_is_file = query.Flag(
+		"from_files", "Args are actually file names which will contain the VQL query").
+		Short('f').Bool()
 
 	query_command_collect_timeout = query.Flag(
 		"timeout", "Time collection out after this many seconds.").
@@ -91,7 +97,7 @@ func outputJSON(ctx context.Context,
 	out io.Writer) error {
 	for result := range vfilter.GetResponseChannel(
 		vql, ctx, scope,
-		vql_subsystem.MarshalJsonIndent(scope),
+		vql_subsystem.MarshalJsonIndentIgnoreEmpty(scope),
 		10, *max_wait) {
 		_, err := out.Write(result.Payload)
 		if err != nil {
@@ -153,13 +159,18 @@ func outputCSV(ctx context.Context,
 }
 
 func doRemoteQuery(
-	config_obj *config_proto.Config, format string,
+	config_obj *config_proto.Config, format string, org_id string,
 	queries []string, env *ordereddict.Dict) error {
+
+	logging.DisableLogging()
 
 	ctx, cancel := install_sig_handler()
 	defer cancel()
 
-	client, closer, err := grpc_client.Factory.GetAPIClient(ctx, config_obj)
+	// Make a remote query using the API - we better have user API
+	// credentials in the config file.
+	client, closer, err := grpc_client.Factory.GetAPIClient(
+		ctx, grpc_client.API_User, config_obj)
 	if err != nil {
 		return err
 	}
@@ -168,7 +179,7 @@ func doRemoteQuery(
 	logger := logging.GetLogger(config_obj, &logging.ToolComponent)
 
 	request := &actions_proto.VQLCollectorArgs{
-		OrgId:    *query_org_id,
+		OrgId:    org_id,
 		MaxRow:   1000,
 		MaxWait:  1,
 		CpuLimit: float32(*query_command_collect_cpu_limit),
@@ -176,12 +187,9 @@ func doRemoteQuery(
 	}
 
 	if env != nil {
-		for _, k := range env.Keys() {
-			v, ok := env.GetString(k)
-			if ok {
-				request.Env = append(request.Env, &actions_proto.VQLEnv{
-					Key: k, Value: v})
-			}
+		for _, i := range env.Items() {
+			request.Env = append(request.Env, &actions_proto.VQLEnv{
+				Key: i.Key, Value: utils.ToString(i.Value)})
 		}
 	}
 
@@ -204,7 +212,7 @@ func doRemoteQuery(
 		}
 
 		if response.Log != "" {
-			logger.Info(response.Log)
+			logger.Info("%s", response.Log)
 			continue
 		}
 
@@ -254,7 +262,10 @@ func doRemoteQuery(
 }
 
 func doQuery() error {
-	config_obj, err := APIConfigLoader.WithNullLoader().LoadAndValidate()
+	logging.DisableLogging()
+
+	config_obj, err := APIConfigLoader.WithNullLoader().
+		LoadAndValidate()
 	if err != nil {
 		return err
 	}
@@ -281,10 +292,41 @@ func doQuery() error {
 		env.Set(k, v)
 	}
 
+	vql_queries := *queries
+	if *query_command_is_file {
+		vql_queries = []string{}
+		for _, q := range *queries {
+			fd, err := os.Open(q)
+			if err != nil {
+				return fmt.Errorf("While opening query file %v: %w", q, err)
+			}
+			data, err := utils.ReadAllWithLimit(fd, constants.MAX_MEMORY)
+			if err != nil {
+				return fmt.Errorf("While opening query file %v: %w", q, err)
+			}
+			fd.Close()
+			vql_queries = append(vql_queries, string(data))
+		}
+	}
+
 	if config_obj.ApiConfig != nil && config_obj.ApiConfig.Name != "" {
 		logging.GetLogger(config_obj, &logging.ToolComponent).
 			Info("API Client configuration loaded - will make gRPC connection.")
-		return doRemoteQuery(config_obj, *format, *queries, env)
+		return doRemoteQuery(
+			config_obj, *format, *query_org_id, vql_queries, env)
+	}
+
+	if *query_org_id != "" {
+		org_manager, err := services.GetOrgManager()
+		if err != nil {
+			return err
+		}
+
+		org_config_obj, err := org_manager.GetOrgConfig(*query_org_id)
+		if err != nil {
+			return err
+		}
+		config_obj = org_config_obj
 	}
 
 	// Initialize the repository in case the artifacts use it
@@ -293,10 +335,11 @@ func doQuery() error {
 		return fmt.Errorf("Artifact GetGlobalRepository: %w ", err)
 	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	builder := services.ScopeBuilder{
 		Config:     config_obj,
 		ACLManager: acl_managers.NullACLManager{},
-		Logger:     log.New(&LogWriter{config_obj}, "", 0),
+		Logger:     log.New(logger, "", 0),
 		Env:        ordereddict.NewDict(),
 	}
 
@@ -332,21 +375,25 @@ func doQuery() error {
 
 		// When the scope is destroyed store it in the file again.
 		if !*do_not_update {
-			scope.AddDestructor(func() {
+			err := scope.AddDestructor(func() {
 				err := storeScopeInFile(*scope_file, scope)
 				if err != nil {
 					scope.Log("Storing scope in %v: %v",
 						*scope_file, err)
 				}
 			})
+			if err != nil {
+				return err
+			}
 		}
 
 	}
 
 	if *query_command_collect_timeout > 0 {
 		start := time.Now()
-		timed_ctx, timed_cancel := context.WithTimeout(ctx,
-			time.Second*time.Duration(*query_command_collect_timeout))
+		timed_ctx, timed_cancel := utils.WithTimeoutCause(ctx,
+			time.Second*time.Duration(*query_command_collect_timeout),
+			errors.New("Query: deadline reached"))
 
 		go func() {
 			select {
@@ -363,8 +410,15 @@ func doQuery() error {
 	}
 
 	// Install throttler into the scope.
-	scope.SetThrottler(actions.NewThrottler(ctx, scope,
-		0, *query_command_collect_cpu_limit, 0))
+	scope.SetContext(constants.SCOPE_QUERY_NAME, "query command")
+	t, closer := throttler.NewThrottler(
+		ctx, scope, config_obj, 0, *query_command_collect_cpu_limit, 0)
+	scope.SetThrottler(t)
+	err = scope.AddDestructor(closer)
+	if err != nil {
+		closer()
+		return err
+	}
 
 	out_fd := os.Stdout
 	if *output_file != "" {
@@ -384,7 +438,7 @@ func doQuery() error {
 	if *trace_vql_flag {
 		scope.SetTracer(log.New(os.Stderr, "VQL Trace: ", 0))
 	}
-	for _, query := range *queries {
+	for _, query := range vql_queries {
 		statements, err := vfilter.MultiParse(query)
 		kingpin.FatalIfError(err, "Unable to parse VQL Query")
 
@@ -412,7 +466,7 @@ func doQuery() error {
 			}
 		}
 	}
-	return nil
+	return logger.Error
 }
 
 func init() {

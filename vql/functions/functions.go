@@ -1,25 +1,26 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package functions
 
 import (
 	"bytes"
 	"context"
+	"encoding/ascii85"
 	"encoding/base64"
 	"encoding/binary"
 	"strconv"
@@ -45,6 +46,9 @@ func (self _Base64Decode) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "base64decode", args)()
+
 	arg := &_Base64DecodeArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -66,6 +70,38 @@ func (self _Base64Decode) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *
 	}
 }
 
+type _Base85Decode struct{}
+
+func (self _Base85Decode) Call(
+	ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "base85decode", args)()
+
+	arg := &_Base64DecodeArgs{}
+	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+	if err != nil {
+		scope.Log("base85decode: %s", err.Error())
+		return vfilter.Null{}
+	}
+
+	dest := make([]byte, len(arg.String))
+	src := strings.TrimSuffix(strings.TrimPrefix(arg.String, "<~"), "~>")
+	n, _, err := ascii85.Decode(dest, []byte(src), true)
+	if err != nil {
+		scope.Log("base85decode: %v %v", n, err)
+	}
+	return string(dest[:n])
+}
+
+func (self _Base85Decode) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+	return &vfilter.FunctionInfo{
+		Name:    "base85decode",
+		ArgType: type_map.AddType(scope, &_Base64DecodeArgs{}),
+	}
+}
+
 type _Base64EncodeArgs struct {
 	String string `vfilter:"required,field=string,doc=A string to decode"`
 }
@@ -76,6 +112,8 @@ func (self _Base64Encode) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "base64encode", args)()
+
 	arg := &_Base64EncodeArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -96,7 +134,7 @@ func (self _Base64Encode) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *
 }
 
 type _ToLowerArgs struct {
-	String string `vfilter:"required,field=string,doc=A string to lower"`
+	String string `vfilter:"required,field=string,doc=The string to process"`
 }
 
 type _ToLower struct{}
@@ -105,6 +143,7 @@ func (self _ToLower) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "lowcase", args)()
 	arg := &_ToLowerArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -118,6 +157,7 @@ func (self _ToLower) Call(
 func (self _ToLower) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "lowcase",
+		Doc:     "Returns the lowercase version of a string.",
 		ArgType: type_map.AddType(scope, &_ToLowerArgs{}),
 	}
 }
@@ -128,6 +168,7 @@ func (self _ToUpper) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "upcase", args)()
 	arg := &_ToLowerArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -141,6 +182,7 @@ func (self _ToUpper) Call(
 func (self _ToUpper) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "upcase",
+		Doc:     "Returns the uppercase version of a string.",
 		ArgType: type_map.AddType(scope, &_ToLowerArgs{}),
 	}
 }
@@ -155,6 +197,8 @@ func (self _ToInt) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "atoi", args)()
+
 	arg := &_ToIntArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -187,10 +231,13 @@ func (self _ParseFloat) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "parse_float", args)()
+
 	arg := &_ToIntArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
-		scope.Log("atoi: %s", err.Error())
+		scope.Log("parse_float: %s", err.Error())
 		return vfilter.Null{}
 	}
 
@@ -236,9 +283,8 @@ func (self _Now) Call(
 
 func (self _Now) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "now",
-		Doc:     "Returns current time in seconds since epoch.",
-		ArgType: type_map.AddType(scope, &_ToIntArgs{}),
+		Name: "now",
+		Doc:  "Returns current time in seconds since epoch.",
 	}
 }
 
@@ -248,6 +294,7 @@ func (self _UTF16) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "utf16", args)()
 
 	arg := &_Base64DecodeArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -279,6 +326,7 @@ func (self _UTF16Encode) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "utf16_encode", args)()
 
 	arg := &_Base64EncodeArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -306,23 +354,6 @@ func (self _UTF16Encode) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *v
 	}
 }
 
-type _Scope struct{}
-
-func (self _Scope) Call(
-	ctx context.Context,
-	scope vfilter.Scope,
-	args *ordereddict.Dict) vfilter.Any {
-
-	return scope
-}
-
-func (self _Scope) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
-	return &vfilter.FunctionInfo{
-		Name: "scope",
-		Doc:  "return the scope.",
-	}
-}
-
 type _GetFunctionArgs struct {
 	Item    vfilter.Any `vfilter:"optional,field=item"`
 	Member  string      `vfilter:"optional,field=member"`
@@ -344,6 +375,8 @@ func (self _GetFunction) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "get", args)()
+
 	arg := &_GetFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -410,6 +443,8 @@ func (self _SetFunction) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "set", args)()
+
 	arg := &_SetFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -430,7 +465,9 @@ func (self _SetFunction) Call(
 
 	case ordereddict.Dict:
 		t.Set(arg.Field, arg.Value)
-		return t
+		res := ordereddict.NewDict()
+		res.MergeFrom(&t)
+		return res
 
 	case map[string]interface{}:
 		t[arg.Field] = arg.Value
@@ -448,8 +485,8 @@ func (self _SetFunction) Call(
 
 func init() {
 	vql_subsystem.RegisterFunction(&_Base64Decode{})
+	vql_subsystem.RegisterFunction(&_Base85Decode{})
 	vql_subsystem.RegisterFunction(&_Base64Encode{})
-	vql_subsystem.RegisterFunction(&_Scope{})
 	vql_subsystem.RegisterFunction(&_SetFunction{})
 	vql_subsystem.RegisterFunction(&_ToInt{})
 	vql_subsystem.RegisterFunction(&_ParseFloat{})

@@ -1,11 +1,13 @@
 package reporting
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
+	"google.golang.org/protobuf/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
@@ -47,7 +49,7 @@ func (self *BaseTemplateEngine) Close() {
 	self.Scope.Close()
 }
 
-func (self *BaseTemplateEngine) getFunction(a interface{}, b string,
+func (self *BaseTemplateEngine) GetFunction(a interface{}, b string,
 	opts ...interface{}) interface{} {
 
 	res := a
@@ -111,6 +113,8 @@ func (self *BaseTemplateEngine) Expand(values ...interface{}) interface{} {
 	return results
 }
 
+// TODO: Deprecate this - it is only used in the main dashboard now.
+
 // GenerateMonitoringDailyReport Generates a report for daily
 // monitoring reports.
 
@@ -151,11 +155,29 @@ func GenerateMonitoringDailyReport(template_engine TemplateEngine,
 	return result, nil
 }
 
+func truncateLongLines(in string) string {
+	q_lines := strings.Split(in, "\n")
+	for i := range q_lines {
+		if len(q_lines[i]) > 200 {
+			q_lines[i] = q_lines[i][:200] + " ..."
+		}
+	}
+	return strings.Join(q_lines, "\n")
+}
+
 func GenerateArtifactDescriptionReport(
+	ctx context.Context,
 	template_engine TemplateEngine,
 	config_obj *config_proto.Config) (
 	string, error) {
-	artifact := template_engine.GetArtifact()
+	artifact := proto.Clone(template_engine.GetArtifact()).(*artifacts_proto.Artifact)
+
+	// Ensure long lines in the artifact are truncated- This ensures
+	// the html DOM is not too large and keeps the browser fast.
+	for _, s := range artifact.Sources {
+		s.Query = truncateLongLines(s.Query)
+	}
+	artifact.Export = truncateLongLines(artifact.Export)
 
 	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
@@ -167,7 +189,7 @@ func GenerateArtifactDescriptionReport(
 		return "", err
 	}
 
-	template_artifact, pres := repository.Get(
+	template_artifact, pres := repository.Get(ctx,
 		config_obj, "Server.Internal.ArtifactDescription")
 	if pres {
 		template_engine.SetEnv("artifact", artifact)
@@ -319,6 +341,7 @@ func GenerateHuntReport(template_engine TemplateEngine,
 }
 
 func newBaseTemplateEngine(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	scope vfilter.Scope,
 	acl_manager vql_subsystem.ACLManager,
@@ -327,7 +350,7 @@ func newBaseTemplateEngine(
 	artifact_name string) (
 	*BaseTemplateEngine, error) {
 
-	artifact, pres := repository.Get(config_obj, artifact_name)
+	artifact, pres := repository.Get(ctx, config_obj, artifact_name)
 	if !pres {
 		return nil, fmt.Errorf(
 			"Artifact %v not known.", artifact_name)
@@ -353,7 +376,6 @@ func newBaseTemplateEngine(
 	scope.AppendVars(env)
 
 	// Closing the scope is deferred to closing the template.
-
 	return &BaseTemplateEngine{
 		Artifact:   artifact,
 		Repository: repository,

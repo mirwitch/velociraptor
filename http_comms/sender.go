@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -62,9 +62,7 @@ type Sender struct {
 	clock utils.Clock
 }
 
-func (self *Sender) CleanOnExit(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-
+func (self *Sender) CleanOnExit(ctx context.Context) {
 	<-ctx.Done()
 	self.urgent_buffer.Close()
 	self.ring_buffer.Close()
@@ -72,9 +70,7 @@ func (self *Sender) CleanOnExit(ctx context.Context, wg *sync.WaitGroup) {
 
 // Persistent loop to pump messages from the executor to the ring
 // buffer. This function should never exit in a real client.
-func (self *Sender) PumpExecutorToRingBuffer(
-	ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
+func (self *Sender) PumpExecutorToRingBuffer(ctx context.Context) {
 
 	// We should never exit from this.
 	defer self.maybeCallOnExit()
@@ -89,6 +85,7 @@ func (self *Sender) PumpExecutorToRingBuffer(
 			case <-ctx.Done():
 				return
 			case <-self.clock.After(self.minPoll):
+				executor.Nanny.UpdatePumpToRb()
 				continue
 			}
 		}
@@ -176,12 +173,7 @@ func (self *Sender) PumpExecutorToRingBuffer(
 // to send. This also manages timing and retransmissions - blocks if
 // the server is not available. This function should never exit in a
 // real client.
-func (self *Sender) PumpRingBufferToSendMessage(
-	ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	// We should never exit from this.
-	defer self.maybeCallOnExit()
+func (self *Sender) PumpRingBufferToSendMessage(ctx context.Context) {
 
 	compression := crypto_proto.PackedMessageList_ZCOMPRESSION
 	if self.config_obj.Client.DisableCompression {
@@ -197,7 +189,11 @@ func (self *Sender) PumpRingBufferToSendMessage(
 				self.config_obj.Client.MaxUploadSize, compression)
 			if len(compressed_messages) > 0 {
 				self.sendMessageList(ctx, compressed_messages, URGENT, compression)
-				self.urgent_buffer.Commit()
+				if utils.IsCtxDone(ctx) {
+					self.ring_buffer.Rollback()
+				} else {
+					self.ring_buffer.Commit()
+				}
 			}
 
 			// Grab some messages from the ring buffer.
@@ -209,9 +205,17 @@ func (self *Sender) PumpRingBufferToSendMessage(
 				// know the messages are sent so we can commit them
 				// from the ring buffer.
 				self.sendMessageList(ctx, compressed_messages, !URGENT, compression)
-				self.ring_buffer.Commit()
+				if utils.IsCtxDone(ctx) {
+					self.ring_buffer.Rollback()
+				} else {
+					self.ring_buffer.Commit()
+				}
 			}
 		}
+
+		self.mu.Lock()
+		release := self.release
+		self.mu.Unlock()
 
 		// Wait a minimum time before sending the next one to
 		// give the executor a chance to fill the queue.
@@ -221,7 +225,7 @@ func (self *Sender) PumpRingBufferToSendMessage(
 
 			// If the queue is too large we need to flush
 			// it out immediately so skip the wait below.
-		case <-self.release:
+		case <-release:
 			continue
 
 			// Wait a minimum amount of time to allow for
@@ -238,19 +242,47 @@ func (self *Sender) Start(
 	ctx context.Context, wg *sync.WaitGroup) {
 
 	wg.Add(1)
-	go self.PumpExecutorToRingBuffer(ctx, wg)
+	go func() {
+		defer wg.Done()
+		self.PumpExecutorToRingBuffer(ctx)
+
+	}()
 
 	wg.Add(1)
-	go self.PumpRingBufferToSendMessage(ctx, wg)
+	go func() {
+		defer wg.Done()
+
+		// We should never exit from this.
+		defer self.maybeCallOnExit()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			// Allow cancellation of the main loop. This will restart
+			// it as needed.
+			sub_ctx, cancel := context.WithCancel(ctx)
+			self.cancel = cancel
+
+			self.PumpRingBufferToSendMessage(sub_ctx)
+			cancel()
+		}
+	}()
 
 	wg.Add(1)
-	go self.CleanOnExit(ctx, wg)
+	go func() {
+		defer wg.Done()
+		self.CleanOnExit(ctx)
+	}()
 }
 
 func NewSender(
 	config_obj *config_proto.Config,
 	connector IConnector,
-	manager crypto.ICryptoManager,
+	crypto_manager crypto.ICryptoManager,
 	executor executor.Executor,
 	ring_buffer IRingBuffer,
 	enroller *Enroller,
@@ -267,7 +299,7 @@ func NewSender(
 
 	result := &Sender{
 		NotificationReader: NewNotificationReader(
-			config_obj, connector, manager,
+			config_obj, connector, crypto_manager,
 			executor, enroller, logger, name,
 			limiter, handler, on_exit, clock),
 		ring_buffer: ring_buffer,
@@ -275,10 +307,18 @@ func NewSender(
 		// Urgent buffer is an in memory ring buffer to handle
 		// urgent queries. This ensures urgent queries can
 		// skip the buffer ahead of normal queries.
-		urgent_buffer: NewRingBuffer(config_obj, 2*config_obj.Client.MaxUploadSize),
-		release:       make(chan bool),
-		clock:         clock,
+		urgent_buffer: NewRingBuffer(config_obj, executor.FlowManager(),
+			2*config_obj.Client.MaxUploadSize, "UrgentBuffer"),
+		release: make(chan bool),
+		clock:   clock,
 	}
+
+	executor.Nanny().RegisterOnWarnings(result.id, func() {
+		result.logger.Info(
+			"<red>%s: Nanny issued first warning!</> Restarting Sender comms",
+			result.name)
+		result.Restart()
+	})
 
 	return result, nil
 }

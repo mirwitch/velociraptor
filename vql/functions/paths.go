@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package functions
 
@@ -25,6 +25,7 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -33,7 +34,7 @@ import (
 type DirnameArgs struct {
 	Path     vfilter.Any `vfilter:"required,field=path,doc=Extract directory name of path"`
 	Sep      string      `vfilter:"optional,field=sep,doc=Separator to use (default /)"`
-	PathType string      `vfilter:"optional,field=path_type,doc=Type of path (e.g. 'windows,linux)"`
+	PathType string      `vfilter:"optional,field=path_type,doc=Type of path (e.g. windows, linux)"`
 }
 
 type DirnameFunction struct{}
@@ -41,6 +42,9 @@ type DirnameFunction struct{}
 func (self *DirnameFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "dirname", args)()
+
 	arg := &DirnameArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -70,6 +74,9 @@ type BasenameFunction struct{}
 func (self *BasenameFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "basename", args)()
+
 	arg := &DirnameArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -105,6 +112,9 @@ type RelnameFunction struct{}
 func (self *RelnameFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "relpath", args)()
+
 	arg := &RelnameFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -139,6 +149,9 @@ type PathJoinFunction struct{}
 func (self *PathJoinFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "path_join", args)()
+
 	arg := &PathJoinArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -155,7 +168,7 @@ func (self *PathJoinFunction) Call(ctx context.Context,
 	for _, c := range arg.Components {
 		os_path, err = parsePath(ctx, scope, c, arg.Sep, arg.PathType)
 		if err != nil {
-			scope.Log("dirname: %v", err)
+			scope.Log("path_join: %v", err)
 			return false
 		}
 
@@ -165,7 +178,7 @@ func (self *PathJoinFunction) Call(ctx context.Context,
 	if os_path == nil {
 		os_path, err = parsePath(ctx, scope, "", arg.Sep, arg.PathType)
 		if err != nil {
-			scope.Log("dirname: %v", err)
+			scope.Log("path_join: %v", err)
 			return false
 		}
 	}
@@ -192,6 +205,8 @@ type PathSplitFunction struct{}
 func (self *PathSplitFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "path_split", args)()
+
 	arg := &PathSplitArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -251,6 +266,7 @@ func parsePath(
 		return accessors.ParsePath(t, path_type)
 
 	default:
+		utils.DlvBreak()
 		return nil, fmt.Errorf(
 			"Path should be an OSPath or string, not %T", path)
 	}

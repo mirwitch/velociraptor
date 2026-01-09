@@ -1,7 +1,11 @@
 import React, { Component } from 'react';
 import './css/App.css';
+import qs from "qs";
+import _ from 'lodash';
 
+import PropTypes from 'prop-types';
 import VeloNavigator from './components/sidebar/navigator.jsx';
+import GlobalMessages from './components/users/global-messages.jsx';
 import VeloClientSearch from './components/clients/search.jsx';
 import VeloClientList from './components/clients/clients-list.jsx';
 import VeloHostInfo from './components/clients/host-info.jsx';
@@ -13,6 +17,7 @@ import VeloLiveClock from './components/utils/clock.jsx';
 import ClientFlowsView from './components/flows/client-flows-view.jsx';
 import ServerFlowsView from './components/flows/server-flows-view.jsx';
 import Notebook from './components/notebooks/notebook.jsx';
+import FullScreenTable from './components/notebooks/table_view.jsx';
 import FullScreenNotebook from './components/notebooks/full_notebook.jsx';
 import FullScreenHuntNotebook from './components/hunts/hunt-full-notebook.jsx';
 import FullScreenFlowNotebook from './components/flows/flow-full-notebook.jsx';
@@ -20,7 +25,6 @@ import ArtifactInspector from './components/artifacts/artifacts.jsx';
 import UserInspector from './components/users/user-inspector.jsx';
 import VeloHunts from './components/hunts/hunts.jsx';
 import UserDashboard from './components/sidebar/user-dashboard.jsx';
-import Form from 'react-bootstrap/Form';
 import UserLabel from './components/users/user-label.jsx';
 import EventMonitoring from './components/events/events.jsx';
 import SnackbarProvider from 'react-simple-snackbar';
@@ -30,10 +34,9 @@ import LoginPage from './components/welcome/login.jsx';
 import LogoffPage from './components/welcome/logoff.jsx';
 import KeyboardHelp from './components/core/keyboard-help.jsx';
 import { UserSettings } from './components/core/user.jsx';
-import { ContextMenuPopup } from './components/utils/context.jsx';
-import { Switch, Route } from "react-router-dom";
+import { Switch, Route, withRouter } from "react-router-dom";
 import { Join } from './components/utils/paths.jsx';
-import { withRouter }  from "react-router-dom";
+import SecretManager from './components/secrets/secrets.jsx';
 
 import Navbar from 'react-bootstrap/Navbar';
 import Nav from 'react-bootstrap/Nav';
@@ -42,12 +45,15 @@ import SidebarKeyNavigator from './components/sidebar/hotkeys.jsx';
 
 import './themes/no-theme.css';
 import './themes/veloci-light.css';
+import './themes/veloci-docs.css';
 import './themes/veloci-dark.css';
 import './themes/pink-light.css';
 import './themes/github-dimmed-dark.css';
-import './themes/ncurses.css';
+import './themes/ncurses-light.css';
+import './themes/ncurses-dark.css';
 import './themes/coolgray-dark.css';
 import './themes/midnight.css';
+import './themes/vscode-dark.css';
 
 /* This is the main App page.
 
@@ -67,6 +73,11 @@ import './themes/midnight.css';
 */
 
 class App extends Component {
+    static propTypes = {
+        history: PropTypes.any,
+        location: PropTypes.any,
+    }
+
     state = {
         client: {},
 
@@ -86,6 +97,9 @@ class App extends Component {
     };
 
     setClientSearch = (query) => {
+        if (!_.isString(query)) {
+            return;
+        }
         let now = new Date();
         this.setState({query: query, query_version: now.getTime()});
         this.props.history.push('/search/' + (query || "all"));
@@ -95,8 +109,19 @@ class App extends Component {
         this.setState({current_node: node});
     }
 
+    updateOrgIdFromUrl = ()=>{
+        let search = this.props.location.search.replace('?', '');
+        let params = qs.parse(search);
+        let org_id = params.org_id;
+        if (org_id) {
+            window.globals.OrgId = org_id;
+        }
+    }
+
     // Renders the entire app as normal.
     renderApp() {
+        this.updateOrgIdFromUrl();
+
         // We need to prepare a vfs_path for the navigator to link
         // to. Depending on the current node, we make a link with or
         // without a final "/".
@@ -114,19 +139,19 @@ class App extends Component {
 
         return <div>
                  <Navbar fixed="top" className="main-navbar justify-content-between">
-                   <Form inline>
+                   <div className="navigator-left-side form-inline">
                      <VeloNavigator
                        vfs_path={vfs_path}
                        client={this.state.client} />
-
                      <VeloClientSearch
-                       setSearch={this.setClientSearch}
-                     />
-                   </Form>
+                       setSearch={this.setClientSearch} />
+                   </div>
                    <VeloClientSummary
                      setClient={this.setClient}
                      client={this.state.client}/>
-                   <UserLabel className="navbar-text"/>
+                   <UserLabel
+                     setClient={this.setClient}
+                     className="navbar-text"/>
                  </Navbar>
                  <div id="content">
                    <Switch>
@@ -143,7 +168,10 @@ class App extends Component {
                          setClient={this.setClient}
                        />
                      </Route>
-                     <Route path="/artifacts/:artifact?">
+                     <Route path="/secrets/">
+                       <SecretManager/>
+                     </Route>
+                     <Route path="/artifacts/:artifact?/:action?">
                        <ArtifactInspector client={this.state.client}/>
                      </Route>
                      <Route path="/users/:user?" component={UserInspector}/>
@@ -163,7 +191,8 @@ class App extends Component {
                        <ServerInfo  />
                      </Route>
                      <Route path="/vfs/:client_id/:vfs_path(.*)">
-                       <ClientSetterFromRoute client={this.state.client} setClient={this.setClient} />
+                       <ClientSetterFromRoute client={this.state.client}
+                                              setClient={this.setClient} />
                        <VFSViewer client={this.state.client}
                                   selectedRow={this.state.selected_row}
                                   updateCurrentNode={this.updateCurrentNode}
@@ -196,7 +225,9 @@ class App extends Component {
                    </Switch>
                  </div>
                  <Navbar fixed="bottom" className="app-footer justify-content-between ">
-                   <Nav></Nav>
+                   <Nav>
+                     <GlobalMessages/>
+                   </Nav>
                    <Nav>
                      <VeloLiveClock className="float-right" />
                      <Snackbar />
@@ -221,13 +252,15 @@ class App extends Component {
                     <Route path="/fullscreen/collected/:client_id/:flow_id/notebook">
                       <FullScreenFlowNotebook />
                     </Route>
+                    <Route path="/fullscreen/table/:state">
+                      <FullScreenTable />
+                    </Route>
                     <Route>
                       { this.renderApp() }
                     </Route>
                   </Switch>
                   <KeyboardHelp />
                 </SnackbarProvider>
-                <ContextMenuPopup/>
               </UserSettings>
             </div>
         );

@@ -12,10 +12,13 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/services/acl_manager"
+	"www.velocidex.com/golang/velociraptor/services/audit_manager"
+	"www.velocidex.com/golang/velociraptor/services/backup"
 	"www.velocidex.com/golang/velociraptor/services/broadcast"
 	"www.velocidex.com/golang/velociraptor/services/client_info"
 	"www.velocidex.com/golang/velociraptor/services/client_monitoring"
 	"www.velocidex.com/golang/velociraptor/services/ddclient"
+	"www.velocidex.com/golang/velociraptor/services/exports"
 	"www.velocidex.com/golang/velociraptor/services/frontend"
 	"www.velocidex.com/golang/velociraptor/services/hunt_dispatcher"
 	"www.velocidex.com/golang/velociraptor/services/hunt_manager"
@@ -29,6 +32,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/services/notifications"
 	"www.velocidex.com/golang/velociraptor/services/repository"
 	"www.velocidex.com/golang/velociraptor/services/sanity"
+	"www.velocidex.com/golang/velociraptor/services/scheduler"
+	"www.velocidex.com/golang/velociraptor/services/secrets"
 	"www.velocidex.com/golang/velociraptor/services/server_artifacts"
 	"www.velocidex.com/golang/velociraptor/services/server_monitoring"
 	"www.velocidex.com/golang/velociraptor/services/users"
@@ -39,22 +44,27 @@ import (
 type ServiceContainer struct {
 	mu sync.Mutex
 
-	frontend             services.FrontendManager
-	journal              services.JournalService
-	client_info_manager  services.ClientInfoManager
-	indexer              services.Indexer
-	broadcast            services.BroadcastService
-	inventory            services.Inventory
-	vfs_service          services.VFSService
-	labeler              services.Labeler
-	repository           services.RepositoryManager
-	hunt_dispatcher      services.IHuntDispatcher
-	launcher             services.Launcher
-	notebook_manager     services.NotebookManager
-	client_event_manager services.ClientEventTable
-	server_event_manager services.ServerEventManager
-	notifier             services.Notifier
-	acl_manager          services.ACLManager
+	frontend                services.FrontendManager
+	journal                 services.JournalService
+	client_info_manager     services.ClientInfoManager
+	indexer                 services.Indexer
+	broadcast               services.BroadcastService
+	inventory               services.Inventory
+	vfs_service             services.VFSService
+	labeler                 services.Labeler
+	repository              services.RepositoryManager
+	hunt_dispatcher         services.IHuntDispatcher
+	launcher                services.Launcher
+	notebook_manager        services.NotebookManager
+	scheduler               services.Scheduler
+	client_event_manager    services.ClientEventTable
+	server_event_manager    services.ServerEventManager
+	server_artifact_manager services.ServerArtifactRunner
+	notifier                services.Notifier
+	acl_manager             services.ACLManager
+	secrets                 services.SecretsService
+	backups                 services.BackupService
+	export_manager          services.ExportManager
 }
 
 func (self *ServiceContainer) MockFrontendManager(svc services.FrontendManager) {
@@ -96,6 +106,17 @@ func (self *ServiceContainer) ServerEventManager() (services.ServerEventManager,
 	return self.server_event_manager, nil
 }
 
+func (self *ServiceContainer) ServerArtifactRunner() (services.ServerArtifactRunner, error) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self.server_artifact_manager == nil {
+		return nil, errors.New("Server Artifact Runner service not initialized")
+	}
+
+	return self.server_artifact_manager, nil
+}
+
 func (self *ServiceContainer) ClientEventManager() (services.ClientEventTable, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
@@ -116,6 +137,21 @@ func (self *ServiceContainer) NotebookManager() (services.NotebookManager, error
 	}
 
 	return self.notebook_manager, nil
+}
+
+func (self *ServiceContainer) SecretsService() (services.SecretsService, error) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self.secrets == nil {
+		return nil, errors.New("Secrets service not initialized")
+	}
+
+	return self.secrets, nil
+}
+
+func (self *ServiceContainer) AuditManager() (services.AuditManager, error) {
+	return &audit_manager.AuditManager{}, nil
 }
 
 func (self *ServiceContainer) Launcher() (services.Launcher, error) {
@@ -173,6 +209,17 @@ func (self *ServiceContainer) VFSService() (services.VFSService, error) {
 	return self.vfs_service, nil
 }
 
+func (self *ServiceContainer) Scheduler() (services.Scheduler, error) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self.scheduler == nil {
+		return nil, errors.New("Scheduler service not initialized")
+	}
+
+	return self.scheduler, nil
+}
+
 func (self *ServiceContainer) Labeler() (services.Labeler, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
@@ -224,6 +271,26 @@ func (self *ServiceContainer) BroadcastService() (services.BroadcastService, err
 	return self.broadcast, nil
 }
 
+func (self *ServiceContainer) ExportManager() (services.ExportManager, error) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self.export_manager == nil {
+		return nil, errors.New("ExportManager Service not ready")
+	}
+	return self.export_manager, nil
+}
+
+func (self *ServiceContainer) BackupService() (services.BackupService, error) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self.backups == nil {
+		return nil, errors.New("Backup Service not ready")
+	}
+	return self.backups, nil
+}
+
 func (self *ServiceContainer) ACLManager() (services.ACLManager, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
@@ -238,9 +305,14 @@ func (self *ServiceContainer) ACLManager() (services.ACLManager, error) {
 // manager. This function is used both in the client and the server to
 // start all the needed services.
 func (self *OrgManager) startOrg(org_record *api_proto.OrgRecord) (err error) {
+
+	org_record.Id = utils.NormalizedOrgId(org_record.Id)
+
 	org_config := self.makeNewConfigObj(org_record)
 	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 	logger.Info("Starting services for %v", services.GetOrgName(org_config))
+
+	orgStartCounter.Inc()
 
 	org_ctx := &OrgContext{
 		record:     org_record,
@@ -254,9 +326,10 @@ func (self *OrgManager) startOrg(org_record *api_proto.OrgRecord) (err error) {
 	// not exit the org manager until they all shut down properly.
 	self.parent_wg.Add(1)
 	go func() {
+		defer self.parent_wg.Done()
+
 		<-org_ctx.sm.Ctx.Done()
 		org_ctx.sm.Wg.Wait()
-		self.parent_wg.Done()
 	}()
 
 	self.mu.Lock()
@@ -305,10 +378,17 @@ func (self *OrgManager) startRootOrgServices(
 		return err
 	}
 
-	err = datastore.StartRemoteDatastore(
+	err = datastore.StartDatastore(
 		ctx, wg, org_config)
 	if err != nil {
 		return err
+	}
+
+	if spec.SchedulerService {
+		err := scheduler.StartSchedulerService(ctx, wg, org_config)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -327,6 +407,12 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 		spec = org_config.Services
 	}
 
+	if spec.BackupService {
+		service_container.mu.Lock()
+		service_container.backups = backup.NewBackupService(ctx, wg, org_config)
+		service_container.mu.Unlock()
+	}
+
 	if spec.FrontendServer {
 		f, err := frontend.NewFrontendService(ctx, wg, org_config)
 		if err != nil {
@@ -337,28 +423,6 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 		service_container.mu.Unlock()
 	}
 
-	// Now start service on the root org
-	if utils.IsRootOrg(org_id) {
-		err := self.startRootOrgServices(ctx, wg, spec, org_config, service_container)
-		if err != nil {
-			return err
-		}
-	}
-
-	if spec.UserManager {
-		m, err := acl_manager.NewACLManager(ctx, wg, org_config)
-		if err != nil {
-			return err
-		}
-
-		service_container.mu.Lock()
-		service_container.acl_manager = m
-		service_container.mu.Unlock()
-	}
-
-	// Now start the services for this org. Services depend on other
-	// services so they need to be accessible as soon as they are
-	// ready.
 	if spec.JournalService {
 		j, err := journal.NewJournalService(ctx, wg, org_config)
 		if err != nil {
@@ -370,6 +434,38 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 		service_container.mu.Unlock()
 	}
 
+	// Now start service on the root org
+	if utils.IsRootOrg(org_id) {
+		err := self.startRootOrgServices(ctx, wg, spec, org_config, service_container)
+		if err != nil {
+			return err
+		}
+	}
+
+	// ACL manager exist for each org
+	if spec.UserManager {
+		m, err := acl_manager.NewACLManager(ctx, wg, org_config)
+		if err != nil {
+			return err
+		}
+
+		service_container.mu.Lock()
+		service_container.acl_manager = m
+		service_container.mu.Unlock()
+
+		s, err := secrets.NewSecretsService(ctx, wg, org_config)
+		if err != nil {
+			return err
+		}
+
+		service_container.mu.Lock()
+		service_container.secrets = s
+		service_container.mu.Unlock()
+	}
+
+	// Now start the services for this org. Services depend on other
+	// services so they need to be accessible as soon as they are
+	// ready.
 	if spec.NotificationService {
 		n, err := notifications.NewNotificationService(ctx, wg, org_config)
 		if err != nil {
@@ -409,6 +505,19 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 		service_container.mu.Unlock()
 	}
 
+	// Inventory service needs to start before we import built in
+	// artifacts so they can add their tool dependencies.
+	if spec.InventoryService {
+		i, err := inventory.NewInventoryService(ctx, wg, org_config)
+		if err != nil {
+			return err
+		}
+
+		service_container.mu.Lock()
+		service_container.inventory = i
+		service_container.mu.Unlock()
+	}
+
 	if spec.RepositoryManager {
 		repo_manager, err := repository.NewRepositoryManager(
 			ctx, wg, org_config)
@@ -416,27 +525,26 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 			return err
 		}
 
-		err = repository.LoadArtifactsFromConfig(repo_manager, org_config)
-		if err != nil {
-			return err
-		}
-
 		// The Root org will contain all the built in artifacts
-		if org_id == "" {
-			// Assume the built in artifacts are OK so we dont need to
-			// validate them at runtime.
+		if utils.IsRootOrg(org_id) {
+			// These artifacts are compiled in.
 			err = repository.LoadBuiltInArtifacts(ctx, org_config,
-				repo_manager.(*repository.RepositoryManager),
-				!services.ValidateArtifact)
+				repo_manager.(*repository.RepositoryManager))
 			if err != nil {
 				return err
 			}
 
-			err = repository.LoadArtifactsFromConfig(
-				repo_manager.(*repository.RepositoryManager), org_config)
+			global_repository, err := repo_manager.GetGlobalRepository(org_config)
 			if err != nil {
 				return err
 			}
+
+			_, err = repository.InitializeGlobalRepositoryFromFilestore(
+				ctx, org_config, global_repository)
+			if err != nil {
+				return err
+			}
+
 		} else {
 			root_org_config, _ := self.GetOrgConfig("")
 			root_repo_manager, _ := self.Services("").RepositoryManager()
@@ -454,20 +562,15 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 			}
 		}
 
-		service_container.mu.Lock()
-		service_container.repository = repo_manager
-		service_container.mu.Unlock()
-	}
-
-	if spec.InventoryService {
-		i, err := inventory.NewInventoryService(
-			ctx, wg, org_config)
+		// Load config artifacts last so they can override all the
+		// other artifacts.
+		err = repository.LoadArtifactsFromConfig(repo_manager, org_config)
 		if err != nil {
 			return err
 		}
 
 		service_container.mu.Lock()
-		service_container.inventory = i
+		service_container.repository = repo_manager
 		service_container.mu.Unlock()
 	}
 
@@ -478,8 +581,15 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 			return err
 		}
 
+		export_manager, err := exports.NewExportManager(
+			ctx, wg, org_config)
+		if err != nil {
+			return err
+		}
+
 		service_container.mu.Lock()
 		service_container.hunt_dispatcher = hd
+		service_container.export_manager = export_manager
 		service_container.mu.Unlock()
 	}
 
@@ -501,7 +611,10 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 	}
 
 	if spec.ClientInfo {
-		c := client_info.NewClientInfoManager(org_config)
+		c, err := client_info.NewClientInfoManager(ctx, wg, org_config)
+		if err != nil {
+			return err
+		}
 		err = c.Start(ctx, org_config, wg)
 		if err != nil {
 			return err
@@ -559,10 +672,13 @@ func (self *OrgManager) startOrgFromContext(org_ctx *OrgContext) (err error) {
 	}
 
 	if spec.ServerArtifacts {
-		err = server_artifacts.NewServerArtifactService(ctx, wg, org_config)
+		sm, err := server_artifacts.NewServerArtifactService(ctx, wg, org_config)
 		if err != nil {
 			return err
 		}
+		service_container.mu.Lock()
+		service_container.server_artifact_manager = sm
+		service_container.mu.Unlock()
 	}
 
 	if spec.ClientMonitoring {
@@ -611,37 +727,21 @@ func maybeFlushFilesOnClose(
 		return nil
 	}
 
-	// Flush the filestore if needed. Not all filestores need
-	// flushing.
-	file_store_factory := file_store.GetFileStore(org_config)
-	flusher, ok := file_store_factory.(Flusher)
-	if ok {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-ctx.Done()
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}()
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
 
-	db, err := datastore.GetDB(org_config)
-	if err != nil {
-		return err
-	}
-
-	flusher, ok = db.(Flusher)
-	if ok {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-ctx.Done()
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}()
-	}
+		logger := logging.GetLogger(org_config, &logging.FrontendComponent)
+		err := file_store.FlushFilestore(org_config)
+		if err != nil {
+			logger.Error("<red>maybeFlushFilesOnClose FlushFilestore</> %v", err)
+		}
+		err = datastore.FlushDatastore(org_config)
+		if err != nil {
+			logger.Error("<red>maybeFlushFilesOnClose FlushDatastore</> %v", err)
+		}
+	}()
 
 	return nil
 }
@@ -649,6 +749,8 @@ func maybeFlushFilesOnClose(
 func (self *OrgManager) Services(org_id string) services.ServiceContainer {
 	self.mu.Lock()
 	defer self.mu.Unlock()
+
+	org_id = utils.NormalizedOrgId(org_id)
 
 	service_container, pres := self.orgs[org_id]
 	if !pres {

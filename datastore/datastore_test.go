@@ -1,9 +1,10 @@
-package datastore
+package datastore_test
 
 import (
 	"errors"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
+	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/utils"
@@ -39,7 +41,7 @@ type BaseTestSuite struct {
 	suite.Suite
 
 	config_obj *config_proto.Config
-	datastore  DataStore
+	datastore  datastore.DataStore
 }
 
 func (self BaseTestSuite) TestSetGetJSON() {
@@ -191,9 +193,9 @@ func (self BaseTestSuite) TestListChildren() {
 		"/a/b/c/3"}, asStrings(children))
 
 	visited := []api.DSPathSpec{}
-	Walk(self.config_obj, self.datastore,
+	datastore.Walk(self.config_obj, self.datastore,
 		path_specs.NewSafeDatastorePath("a", "b"),
-		WalkWithoutDirectories,
+		datastore.WalkWithoutDirectories,
 		func(path_name api.DSPathSpec) error {
 			visited = append(visited, path_name)
 			return nil
@@ -233,9 +235,9 @@ func (self BaseTestSuite) TestListChildrenTypes() {
 		"/a/b/c/3:dir"}, asStringsWithTypes(children))
 
 	visited := []api.DSPathSpec{}
-	Walk(self.config_obj, self.datastore,
+	datastore.Walk(self.config_obj, self.datastore,
 		path_specs.NewSafeDatastorePath("a", "b"),
-		WalkWithoutDirectories,
+		datastore.WalkWithoutDirectories,
 		func(path_name api.DSPathSpec) error {
 			visited = append(visited, path_name)
 			return nil
@@ -281,9 +283,9 @@ func (self BaseTestSuite) TestUnsafeListChildren() {
 		"/a/b:b/c:b/3"}, asStrings(children))
 
 	visited := []api.DSPathSpec{}
-	Walk(self.config_obj, self.datastore,
+	datastore.Walk(self.config_obj, self.datastore,
 		root,
-		WalkWithoutDirectories,
+		datastore.WalkWithoutDirectories,
 		func(path_name api.DSPathSpec) error {
 			visited = append(visited, path_name)
 			return nil
@@ -327,8 +329,46 @@ func (self BaseTestSuite) TestListChildrenSubdirs() {
 		"/Root/item"}, asStrings(children))
 }
 
+// Make sure all the other data stores handle very long filenames
+func (self BaseTestSuite) TestVeryLongFilename() {
+	message := &crypto_proto.VeloMessage{Source: "Server"}
+	very_long_filename := strings.Repeat("Very Long Filename", 100)
+	assert.Equal(self.T(), len(very_long_filename), 1800)
+
+	path := path_specs.NewUnsafeDatastorePath("longfiles", very_long_filename)
+	filename := datastore.AsDatastoreFilename(
+		self.datastore, self.config_obj, path)
+
+	// Filename should be smaller than the read filename because it is
+	// compressed into a hash.
+	assert.True(self.T(), len(filename) < 250)
+	err := self.datastore.SetSubject(
+		self.config_obj, path, message)
+	assert.NoError(self.T(), err)
+
+	read_message := &crypto_proto.VeloMessage{}
+	err = self.datastore.GetSubject(self.config_obj,
+		path, read_message)
+	assert.NoError(self.T(), err)
+
+	assert.Equal(self.T(), message.Source, read_message.Source)
+
+	// Now test that ListChildren works properly.
+	children, err := self.datastore.ListChildren(
+		self.config_obj, path_specs.NewUnsafeDatastorePath("longfiles"))
+	assert.NoError(self.T(), err)
+
+	results := []string{}
+	for _, i := range children {
+		results = append(results, i.Base())
+
+		// Make sure the resulting filename is very long
+		assert.Equal(self.T(), i.Base(), very_long_filename)
+	}
+}
+
 func benchmarkSearchClient(b *testing.B,
-	data_store DataStore,
+	data_store datastore.DataStore,
 	config_obj *config_proto.Config) {
 
 }

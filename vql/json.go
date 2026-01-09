@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Velocidex/json"
+	"www.velocidex.com/golang/velociraptor/constants"
 	vjson "www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -26,7 +27,7 @@ func EncOptsFromScope(scope vfilter.Scope) *json.EncOpts {
 
 	// If the scope contains a TZ variable, then we will use that
 	// instead.
-	location_name, pres := scope.Resolve("TZ")
+	location_name, pres := scope.Resolve(constants.TZ)
 	if pres {
 		location_str, ok := location_name.(string)
 		if ok {
@@ -67,6 +68,27 @@ func MarshalJson(scope vfilter.Scope) vfilter.RowEncoder {
 func MarshalJsonIndent(scope vfilter.Scope) vfilter.RowEncoder {
 	opts := EncOptsFromScope(scope)
 	return func(rows []vfilter.Row) ([]byte, error) {
+		b, err := json.MarshalWithOptions(rows, opts)
+		if err != nil {
+			return nil, err
+		}
+		var buf bytes.Buffer
+		err = json.Indent(&buf, b, "", " ")
+		if err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+}
+
+func MarshalJsonIndentIgnoreEmpty(scope vfilter.Scope) vfilter.RowEncoder {
+	opts := EncOptsFromScope(scope)
+	return func(rows []vfilter.Row) ([]byte, error) {
+		// Ignore empty rows
+		if len(rows) == 0 {
+			return nil, nil
+		}
+
 		b, err := json.MarshalWithOptions(rows, opts)
 		if err != nil {
 			return nil, err

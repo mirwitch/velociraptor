@@ -1,14 +1,17 @@
 package client
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/x509"
 
 	"github.com/Velocidex/ttlcache/v2"
 	"github.com/go-errors/errors"
+	"golang.org/x/time/rate"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 type ClientCryptoManager struct {
@@ -30,7 +33,8 @@ func (self *ClientCryptoManager) AddCertificate(
 
 	// Verify that the certificate is signed by the CA.
 	opts := x509.VerifyOptions{
-		Roots: self.caPool,
+		Roots:       self.caPool,
+		CurrentTime: utils.GetTime().Now(),
 	}
 
 	_, err = server_cert.Verify(opts)
@@ -47,12 +51,14 @@ func (self *ClientCryptoManager) AddCertificate(
 
 	// Remove the cached key for this server. This is essential to
 	// ensure servers can rotate their keys.
-	self.cipher_lru.Delete(server_name)
+	self.cipher_lru.DeleteCipher(server_name)
 
 	return server_name, nil
 }
 
-func NewClientCryptoManager(config_obj *config_proto.Config, client_private_key_pem []byte) (
+func NewClientCryptoManager(
+	ctx context.Context,
+	config_obj *config_proto.Config, client_private_key_pem []byte) (
 	*ClientCryptoManager, error) {
 	private_key, err := crypto_utils.ParseRsaPrivateKeyFromPemStr(client_private_key_pem)
 	if err != nil {
@@ -75,7 +81,14 @@ func NewClientCryptoManager(config_obj *config_proto.Config, client_private_key_
 		lru_size = config_obj.Frontend.Resources.ExpectedClients
 	}
 
-	return &ClientCryptoManager{CryptoManager{
+	limit_rate := int64(100)
+	if config_obj.Frontend != nil &&
+		config_obj.Frontend.Resources != nil &&
+		config_obj.Frontend.Resources.EnrollmentsPerSecond > 0 {
+		limit_rate = config_obj.Frontend.Resources.EnrollmentsPerSecond
+	}
+
+	result := &ClientCryptoManager{CryptoManager{
 		client_id:           client_id,
 		private_key:         private_key,
 		Resolver:            NewInMemoryPublicKeyResolver(),
@@ -83,5 +96,13 @@ func NewClientCryptoManager(config_obj *config_proto.Config, client_private_key_
 		unauthenticated_lru: ttlcache.NewCache(),
 		caPool:              roots,
 		logger:              logger,
-	}}, nil
+		limiter:             rate.NewLimiter(rate.Limit(limit_rate), 100),
+	}}
+
+	go func() {
+		<-ctx.Done()
+		result.unauthenticated_lru.Close()
+	}()
+
+	return result, nil
 }

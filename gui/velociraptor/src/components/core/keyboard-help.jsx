@@ -31,16 +31,23 @@ const helpTextCol1 = [
 
 const helpTextCol2 = [
     [T("Collected Artifacts"), [
-        ["n", T("Select next collection")],
-        ["p", T("Select previous collection")],
-        ["r", T("View selected collection results")],
-        ["o", T("View selected collection overview")],
-        ["l", T("View selected collection logs")],
-        ["u", T("View selected collection uploaded files")],
+        ["alt+r", T("View selected collection results")],
+        ["alt+o", T("View selected collection overview")],
+        ["alt+l", T("View selected collection logs")],
+        ["alt+u", T("View selected collection uploaded files")],
+        ["alt+b", T("View selected collection notebook")],
     ]],
     [T("Editor shortcuts"), [
         ["ctrl+,", T("Popup the editor configuration dialog")],
         ["ctrl+enter", T("Save editor contents")],
+    ]],
+    [T("Table navigation"), [
+        ["n", T("Go to next page")],
+        ["p", T("Go to previous page")],
+        ["j", T("Move to previous selection")],
+        ["k", T("Move to next selection")],
+        ["Home", T("Move to first page")],
+        ["End", T("Move to last page")],
     ]],
 ];
 
@@ -73,7 +80,7 @@ export default class KeyboardHelp extends React.PureComponent {
         return results;
     }
 
-    makeColumn = (specs) => {
+    makeColumn = (specs, colnum) => {
         return <table>
                  <tbody>
                    { _.map(specs, (spec, v)=>{
@@ -81,18 +88,18 @@ export default class KeyboardHelp extends React.PureComponent {
                        let desc = spec[1];
 
                        return (<React.Fragment key={v}>
-                                <tr><td></td>
-                                  <td className="heading">
-                                    {T(title)}
-                                  </td></tr>
-                                { _.map(desc, (x, i)=>{
-                                    return <tr key={i}>
-                                             <td className="key">
+                                 <tr><td></td>
+                                   <td className="heading">
+                                     {T(title)}
+                                   </td></tr>
+                                 { _.map(desc, (x, i)=>{
+                                     return <tr key={"X" + colnum + v+i}>
+                                              <td className="key">
                                                 {this.renderKey(x[0])}  :
                                               </td>
                                               <td className="desc">{x[1]}</td>
                                             </tr>;
-                                })}
+                                 })}
                                </React.Fragment>);
                    })}
                  </tbody>
@@ -111,34 +118,36 @@ export default class KeyboardHelp extends React.PureComponent {
                              }} />
               { this.state.showHelp &&
                 <>
-                <GlobalHotKeys keyMap={{ESCAPE: "esc"}}
-                         handlers={{
-                             ESCAPE: ()=>this.setState({showHelp: false}),
-                         }} />
-                <div className="keyboard-help"
-                     onClick={()=>this.setState({showHelp: false})}>
-                  <div className="keyboard-help-content">
-                    <table className="page-heading">
-                      <tbody>
-                        <tr><td>{T("Keyboard shortcuts")}</td>
-                          <td><Button size="lg"
-                                className="float-right"
-                                variant="link">
-                                <FontAwesomeIcon icon="window-close"/>
-                              </Button></td>
-                        </tr>
-                      </tbody>
-                    </table>
-                    <div className="help-content">
-                      <table cellPadding="0">
+                  <GlobalHotKeys keyMap={{ESCAPE: "esc"}}
+                                 handlers={{
+                                     ESCAPE: ()=>this.setState({showHelp: false}),
+                                 }} />
+                  <div className="keyboard-help"
+                       role="button" tabIndex={0}
+                       onKeyPress={()=>this.setState({showHelp: false})}
+                       onClick={()=>this.setState({showHelp: false})}>
+                    <div className="keyboard-help-content">
+                      <table className="page-heading">
                         <tbody>
-                          <tr>
-                            <td className="column">
-                              { this.makeColumn(helpTextCol1)}
-                            </td>
-                            <td className="column">
-                              { this.makeColumn(helpTextCol2)}
-                            </td>
+                          <tr><td>{T("Keyboard shortcuts")}</td>
+                            <td><Button size="lg"
+                                        className="float-right"
+                                        variant="link">
+                                  <FontAwesomeIcon icon="window-close"/>
+                                </Button></td>
+                          </tr>
+                        </tbody>
+                      </table>
+                      <div className="help-content">
+                        <table cellPadding="0">
+                          <tbody>
+                            <tr>
+                              <td className="column">
+                                { this.makeColumn(helpTextCol1, 0)}
+                              </td>
+                              <td className="column">
+                                { this.makeColumn(helpTextCol2, 1)}
+                              </td>
                           </tr>
                         </tbody>
                       </table>

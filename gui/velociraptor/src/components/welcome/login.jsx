@@ -6,12 +6,13 @@ import Button from 'react-bootstrap/Button';
 import Row from 'react-bootstrap/Row';
 import Col from 'react-bootstrap/Col';
 import Card from 'react-bootstrap/Card';
-
+import api from '../core/api-service.jsx';
 import "./login.css";
 import github_logo from "./Github-octocat-icon-vector-01.svg";
 import google_logo from "./Google-icon-vector-04.svg";
 import azure_logo from "./Microsoft_Azure_Logo.svg";
 import openid_logo from "./OpenID_logo.svg";
+import T from '../i8n/i8n.jsx';
 
 
 class Authenticator extends Component {
@@ -24,20 +25,20 @@ class Authenticator extends Component {
         switch(provider_name) {
         case "Google":
             return <img className="logo" alt='google logo'
-                        src={google_logo}/>;
+                        src={api.src_of(google_logo)}/>;
         case "Github":
             return <img className="logo" alt='github logo'
-                        src={github_logo}/>;
+                        src={api.src_of(github_logo)}/>;
         case "Microsoft":
             return <img className="logo" alt='microsoft logo'
-                        src={azure_logo}/>;
+                        src={api.src_of(azure_logo)}/>;
         default:
             if (this.props.param.ProviderAvatar) {
                 return <img className="logo" alt='oidc logo'
                             src={this.props.param.ProviderAvatar}/>;
             }
             return <img className="logo" alt='oidc logo'
-                        src={openid_logo}/>;
+                        src={api.src_of(openid_logo)}/>;
         }
     }
 
@@ -48,7 +49,7 @@ class Authenticator extends Component {
               <Col sm="6">
                 <Button
                   variant="outline" className="login">
-                  <a href={this.props.param.LoginURL}>
+                  <a href={api.href(this.props.param.LoginURL)}>
                     <Row>
                     <Col sm="1">
                       {this.getIcon()}
@@ -79,10 +80,10 @@ export default class LoginPage extends Component {
                    enforceFocus={true}
                    scrollable={true}
                    onHide={() => {
-                       window.location = '/';
+                       window.location = api.href("/app/index.html");
                    }}>
               <Modal.Header closeButton>
-                <Modal.Title>Velociraptor Login</Modal.Title>
+                <Modal.Title>{T("Velociraptor Login")}</Modal.Title>
               </Modal.Header>
               <Modal.Body className="tool-viewer">
 

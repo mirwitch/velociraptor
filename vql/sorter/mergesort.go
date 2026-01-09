@@ -3,7 +3,6 @@ package sorter
 import (
 	"bufio"
 	"context"
-	"io/ioutil"
 	"os"
 	"sort"
 	"sync"
@@ -11,6 +10,8 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
+	utils_tempfile "www.velocidex.com/golang/velociraptor/utils/tempfile"
 	"www.velocidex.com/golang/vfilter"
 	vsort "www.velocidex.com/golang/vfilter/sort"
 	"www.velocidex.com/golang/vfilter/types"
@@ -85,7 +86,6 @@ type MergeSorterCtx struct {
 
 	// Fallback size to files
 	ChunkSize int
-	idx       int
 }
 
 func (self *MergeSorterCtx) addProvider(p provider) {
@@ -111,49 +111,20 @@ func (self *MergeSorterCtx) Feed(row types.Row) {
 			Desc:    memory_sorter.Desc,
 		}
 
-		// Do this in parallel.
-		self.wg.Add(1)
-		go func() {
-			defer self.wg.Done()
+		new_data_file := newDataFile(
+			memory_sorter.Scope,
+			memory_sorter.Items,
+			memory_sorter.OrderBy)
 
-			self.mu.Lock()
-			defer self.mu.Unlock()
-
-			new_data_file := newDataFile(
-				memory_sorter.Scope,
-				memory_sorter.Items,
-				memory_sorter.OrderBy)
-
-			self.addProvider(new_data_file)
-		}()
+		self.addProvider(new_data_file)
 	}
-}
-
-func (self *MergeSorterCtx) Close() {}
-
-func (self *MergeSorterCtx) Consume() {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	self.idx++
-}
-
-// Returns the last row
-func (self *MergeSorterCtx) Last() types.Row {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	if self.idx < len(self.memory_sorter.Items) {
-		return self.memory_sorter.Items[self.idx]
-	}
-	return nil
 }
 
 func (self *MergeSorterCtx) Merge(ctx context.Context, output_chan chan types.Row) {
 	// Close all the files when we are done.
 	defer func() {
 		self.mu.Lock()
-		self.mu.Unlock()
+		defer self.mu.Unlock()
 
 		for _, provider := range self.merge_files {
 			provider.Close()
@@ -162,9 +133,6 @@ func (self *MergeSorterCtx) Merge(ctx context.Context, output_chan chan types.Ro
 
 	// Wait for all the chunks to be ready.
 	self.wg.Wait()
-
-	self.mu.Lock()
-	self.mu.Unlock()
 
 	// Sort the last in-memory chunk and add it as a provider.
 	if len(self.memory_sorter.Items) > 0 {
@@ -194,6 +162,11 @@ func (self *MergeSorterCtx) Merge(ctx context.Context, output_chan chan types.Ro
 			if !pres {
 				self.memory_sorter.Scope.Log("Order by column %v not present in row",
 					self.memory_sorter.OrderBy)
+			}
+
+			// Treat NULL as a string so they sort properly.
+			if utils.IsNil(value) {
+				value = ""
 			}
 
 			// smallest_value is not set yet.
@@ -259,21 +232,40 @@ type dataFile struct {
 }
 
 func (self *dataFile) Close() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self._Close()
+}
+
+func (self *dataFile) _Close() {
 	if self.fd != nil {
 		self.fd.Close()
-		os.Remove(self.fd.Name())
+		err := os.Remove(self.fd.Name())
+		utils_tempfile.RemoveTmpFile(self.fd.Name(), err)
+
 		self.fd = nil
 		self.reader = nil
 	}
 }
 
 func (self *dataFile) Last() types.Row {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
 	return self.lastValue
 }
 
 // Called when the current value is consumed - read the next row from
 // the file and sets the current value.
 func (self *dataFile) Consume() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self._Consume()
+}
+
+func (self *dataFile) _Consume() {
 	if self.reader == nil {
 		return
 	}
@@ -282,7 +274,7 @@ func (self *dataFile) Consume() {
 	if err != nil {
 		// File is exhausted, close it and reset.
 		self.lastValue = nil
-		self.Close()
+		self._Close()
 		return
 	}
 
@@ -290,51 +282,65 @@ func (self *dataFile) Consume() {
 	err = item.UnmarshalJSON(row_data)
 	if err != nil {
 		self.lastValue = nil
-		self.Close()
+		self._Close()
 		return
 	}
 
 	self.lastValue = item
 }
 
+// Initialize the file by writing it to storage. Writing is done in the background.
+func (self *dataFile) prepareFile(scope vfilter.Scope, items []vfilter.Row) {
+
+	// We hold the lock for the duration of writing the file until we
+	// are ready.
+	self.mu.Lock()
+	go func() {
+		defer self.mu.Unlock()
+
+		tmpfile, err := tempfile.TempFile("vql")
+		if err != nil {
+			scope.Log("Unable to create tempfile: %v", err)
+			return
+		}
+
+		utils_tempfile.AddTmpFile(tmpfile.Name())
+
+		// Serialize all the rows into the file.
+		serialized, err := json.MarshalJsonl(items)
+		if err != nil {
+			scope.Log("Unable to serialize: %v", err)
+			return
+		}
+		_, err = tmpfile.Write(serialized)
+		if err != nil {
+			scope.Log("Unable to serialize: %v", err)
+			return
+		}
+		tmpfile.Close()
+
+		// Reopen the file for reading.
+		fd, err := os.Open(tmpfile.Name())
+		if err != nil {
+			scope.Log("Unable to open file: %v", err)
+			return
+		}
+
+		self.fd = fd
+		self.reader = bufio.NewReader(fd)
+
+		self._Consume()
+	}()
+}
+
 func newDataFile(scope types.Scope, items []types.Row, key string) *dataFile {
-	result := &dataFile{
+	self := &dataFile{
 		scope: scope,
 		key:   key,
 	}
 
-	tmpfile, err := ioutil.TempFile("", "vql")
-	if err != nil {
-		scope.Log("Unable to create tempfile: %v", err)
-		return result
-	}
-
-	// Serialize all the rows into the file.
-	serialized, err := json.MarshalJsonl(items)
-	if err != nil {
-		scope.Log("Unable to serialize: %v", err)
-		return result
-	}
-	_, err = tmpfile.Write(serialized)
-	if err != nil {
-		scope.Log("Unable to serialize: %v", err)
-		return result
-	}
-	tmpfile.Close()
-
-	// Reopen the file for reading.
-	fd, err := os.Open(tmpfile.Name())
-	if err != nil {
-		scope.Log("Unable to open file: %v", err)
-		return result
-	}
-
-	result.fd = fd
-	result.reader = bufio.NewReader(fd)
-
-	result.Consume()
-
-	return result
+	self.prepareFile(scope, items)
+	return self
 }
 
 // A provider for in memory rows

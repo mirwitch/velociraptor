@@ -11,21 +11,17 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
-	"www.velocidex.com/golang/velociraptor/file_store"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/paths/artifacts"
-	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -43,7 +39,6 @@ type EventTable struct {
 	wg *sync.WaitGroup
 
 	logger *serverLogger
-	clock  utils.Clock
 
 	tracer *QueryTracer
 
@@ -55,28 +50,11 @@ func (self *EventTable) Wait() {
 	self.wg.Wait()
 }
 
-func (self *EventTable) Clock() utils.Clock {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	return self.clock
-}
-
 func (self *EventTable) Tracer() *QueryTracer {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
 	return self.tracer
-}
-
-func (self *EventTable) SetClock(clock utils.Clock) {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	self.clock = clock
-	if self.logger != nil {
-		self.logger.Clock = clock
-	}
 }
 
 func (self *EventTable) Close() {
@@ -134,34 +112,51 @@ func (self *EventTable) ProcessArtifactModificationEvent(
 	logger.Info("server_monitoring: Reloading table because artifact %v was updated",
 		modified_name)
 
-	// We could try to figure out if the artifact actually changed
-	// anything but this is hard to know - not only do we need to
-	// look at the artifact in the event table but all
-	// dependencies as well. So for now we just recompile the
-	// event table when any artifact is changed. We dont expect
-	// this to be too frequent.
-	request := self.Get()
+	notifier, err := services.GetNotifier(config_obj)
+	if err == nil {
+		notifier.NotifyDirectListener(loadFileQueue(config_obj))
+	}
+}
 
-	// Restart the queries
-	self.StartQueries(config_obj, request)
+func (self *EventTable) ProcessServerMetadataModificationEvent(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	event *ordereddict.Dict) {
 
+	client_id, pres := event.GetString("client_id")
+	if !pres || client_id != "server" {
+		return
+	}
+
+	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+	logger.Info("<green>server_monitoring</>: Reloading table because server metadata was updated")
+
+	notifier, err := services.GetNotifier(config_obj)
+	if err == nil {
+		notifier.NotifyDirectListener(loadFileQueue(config_obj))
+	}
 }
 
 func (self *EventTable) Update(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	principal string,
 	request *flows_proto.ArtifactCollectorArgs) error {
 
+	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 	if principal != "" {
-		logging.LogAudit(config_obj, principal, "SetServerMonitoringState",
-			logrus.Fields{
-				"user":  principal,
-				"state": request,
-			})
+		err := services.LogAudit(ctx,
+			config_obj, principal, "SetServerMonitoringState",
+			ordereddict.NewDict().
+				Set("user", principal).
+				Set("state", request))
+		if err != nil {
+			logger.Error("EventTable Update SetServerMonitoringState %v %v",
+				principal, request)
+		}
 	}
 
-	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
-	logger.Info("server_monitoring: Updating monitoring table")
+	logger.Info("<green>server_monitoring</>: Updating monitoring table")
 
 	// Now store the monitoring table on disk.
 	db, err := datastore.GetDB(config_obj)
@@ -174,7 +169,12 @@ func (self *EventTable) Update(
 		return err
 	}
 
-	return self.StartQueries(config_obj, request)
+	self.mu.Lock()
+	self.request = request
+	self.mu.Unlock()
+
+	// Update the queries immediately
+	return self.StartQueries(config_obj)
 }
 
 // Compare a new set of queries with the current set to see if they
@@ -212,9 +212,9 @@ func (self *EventTable) equal(events []*actions_proto.VQLCollectorArgs) bool {
 }
 
 // Start the queries in the requewst
-func (self *EventTable) StartQueries(
-	config_obj *config_proto.Config,
-	request *flows_proto.ArtifactCollectorArgs) error {
+func (self *EventTable) StartQueries(config_obj *config_proto.Config) error {
+
+	request := self.Get()
 
 	self.mu.Lock()
 	defer self.mu.Unlock()
@@ -301,6 +301,11 @@ func (self *EventTable) RunQuery(
 	wg *sync.WaitGroup,
 	vql_request *actions_proto.VQLCollectorArgs) error {
 
+	journal, err := services.GetJournal(config_obj)
+	if err != nil {
+		return err
+	}
+
 	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return err
@@ -312,26 +317,18 @@ func (self *EventTable) RunQuery(
 	}
 
 	artifact_name := getArtifactName(vql_request)
-	path_manager, err := artifacts.NewArtifactPathManager(
-		config_obj, "", "", artifact_name)
-	if err != nil {
-		return err
-	}
 
-	path_manager.Clock = self.clock
-
-	// We write the logs to special files.
-	log_path_manager, err := artifacts.NewArtifactLogPathManager(
+	// We write the logs directly to files.
+	log_path_manager, err := artifacts.NewArtifactLogPathManager(ctx,
 		config_obj, "server", "", artifact_name)
 	if err != nil {
 		return err
 	}
-	log_path_manager.Clock = self.clock
-
 	self.logger = &serverLogger{
 		config_obj:   self.config_obj,
 		path_manager: log_path_manager,
-		Clock:        self.clock,
+		ctx:          ctx,
+		artifact:     artifact_name,
 	}
 
 	builder := services.ScopeBuilder{
@@ -340,8 +337,7 @@ func (self *EventTable) RunQuery(
 		// artifact launches other artifacts then it will indicate the
 		// creator was the server.
 		ACLManager: acl_managers.NewServerACLManager(
-			self.config_obj,
-			self.config_obj.Client.PinnedServerName),
+			self.config_obj, utils.GetSuperuserName(config_obj)),
 		Env:        ordereddict.NewDict(),
 		Repository: repository,
 		Logger:     log.New(self.logger, "", 0),
@@ -359,31 +355,18 @@ func (self *EventTable) RunQuery(
 		heartbeat = 120
 	}
 
-	// Create a result set writer for the output.
-	opts := vql_subsystem.EncOptsFromScope(scope)
-	file_store_factory := file_store.GetFileStore(config_obj)
-
 	scope.Log("server_monitoring: Collecting <green>%v</>", artifact_name)
-
-	// Write files in the background
-	rs_writer, err := result_sets.NewTimedResultSetWriterWithClock(
-		file_store_factory, path_manager, opts,
-		utils.BackgroundWriter, self.clock)
-	if err != nil {
-		scope.Close()
-		return err
-	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer rs_writer.Close()
+		//defer rs_writer.Close()
 		defer scope.Close()
 		defer scope.Log("server_monitoring: Finished collecting %v", artifact_name)
 
 		for _, query := range vql_request.Query {
 			query_log := actions.QueryLog.AddQuery(query.VQL)
-			query_start := uint64(self.Clock().Now().UTC().UnixNano() / 1000)
+			query_start := uint64(utils.GetTime().Now().UTC().UnixNano() / 1000)
 
 			// Record the current query.
 			self.Tracer().Set(query.VQL)
@@ -404,9 +387,10 @@ func (self *EventTable) RunQuery(
 					query_log.Close()
 					return
 
-				case <-time.After(time.Second * time.Duration(heartbeat)):
+				case <-time.After(utils.Jitter(
+					time.Second * time.Duration(heartbeat))):
 					scope.Log("Time %v: %s: Waiting for rows.",
-						(uint64(self.Clock().Now().UTC().UnixNano()/1000)-
+						(uint64(utils.GetTime().Now().UTC().UnixNano()/1000)-
 							query_start)/1000000, query.Name)
 
 				case row, ok := <-eval_chan:
@@ -415,9 +399,14 @@ func (self *EventTable) RunQuery(
 						break one_query
 					}
 
-					rs_writer.Write(vfilter.RowToDict(ctx, scope, row).
-						Set("_ts", self.Clock().Now().Unix()))
-					rs_writer.Flush()
+					// Add the timestamp to the row - this is the
+					// server time when the event was generated.
+					event := vfilter.RowToDict(ctx, scope, row).
+						Set("_ts", utils.GetTime().Now().Unix())
+
+					// Write event to the journal asynchronously.
+					journal.PushRowsToArtifactAsync(ctx, config_obj,
+						event, artifact_name)
 				}
 			}
 			self.tracer.Clear(query.VQL)
@@ -426,6 +415,92 @@ func (self *EventTable) RunQuery(
 	}()
 
 	return nil
+}
+
+func (self *EventTable) startLoadFileLoop(
+	ctx context.Context,
+	wg *sync.WaitGroup, config_obj *config_proto.Config) error {
+	defer wg.Done()
+
+	notifier, err := services.GetNotifier(config_obj)
+	if err != nil {
+		return err
+	}
+
+	// Debounce file load through the notifier.
+	notification, remove := notifier.ListenForNotification(loadFileQueue(config_obj))
+	defer remove()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+
+			// Debounced file load notification.
+		case <-notification:
+			remove()
+
+			notification, remove = notifier.ListenForNotification(
+				loadFileQueue(config_obj))
+			err := self.StartQueries(config_obj)
+			if err != nil {
+				logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+				logger.Error("startLoadFileLoop: %v", err)
+			}
+		}
+	}
+}
+
+// Main loop.
+func (self *EventTable) Start(
+	ctx context.Context,
+	wg *sync.WaitGroup, config_obj *config_proto.Config) error {
+
+	defer wg.Done()
+
+	journal, err := services.GetJournal(config_obj)
+	if err != nil {
+		return err
+	}
+
+	wg.Add(1)
+	go func() {
+		err := self.startLoadFileLoop(ctx, wg, config_obj)
+		if err != nil {
+			logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+			logger.Error("startLoadFileLoop: %v", err)
+		}
+	}()
+
+	events, cancel := journal.Watch(
+		ctx, "Server.Internal.ArtifactModification",
+		"server_monitoring_service")
+	defer cancel()
+
+	metadata_mod_event, metadata_mod_event_cancel := journal.Watch(
+		ctx, "Server.Internal.MetadataModifications",
+		"server_monitoring_service")
+	defer metadata_mod_event_cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+
+		case event, ok := <-metadata_mod_event:
+			if !ok {
+				return nil
+			}
+			self.ProcessServerMetadataModificationEvent(
+				ctx, config_obj, event)
+
+		case event, ok := <-events:
+			if !ok {
+				return nil
+			}
+			self.ProcessArtifactModificationEvent(ctx, config_obj, event)
+		}
+	}
 }
 
 // Bring up the server monitoring service.
@@ -459,40 +534,23 @@ func NewServerMonitoringService(
 		config_obj: config_obj,
 		parent_ctx: ctx,
 		wg:         &sync.WaitGroup{},
-		clock:      utils.RealClock{},
 		tracer:     NewQueryTracer(),
 	}
 
-	journal, err := services.GetJournal(config_obj)
-	if err != nil {
-		return nil, err
-	}
-	events, cancel := journal.Watch(
-		ctx, "Server.Internal.ArtifactModification",
-		"server_monitoring_service")
-
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		defer cancel()
-
-		// Shut down all server queries in an orderly fasion
 		defer manager.Close()
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-
-			case event, ok := <-events:
-				if !ok {
-					return
-				}
-				manager.ProcessArtifactModificationEvent(
-					ctx, config_obj, event)
-			}
+		err := manager.Start(ctx, wg, config_obj)
+		if err != nil {
+			logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+			logger.Error("NewServerMonitoringService: %v", err)
 		}
 	}()
 
-	return manager, manager.Update(config_obj, "", artifacts)
+	return manager, manager.Update(ctx, config_obj, "", artifacts)
+}
+
+func loadFileQueue(config_obj *config_proto.Config) string {
+	return "ServerMonitoring" + config_obj.OrgId
 }

@@ -1,8 +1,8 @@
 package paths_test
 
 import (
-	"github.com/alecthomas/assert"
 	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
 )
 
 func (self *PathManagerTestSuite) TestHuntPathManager() {
@@ -14,9 +14,6 @@ func (self *PathManagerTestSuite) TestHuntPathManager() {
 		self.getFilestorePath(manager.GetHuntDownloadsFile(
 			true /* only_combined */, "你好世界", false,
 		)))
-
-	assert.Equal(self.T(), "/ds/hunts/H.1234/stats.db",
-		self.getDatastorePath(manager.Stats()))
 
 	assert.Equal(self.T(), "/fs/hunts/H.1234.json",
 		self.getFilestorePath(manager.Clients()))

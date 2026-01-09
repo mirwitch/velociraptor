@@ -28,18 +28,37 @@ func parseOSPath(ctx context.Context,
 		return nil, err
 	}
 
+	return ParseOSPath(ctx, scope, accessor, value)
+}
+
+func ParseOSPath(ctx context.Context,
+	scope types.Scope, accessor FileSystemAccessor,
+	value interface{}) (*OSPath, error) {
+
 	switch t := value.(type) {
 	case types.LazyExpr:
-		return parseOSPath(ctx, scope, args, t.ReduceWithScope(ctx, scope))
+		return ParseOSPath(ctx, scope, accessor, t.ReduceWithScope(ctx, scope))
+
+	case types.Materializer:
+		return ParseOSPath(ctx, scope, accessor, t.Materialize(ctx, scope))
 
 	case *OSPath:
 		return t, nil
 
 	case *PathSpec:
-		return accessor.ParsePath(t.String())
+		root, err := accessor.ParsePath("")
+		if err != nil {
+			return accessor.ParsePath(t.String())
+		}
+		return root, root.SetPathSpec(t)
 
 	case PathSpec:
-		return accessor.ParsePath(t.String())
+
+		root, err := accessor.ParsePath("")
+		if err != nil {
+			return accessor.ParsePath(t.String())
+		}
+		return root, root.SetPathSpec(&t)
 
 	case api.FSPathSpec:
 		// Create an OSPath to represent the abstract filestore path.
@@ -50,7 +69,13 @@ func parseOSPath(ctx context.Context,
 			last_idx := len(components) - 1
 			components[last_idx] += api.GetExtensionForFilestore(t)
 		}
-		return MustNewFileStorePath("fs:").Append(components...), nil
+		res := MustNewFileStorePath("fs:").Append(components...)
+
+		// Store the FSPathSpec in the data for fast retrieval if we
+		// are passed to the fs accessor (this is commonly the case).
+		res.Data = t
+
+		return res, nil
 
 	case api.DSPathSpec:
 		// Create an OSPath to represent the abstract filestore path.
@@ -63,74 +88,37 @@ func parseOSPath(ctx context.Context,
 		}
 		return MustNewFileStorePath("ds:").Append(components...), nil
 
-		// WHERE version(plugin="glob") > 2:
-		// Initializer can be a list of components. In this case we
-		// take the base pathspec (which is accessor determined) and
-		// add the components to it.
-	case []types.Any:
-		components := make([]string, 0, len(t))
-		for _, i := range t {
-			i_str, ok := i.(string)
-			if ok {
-				components = append(components, i_str)
+	case string:
+		return accessor.ParsePath(t)
+
+	case []uint8:
+		return accessor.ParsePath(string(t))
+
+	default:
+		result, _ := accessor.ParsePath("")
+
+		// Is it an array? Generic code to handle arrays - just append
+		// each element together to form a single path. This allows
+		// joining components directly:
+		//     ["bin", "ls"] or ["/usr/bin", "ls"]
+		a_value := reflect.Indirect(reflect.ValueOf(value))
+		if a_value.Type().Kind() == reflect.Slice {
+			for idx := 0; idx < a_value.Len(); idx++ {
+				slice_item := a_value.Index(int(idx)).Interface()
+				item, err := ParseOSPath(ctx, scope, accessor, slice_item)
+				if err != nil {
+					string_item, ok := slice_item.(string)
+					if ok {
+						result = result.Append(string_item)
+					}
+					continue
+				}
+				result = result.Append(item.Components...)
 			}
+			return result, nil
 		}
 
-		// Build a pathspec from the accessor and the components.
-		base, err := accessor.ParsePath("")
-		if err != nil {
-			return nil, err
-		}
-
-		base.Components = append(base.Components, components...)
-		return base, nil
-
-	case []string:
-		// Build a pathspec from the accessor and the components.
-		base, err := accessor.ParsePath("")
-		if err != nil {
-			return nil, err
-		}
-
-		base.Components = append(base.Components, t...)
-		return base, nil
-
-	case string:
-		return accessor.ParsePath(t)
-
-	case []uint8:
-		return accessor.ParsePath(string(t))
-
-	default:
 		// This is a fatal error on the client.
-		return nil, fmt.Errorf("Expecting a path arg type, not %T", t)
-	}
-}
-
-func ParseOSPath(ctx context.Context,
-	scope types.Scope, accessor FileSystemAccessor,
-	value interface{}) (*OSPath, error) {
-
-	switch t := value.(type) {
-	case types.LazyExpr:
-		return ParseOSPath(ctx, scope, accessor, t.ReduceWithScope(ctx, scope))
-
-	case *OSPath:
-		return t, nil
-
-	case *PathSpec:
-		return accessor.ParsePath(t.String())
-
-	case PathSpec:
-		return accessor.ParsePath(t.String())
-
-	case string:
-		return accessor.ParsePath(t)
-
-	case []uint8:
-		return accessor.ParsePath(string(t))
-
-	default:
 		return nil, fmt.Errorf("Expecting a path arg type, not %T", t)
 	}
 }

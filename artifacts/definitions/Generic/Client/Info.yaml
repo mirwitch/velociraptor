@@ -18,8 +18,7 @@ sources:
       This source is used internally to populate agent info. Do not
       modify or remove this query.
     query: |
-        LET Interfaces = SELECT format(format='%02x:%02x:%02x:%02x:%02x:%02x',
-            args=HardwareAddr) AS MAC
+        LET Interfaces = SELECT HardwareAddrString AS MAC
         FROM interfaces()
         WHERE HardwareAddr
 
@@ -27,11 +26,28 @@ sources:
                config.Version.BuildTime as BuildTime,
                config.Version.Version as Version,
                config.Version.ci_build_url AS build_url,
+               config.Version.install_time as install_time,
                config.Labels AS Labels,
                Hostname, OS, Architecture,
                Platform, PlatformVersion, KernelVersion, Fqdn,
                Interfaces.MAC AS MACAddresses
         FROM info()
+
+  - name: DetailedInfo
+    query: |
+      LET Info = SELECT * FROM info()
+      SELECT _key AS Param, _value AS Value FROM items(item=Info[0])
+
+  - name: LinuxInfo
+    description: Linux specific information about the host
+    precondition: SELECT OS From info() where OS = 'linux'
+    query: |
+      SELECT if(condition=version(function='sysinfo') != NULL, then=sysinfo()) AS `Computer Info`,
+      { SELECT Name, HardwareAddrString AS MACAddress,
+               Up, PointToPoint,
+               AddrsString AS IPAddresses
+        FROM interfaces() WHERE HardwareAddr} AS `Network Info`
+      FROM scope()
 
   - name: WindowsInfo
     description: Windows specific information about the host
@@ -87,7 +103,7 @@ sources:
                 `Computer Info`.DomainRole AS DomainRole
               FROM source(client_id=client_id,
                   flow_id=last_interrogate_flow_id,
-                  artifact="Generic.Client.Info/WindowsInfo")
+                  source="WindowsInfo")
           })
           -- WHERE DomainRole =~ "Controller"
 
@@ -95,7 +111,7 @@ sources:
     precondition: SELECT OS From info() where OS = 'windows'
     query: |
       SELECT Name, Description, Mtime AS LastLogin
-      FROM Artifact.Windows.Sys.Users(OnlyRemote=TRUE)
+      FROM Artifact.Windows.Sys.Users()
 
 reports:
   - type: CLIENT
@@ -114,7 +130,8 @@ reports:
        SELECT * FROM sample(
          n=4,
          query={
-           SELECT Timestamp, rate(x=CPU, y=Timestamp) * 100 As CPUPercent,
+           SELECT Timestamp,
+                  rate(x=CPU, y=Timestamp) * 100 As CPUPercent,
                   RSS / 1000000 AS MemoryUse
            FROM source(artifact="Generic.Client.Stats",
                        client_id=ClientId,
@@ -123,14 +140,39 @@ reports:
          })
       {{ end }}
 
+      {{ define "computerinfo" }}
+      LET X <= SELECT *
+        FROM source(source="LinuxInfo')
+        LIMIT 1
+
+      SELECT humanize(bytes=TotalPhysicalMemory) AS  TotalPhysicalMemory,
+             humanize(bytes=TotalFreeMemory) AS  TotalFreeMemory,
+             humanize(bytes=TotalSharedMemory) AS  TotalSharedMemory,
+             humanize(bytes=TotalSwap) AS  TotalSwap,
+             humanize(bytes=FreeSwap) AS  FreeSwap
+      FROM foreach(row=X[0].`Computer Info`)
+      {{ end }}
+
       <div>
-      {{ Query "resources" | LineChart "xaxis_mode" "time" "RSS.yaxis" 2 }}
+      {{ Query "resources" | TimeChart "RSS.yaxis" 2 }}
       </div>
 
       {{ $windows_info := Query "SELECT * FROM source(source='WindowsInfo')" }}
-      {{ if $windows_info }}
+      {{ if $windows_info | Expand }}
       # Windows agent information
         {{ $windows_info | Table }}
+      {{ end }}
+
+      {{ $linux_info := Query "LET X <= SELECT * FROM source(source='LinuxInfo') LIMIT 1 SELECT * FROM X" }}
+      {{ if Query "SELECT * FROM source(source='LinuxInfo')" | Expand }}
+      # Linux agent information
+
+      ### Network Info
+        {{ Query "SELECT * FROM foreach(row=X[0].`Network Info`)" | Table }}
+
+      ### Computer Info
+        {{ Query "computerinfo" | Table }}
+
       {{ end }}
 
       # Active Users

@@ -99,8 +99,6 @@ func CheckAccessWithToken(
 
 	// Requested permission
 	switch permission {
-	case acls.ALL_QUERY:
-		return token.AllQuery, nil
 
 	case acls.ANY_QUERY:
 		return token.AnyQuery, nil
@@ -123,6 +121,12 @@ func CheckAccessWithToken(
 
 	case acls.COLLECT_CLIENT:
 		return token.CollectClient, nil
+
+	case acls.COLLECT_BASIC:
+		return token.CollectBasic, nil
+
+	case acls.START_HUNT:
+		return token.StartHunt, nil
 
 	case acls.COLLECT_SERVER:
 		return token.CollectServer, nil
@@ -151,6 +155,9 @@ func CheckAccessWithToken(
 	case acls.FILESYSTEM_READ:
 		return token.FilesystemRead, nil
 
+	case acls.NETWORK:
+		return token.Network, nil
+
 	case acls.FILESYSTEM_WRITE:
 		return token.FilesystemWrite, nil
 
@@ -160,9 +167,11 @@ func CheckAccessWithToken(
 	case acls.PREPARE_RESULTS:
 		return token.PrepareResults, nil
 
+	case acls.DELETE_RESULTS:
+		return token.DeleteResults, nil
+
 	case acls.DATASTORE_ACCESS:
 		return token.DatastoreAccess, nil
-
 	}
 
 	return false, nil

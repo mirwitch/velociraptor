@@ -8,6 +8,7 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -32,6 +33,7 @@ func (self *NetcatPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "netcat", args)()
 
 		arg := &NetcatPluginArgs{}
 		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
@@ -40,7 +42,7 @@ func (self *NetcatPlugin) Call(
 			return
 		}
 
-		err = vql_subsystem.CheckAccess(scope, acls.COLLECT_SERVER)
+		err = vql_subsystem.CheckAccess(scope, acls.NETWORK)
 		if err != nil {
 			scope.Log("netcat: %s", err)
 			return
@@ -141,9 +143,10 @@ func (self NetcatPlugin) connectOnce(
 
 func (self NetcatPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "netcat",
-		Doc:     "Make a tcp connection and read data from a socket.",
-		ArgType: type_map.AddType(scope, &NetcatPluginArgs{}),
+		Name:     "netcat",
+		Doc:      "Make a tcp connection and read data from a socket.",
+		ArgType:  type_map.AddType(scope, &NetcatPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.NETWORK).Build(),
 	}
 }
 

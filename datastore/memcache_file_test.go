@@ -1,9 +1,8 @@
-package datastore
+package datastore_test
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sort"
 	"sync"
@@ -11,17 +10,23 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	"www.velocidex.com/golang/velociraptor/config"
+	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 	"www.velocidex.com/golang/velociraptor/vtesting"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
+)
+
+var (
+	file_based_imp = &datastore.FileBaseDataStore{}
 )
 
 type MemcacheFileTestSuite struct {
@@ -36,7 +41,7 @@ type MemcacheFileTestSuite struct {
 func (self *MemcacheFileTestSuite) SetupTest() {
 	// Make a tempdir
 	var err error
-	self.dirname, err = ioutil.TempDir("", "datastore_test")
+	self.dirname, err = tempfile.TempDir("datastore_test")
 	assert.NoError(self.T(), err)
 
 	self.config_obj = config.GetDefaultConfig()
@@ -49,7 +54,7 @@ func (self *MemcacheFileTestSuite) SetupTest() {
 	self.ctx, self.cancel = context.WithCancel(context.Background())
 
 	// Clear the cache between runs
-	db := NewMemcacheFileDataStore(self.config_obj)
+	db := datastore.NewMemcacheFileDataStore(self.ctx, self.config_obj)
 	self.datastore = db
 
 	db.Clear()
@@ -63,7 +68,7 @@ func (self *MemcacheFileTestSuite) TearDownTest() {
 }
 
 func (self MemcacheFileTestSuite) TestSetOnFileSystem() {
-	_, ok := self.datastore.(*MemcacheFileDataStore)
+	_, ok := self.datastore.(*datastore.MemcacheFileDataStore)
 	assert.True(self.T(), ok)
 
 	// Setting the data ends up on the filesystem
@@ -113,7 +118,7 @@ func (self MemcacheFileTestSuite) TestDirectoryOverflow() {
 	// Expire directories larger than 2 items.
 	self.config_obj.Datastore.MemcacheDatastoreMaxDirSize = 4
 
-	db := NewMemcacheFileDataStore(self.config_obj)
+	db := datastore.NewMemcacheFileDataStore(self.ctx, self.config_obj)
 	db.StartWriter(self.ctx, &self.wg, self.config_obj)
 
 	client_record := &api_proto.ClientMetadata{
@@ -171,7 +176,7 @@ func (self MemcacheFileTestSuite) TestDirectoryOverflow() {
 }
 
 func (self MemcacheFileTestSuite) TestListChildren() {
-	_, ok := self.datastore.(*MemcacheFileDataStore)
+	_, ok := self.datastore.(*datastore.MemcacheFileDataStore)
 	assert.True(self.T(), ok)
 
 	// Setting the data ends up on the filesystem
@@ -211,7 +216,7 @@ func (self MemcacheFileTestSuite) TestListChildren() {
 }
 
 func (self MemcacheFileTestSuite) TestSetSubjectAndListChildren() {
-	db, ok := self.datastore.(*MemcacheFileDataStore)
+	db, ok := self.datastore.(*datastore.MemcacheFileDataStore)
 	assert.True(self.T(), ok)
 
 	// Setting the data ends up on the filesystem
@@ -246,7 +251,7 @@ func (self MemcacheFileTestSuite) TestSetSubjectAndListChildren() {
 // 2. SetSubject() of /a/e/f/ will implicitly invalidate /a/b/
 // 3. ListChildren() of /a will get fresh data.
 func (self MemcacheFileTestSuite) TestDeepSetSubjectAfterListChildren() {
-	db, ok := self.datastore.(*MemcacheFileDataStore)
+	db, ok := self.datastore.(*datastore.MemcacheFileDataStore)
 	assert.True(self.T(), ok)
 
 	// Setting the data ends up on the filesystem

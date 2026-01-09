@@ -19,33 +19,44 @@ type TestResponderType struct {
 
 func (self *TestResponderType) Close() {
 	self.FlowResponder.Close()
-	self.flow_context.Close()
+	self.FlowResponder.flow_context.Close()
+}
+
+func (self *TestResponderType) Output() chan *crypto_proto.VeloMessage {
+	return self.output
 }
 
 func TestResponderWithFlowId(
 	config_obj *config_proto.Config, flow_id string) *TestResponderType {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.Background()
 
 	output_chan, drain := NewMessageDrain(ctx)
 
-	flow_manager := GetFlowManager(ctx, config_obj)
+	sub_ctx, sub_cancel := context.WithCancel(ctx)
+
+	flow_manager := NewFlowManager(ctx, config_obj, "")
 	result := &TestResponderType{
 		FlowResponder: &FlowResponder{
-			ctx:    ctx,
-			cancel: cancel,
-			wg:     &sync.WaitGroup{},
-			output: output_chan,
+			ctx:           sub_ctx,
+			cancel:        sub_cancel,
+			wg:            &sync.WaitGroup{},
+			output:        output_chan,
+			logErrorRegex: defaultLogErrorRegex,
+			status:        &crypto_proto.VeloStatus{},
 		},
 		Drain: drain,
 	}
 
 	result.status.Status = crypto_proto.VeloStatus_PROGRESS
+	result.status.FirstActive = uint64(utils.GetTime().Now().UnixNano() / 1000)
 	result.wg.Add(1)
 	flow_context := flow_manager.FlowContext(
 		result.output, &crypto_proto.VeloMessage{SessionId: flow_id})
-	result.flow_context = flow_context
-	result.flow_context.responders = append(
-		result.flow_context.responders, result.FlowResponder)
+	result.FlowResponder.flow_context = flow_context
+	result.FlowResponder.flow_context.mu.Lock()
+	result.FlowResponder.flow_context.responders = append(
+		result.FlowResponder.flow_context.responders, result.FlowResponder)
+	result.flow_context.mu.Unlock()
 
 	return result
 }
@@ -114,6 +125,35 @@ func (self *messageDrain) WaitForStatsMessage(t *testing.T) []*crypto_proto.Velo
 			if r.FlowStats != nil &&
 				len(r.FlowStats.QueryStatus) > 0 &&
 				r.FlowStats.QueryStatus[0].UploadedFiles == 1 {
+				return true
+			}
+		}
+		return false
+	})
+	return responses
+}
+
+func (self *messageDrain) WaitForCompletion(t *testing.T) []*crypto_proto.VeloMessage {
+	var responses []*crypto_proto.VeloMessage
+	vtesting.WaitUntil(time.Second*5, t, func() bool {
+		responses = self.Messages()
+		for _, r := range responses {
+			if r.FlowStats != nil &&
+				r.FlowStats.FlowComplete {
+				return true
+			}
+		}
+		return false
+	})
+	return responses
+}
+
+func (self *messageDrain) WaitForEof(t *testing.T) []*crypto_proto.VeloMessage {
+	var responses []*crypto_proto.VeloMessage
+	vtesting.WaitUntil(time.Second*5, t, func() bool {
+		responses = self.Messages()
+		for _, r := range responses {
+			if r.FileBuffer != nil && r.FileBuffer.Eof {
 				return true
 			}
 		}

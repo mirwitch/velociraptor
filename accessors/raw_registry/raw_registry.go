@@ -1,6 +1,6 @@
 /*
    Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+   Copyright (C) 2019-2025 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -19,13 +19,13 @@
 // file parsing.
 
 // We make the registry look like a filesystem:
-// 1. Keys are mapped as directories, and values are files.
-// 2. The file is interpreted as a URL with the following format:
-//    accessor:/path#key_path
-// 3. We use the accessor and path to open the underlying file, then
-//    extract the key or value named by the key_path from it.
-// 4. Normalized paths contain / for directory separators.
-// 5. Normalized paths have rawreg: prefix.
+//  1. Keys are mapped as directories, and values are files.
+//  2. The file is interpreted as a URL with the following format:
+//     accessor:/path#key_path
+//  3. We use the accessor and path to open the underlying file, then
+//     extract the key or value named by the key_path from it.
+//  4. Normalized paths contain / for directory separators.
+//  5. Normalized paths have rawreg: prefix.
 package raw_registry
 
 import (
@@ -37,11 +37,14 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"www.velocidex.com/golang/regparser"
 	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/readers"
 	"www.velocidex.com/golang/vfilter"
@@ -51,9 +54,34 @@ const (
 	MAX_EMBEDDED_REG_VALUE = 4 * 1024
 )
 
+var (
+	metricsReadValue = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "rawreg_getvalue",
+			Help: "Number of time we Queried Value from the registry",
+		})
+
+	metricsReadDirLruHit = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "rawreg_readdir_lru_hit",
+			Help: "Performance of the Read Dir Cache",
+		})
+
+	metricsReadDirLruMiss = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "rawreg_readdir_lru_miss",
+			Help: "Performance of the Read Dir Cache",
+		})
+)
+
 type RawRegKeyInfo struct {
-	key        *regparser.CM_KEY_NODE
+	mu sync.Mutex
+
 	_full_path *accessors.OSPath
+	_data      *ordereddict.Dict
+	_modtime   time.Time
+
+	_key *regparser.CM_KEY_NODE
 }
 
 func (self *RawRegKeyInfo) IsDir() bool {
@@ -61,11 +89,24 @@ func (self *RawRegKeyInfo) IsDir() bool {
 }
 
 func (self *RawRegKeyInfo) Data() *ordereddict.Dict {
-	return ordereddict.NewDict().Set("type", "Key")
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self._data == nil {
+		self._data = ordereddict.NewDict().Set("type", "Key")
+	}
+
+	return self._data
 }
 
 func (self *RawRegKeyInfo) Size() int64 {
 	return 0
+}
+
+func (self *RawRegKeyInfo) UniqueName() string {
+	// Key names can not have \ in them so it is safe to add this
+	// without risk of collisions.
+	return self._full_path.String() + "\\"
 }
 
 func (self *RawRegKeyInfo) FullPath() string {
@@ -81,11 +122,11 @@ func (self *RawRegKeyInfo) Mode() os.FileMode {
 }
 
 func (self *RawRegKeyInfo) Name() string {
-	return self.key.Name()
+	return self._full_path.Basename()
 }
 
 func (self *RawRegKeyInfo) ModTime() time.Time {
-	return self.key.LastWriteTime().Time
+	return self._modtime
 }
 
 func (self *RawRegKeyInfo) Mtime() time.Time {
@@ -120,29 +161,61 @@ func (self *RawRegKeyInfo) UnmarshalJSON(data []byte) error {
 type RawRegValueInfo struct {
 	// Containing key
 	*RawRegKeyInfo
-	value *regparser.CM_KEY_VALUE
+
+	// Hold a reference so value can be decoded lazily.
+	_value *regparser.CM_KEY_VALUE
+
+	// Once value is decoded once it will be cached here.
+	_data *ordereddict.Dict
+	_size int64
 }
 
-func (self *RawRegValueInfo) Name() string {
-	return self.value.ValueName()
+func (self *RawRegValueInfo) Copy() *RawRegValueInfo {
+	return &RawRegValueInfo{
+		RawRegKeyInfo: &RawRegKeyInfo{
+			_full_path: self._full_path,
+			_modtime:   self._modtime,
+			_key:       self._key,
+		},
+		_value: self._value,
+		_data:  self._data,
+		_size:  self._size,
+	}
 }
 
 func (self *RawRegValueInfo) IsDir() bool {
 	return false
 }
 
+func (self *RawRegValueInfo) UniqueName() string {
+	return self._full_path.String()
+}
+
 func (self *RawRegValueInfo) Mode() os.FileMode {
-	return 0755
+	return 0644
 }
 
 func (self *RawRegValueInfo) Size() int64 {
-	return int64(self.value.DataSize())
+	if self._size > 0 {
+		return self._size
+	}
+	self._size = int64(self._value.DataSize())
+	return self._size
 }
 
 func (self *RawRegValueInfo) Data() *ordereddict.Dict {
-	value_data := self.value.ValueData()
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self._data != nil {
+		return self._data
+	}
+
+	metricsReadValue.Inc()
+	value_data := self._value.ValueData()
+	value_type := self._value.TypeString()
 	result := ordereddict.NewDict().
-		Set("type", self.value.TypeString()).
+		Set("type", value_type).
 		Set("data_len", len(value_data.Data))
 
 	switch value_data.Type {
@@ -159,23 +232,13 @@ func (self *RawRegValueInfo) Data() *ordereddict.Dict {
 			result.Set("value", value_data.Data)
 		}
 	}
+
+	self._data = result
 	return result
 }
 
 type RawValueBuffer struct {
 	*bytes.Reader
-	info *RawRegValueInfo
-}
-
-func (self *RawValueBuffer) Close() error {
-	return nil
-}
-
-func NewRawValueBuffer(buf string, stat *RawRegValueInfo) *RawValueBuffer {
-	return &RawValueBuffer{
-		bytes.NewReader(stat.value.ValueData().Data),
-		stat,
-	}
 }
 
 type rawHiveCache struct {
@@ -203,6 +266,14 @@ func (self *rawHiveCache) Set(name string, reg *regparser.Registry) {
 type RawRegFileSystemAccessor struct {
 	scope vfilter.Scope
 	root  *accessors.OSPath
+
+	cache *RawRegFileSystemAccessorCache
+}
+
+// Registery filesystems are usually case insensitive.
+func (self RawRegFileSystemAccessor) GetCanonicalFilename(
+	path *accessors.OSPath) string {
+	return strings.ToLower(path.String())
 }
 
 func getRegHiveCache(scope vfilter.Scope) *rawHiveCache {
@@ -247,10 +318,10 @@ func getRegHive(scope vfilter.Scope,
 		return nil, err
 	}
 
-	paged_reader, err := readers.NewPagedReader(
+	paged_reader, err := readers.NewAccessorReader(
 		scope, pathspec.DelegateAccessor, delegate, int(lru_size))
 	if err != nil {
-		scope.Log("%v: did you provide a URL or Pathspec?", err)
+		scope.Log("%v: did you provide a Pathspec?", err)
 		return nil, err
 	}
 
@@ -276,12 +347,20 @@ func getRegHive(scope vfilter.Scope,
 
 const RawRegFileSystemTag = "_RawReg"
 
+func (self RawRegFileSystemAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name:        "raw_reg",
+		Description: `Access keys and values by parsing the raw registry hive. Path is a pathspec having delegate opening the raw registry hive.`,
+	}
+}
+
 func (self *RawRegFileSystemAccessor) New(scope vfilter.Scope) (
 	accessors.FileSystemAccessor, error) {
 
 	return &RawRegFileSystemAccessor{
 		scope: scope,
 		root:  self.root,
+		cache: getRegFileSystemAccessorCache(scope),
 	}, nil
 }
 
@@ -306,38 +385,124 @@ func (self *RawRegFileSystemAccessor) ReadDir(key_path string) (
 }
 
 func (self *RawRegFileSystemAccessor) ReadDirWithOSPath(
-	full_path *accessors.OSPath) (
-	[]accessors.FileInfo, error) {
+	full_path *accessors.OSPath) (result []accessors.FileInfo, err error) {
 
-	var result []accessors.FileInfo
-	hive, err := getRegHive(self.scope, full_path)
+	contents, _, err := self._readDirWithOSPath(full_path)
+	return contents, err
+}
+
+// Return all the contents in the directory including all keys and all
+// values, even if some keys have a default value.
+// Additionally returns the CM_KEY_NODE for this actual directory.
+
+// This function is recursive! It ascends to the root cell recursively
+// and resolves all keys along the path to the required key. On each
+// level the function tries the LRU to avoid further recursion. This
+// means that in practice most of the time we wont actually be
+// recursing more than a few levels because top level keys will be
+// cached in the LRU.
+func (self *RawRegFileSystemAccessor) _readDirWithOSPath(
+	full_path *accessors.OSPath) (result []accessors.FileInfo, key *regparser.CM_KEY_NODE, err error) {
+
+	cache_key := full_path.String()
+	cached, err := self.cache.readdir_lru.Get(cache_key)
+	if err == nil {
+		cached_res, ok := cached.(*readDirLRUItem)
+		if ok {
+			metricsReadDirLruHit.Inc()
+			return cached_res.children, cached_res.key, cached_res.err
+		}
+	}
+	metricsReadDirLruMiss.Inc()
+
+	// Cache the result of this function
+	defer func() {
+		err1 := self.cache.readdir_lru.Set(cache_key, &readDirLRUItem{
+			children: result,
+			err:      err,
+			key:      key,
+		})
+		if err1 != nil && err == nil {
+			err = err1
+		}
+	}()
+
+	// Listing the top level of the hive.
+	if len(full_path.Components) == 0 {
+		hive, err := getRegHive(self.scope, full_path)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		root_cell := hive.Profile.HCELL(hive.Reader,
+			0x1000+int64(hive.BaseBlock.RootCell()))
+
+		nk := root_cell.KeyNode()
+		if nk != nil {
+			listing, err := self._readDirFromKey(full_path, nk)
+			return listing, nk, err
+		}
+		return nil, nil, utils.NotFoundError
+	}
+
+	parent := full_path.Dirname()
+	basename := full_path.Basename()
+
+	// If the directory is not cached, get its parent and list it.
+	contents, key, err := self._readDirWithOSPath(parent)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	key := OpenKeyComponents(hive, full_path.Components)
-	if key == nil {
-		return nil, errors.New("Key not found")
+	// Find the required key in the parent directory listing.
+	for _, item := range contents {
+		key, ok := item.(*RawRegKeyInfo)
+		if !ok {
+			continue
+		}
+
+		// Found it!
+		if key._key != nil &&
+			strings.EqualFold(key.Name(), basename) {
+			listing, err := self._readDirFromKey(full_path, key._key)
+			return listing, key._key, err
+		}
 	}
 
-	for _, subkey := range key.Subkeys() {
-		result = append(result,
-			&RawRegKeyInfo{
-				key:        subkey,
-				_full_path: full_path.Append(subkey.Name()),
-			})
+	return nil, nil, utils.NotFoundError
+}
+
+func (self *RawRegFileSystemAccessor) _readDirFromKey(
+	parent *accessors.OSPath, key *regparser.CM_KEY_NODE) (
+	result []accessors.FileInfo, err error) {
+
+	subkeys := key.Subkeys()
+	for _, subkey := range subkeys {
+		basename := subkey.Name()
+		subkey := &RawRegKeyInfo{
+			_full_path: parent.Append(basename),
+			_modtime:   subkey.LastWriteTime().Time,
+			_key:       subkey,
+		}
+		result = append(result, subkey)
 	}
 
+	// All Values carry their mode time as the parent key
+	key_mod_time := key.LastWriteTime().Time
 	for _, value := range key.Values() {
-		result = append(result,
-			&RawRegValueInfo{
-				&RawRegKeyInfo{
-					key:        key,
-					_full_path: full_path.Append(value.ValueName()),
-				}, value,
-			})
+		basename := value.ValueName()
+		if basename == "" {
+			basename = "@"
+		}
+		value_obj := &RawRegValueInfo{
+			RawRegKeyInfo: &RawRegKeyInfo{
+				_full_path: parent.Append(basename),
+				_modtime:   key_mod_time,
+			},
+			_value: value,
+		}
+		result = append(result, value_obj)
 	}
-
 	return result, nil
 }
 
@@ -351,7 +516,7 @@ func (self *RawRegFileSystemAccessor) Open(path string) (
 	value_info, ok := stat.(*RawRegValueInfo)
 	if ok {
 		return NewValueBuffer(
-			value_info.value.ValueData().Data, stat), nil
+			value_info._value.ValueData().Data, stat), nil
 	}
 
 	// Keys do not have any data.
@@ -361,20 +526,24 @@ func (self *RawRegFileSystemAccessor) Open(path string) (
 
 func (self *RawRegFileSystemAccessor) OpenWithOSPath(path *accessors.OSPath) (
 	accessors.ReadSeekCloser, error) {
-	stat, err := self.LstatWithOSPath(path)
+	stats, err := self.multiLstat(path)
 	if err != nil {
 		return nil, err
 	}
 
-	value_info, ok := stat.(*RawRegValueInfo)
-	if ok {
-		return NewValueBuffer(
-			value_info.value.ValueData().Data, stat), nil
+	// We are looking for a value to open try to find one but if now,
+	// just serialize the key data.
+	for _, stat := range stats {
+		value_info, ok := stat.(*RawRegValueInfo)
+		if ok {
+			return NewValueBuffer(
+				value_info._value.ValueData().Data, stat), nil
+		}
 	}
 
 	// Keys do not have any data.
-	serialized, _ := json.Marshal(stat.Data)
-	return NewValueBuffer(serialized, stat), nil
+	serialized, _ := json.Marshal(stats[0].Data)
+	return NewValueBuffer(serialized, stats[0]), nil
 }
 
 func (self *RawRegFileSystemAccessor) Lstat(filename string) (
@@ -391,32 +560,58 @@ func (self *RawRegFileSystemAccessor) LstatWithOSPath(
 	full_path *accessors.OSPath) (
 	accessors.FileInfo, error) {
 
+	// Top level stat
 	if len(full_path.Components) == 0 {
 		return &accessors.VirtualFileInfo{
-			Path: full_path,
+			Path:   full_path,
+			IsDir_: true,
 		}, nil
 	}
 
-	children, err := self.ReadDirWithOSPath(full_path.Dirname())
+	res, err := self.multiLstat(full_path)
 	if err != nil {
 		return nil, err
 	}
 
+	// Return the first one.
+	return res[0], nil
+}
+
+// The registry can have keys and values named the same so an Lstat
+// can actually return two separate entities. This function returns
+// both.
+func (self *RawRegFileSystemAccessor) multiLstat(
+	full_path *accessors.OSPath) (res []accessors.FileInfo, err error) {
+
 	name := full_path.Basename()
+	container := full_path.Dirname()
+
+	children, err := self.ReadDirWithOSPath(container)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, child := range children {
-		if child.Name() == name {
-			return child, nil
+		child_name := child.Name()
+
+		// Fetch default value as either @ or ""
+		if strings.EqualFold(child_name, name) ||
+			(name == "@" && child_name == "") {
+			res = append(res, child)
 		}
 	}
 
-	return nil, errors.New("Key not found")
+	if len(res) == 0 {
+		return nil, errors.New("Key not found")
+	}
+
+	return res, nil
 }
 
 func init() {
-	accessors.Register("raw_reg", &RawRegFileSystemAccessor{
+	accessors.Register(&RawRegFileSystemAccessor{
 		root: accessors.MustNewGenericOSPathWithBackslashSeparator(""),
-	},
-		`Access keys and values by parsing the raw registry hive. Path is a pathspec having delegate opening the raw registry hive.`)
+	})
 
 	json.RegisterCustomEncoder(&RawRegKeyInfo{}, accessors.MarshalGlobFileInfo)
 	json.RegisterCustomEncoder(&RawRegValueInfo{}, accessors.MarshalGlobFileInfo)

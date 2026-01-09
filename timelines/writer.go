@@ -1,16 +1,28 @@
 package timelines
 
+/*
+  Implements a ITimelineWriter interface to write time series data to
+  the filestore.
+
+  Assumes data is written in time increasing order.
+*/
+
 import (
 	"bytes"
 	"encoding/binary"
+	"sync"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/json"
 	vjson "www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/result_sets"
+	timelines_proto "www.velocidex.com/golang/velociraptor/timelines/proto"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 const (
@@ -29,14 +41,33 @@ type IndexRecord struct {
 }
 
 type TimelineWriter struct {
-	last_time time.Time
-	opts      *json.EncOpts
-	fd        api.FileWriter
-	index_fd  api.FileWriter
+	mu                    sync.Mutex
+	wg                    sync.WaitGroup
+	first_time, last_time time.Time
+	opts                  *json.EncOpts
+	fd                    api.FileWriter
+	index_fd              api.FileWriter
+}
+
+func (self *TimelineWriter) Stats() *timelines_proto.Timeline {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return &timelines_proto.Timeline{
+		StartTime: self.first_time.Unix(),
+		EndTime:   self.last_time.Unix(),
+	}
 }
 
 func (self *TimelineWriter) Write(
 	timestamp time.Time, row *ordereddict.Dict) error {
+	self.mu.Lock()
+	if self.first_time.IsZero() {
+		self.first_time = timestamp
+	}
+	self.last_time = timestamp
+	self.mu.Unlock()
+
 	serialized, err := vjson.MarshalWithOptions(row, self.opts)
 	if err != nil {
 		return err
@@ -96,39 +127,45 @@ func (self *TimelineWriter) WriteBuffer(
 }
 
 func (self *TimelineWriter) Truncate() {
-	self.fd.Truncate()
-	self.index_fd.Truncate()
+	_ = self.fd.Truncate()
+	_ = self.index_fd.Truncate()
 }
 
 func (self *TimelineWriter) Close() {
 	self.fd.Close()
 	self.index_fd.Close()
+	self.wg.Wait()
 }
 
 func NewTimelineWriter(
-	file_store_factory api.FileStore,
+	config_obj *config_proto.Config,
 	path_manager paths.TimelinePathManagerInterface,
 	completion func(),
 	truncate result_sets.WriteMode) (*TimelineWriter, error) {
 
 	result := &TimelineWriter{}
 
+	// Call the completer when both index and file are done.
+	completer := utils.NewCompleter(completion)
+
+	file_store_factory := file_store.GetFileStore(config_obj)
+
 	fd, err := file_store_factory.WriteFileWithCompletion(
-		path_manager.Path(), completion)
+		path_manager.Path(), completer.GetCompletionFunc())
 	if err != nil {
 		return nil, err
 	}
 
-	index_fd, err := file_store_factory.WriteFile(
-		path_manager.Index())
+	index_fd, err := file_store_factory.WriteFileWithCompletion(
+		path_manager.Index(), completer.GetCompletionFunc())
 	if err != nil {
 		fd.Close()
 		return nil, err
 	}
 
 	if truncate {
-		fd.Truncate()
-		index_fd.Truncate()
+		_ = fd.Truncate()
+		_ = index_fd.Truncate()
 	}
 
 	result.fd = fd

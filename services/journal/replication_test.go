@@ -4,24 +4,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/alecthomas/assert"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 	mock_proto "www.velocidex.com/golang/velociraptor/api/mock"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/frontend"
 	"www.velocidex.com/golang/velociraptor/services/journal"
 	"www.velocidex.com/golang/velociraptor/services/orgs"
 	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vtesting"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
 )
@@ -32,6 +35,24 @@ type MockFrontendService struct {
 
 func (self MockFrontendService) GetMinionCount() int {
 	return 1
+}
+
+func (self MockFrontendService) SetGlobalMessage(
+	message *api_proto.GlobalUserMessage) {
+}
+
+func (self MockFrontendService) GetGlobalMessages() []*api_proto.GlobalUserMessage {
+	return nil
+}
+
+func (self MockFrontendService) GetPublicUrl(
+	config_obj *config_proto.Config) (res *url.URL, err error) {
+	return frontend.GetPublicUrl(config_obj)
+}
+
+func (self MockFrontendService) GetBaseURL(
+	config_obj *config_proto.Config) (res *url.URL, err error) {
+	return frontend.GetBaseURL(config_obj)
 }
 
 // The minion replicates to the master node.
@@ -53,7 +74,7 @@ func (self *ReplicationTestSuite) SetupTest() {
 	self.ConfigObj.Services.FrontendServer = false
 	self.ConfigObj.Services.ReplicationService = true
 
-	self.LoadArtifacts([]string{`
+	self.LoadArtifactsIntoConfig([]string{`
 name: Test.Artifact
 type: CLIENT_EVENT
 `})
@@ -173,7 +194,7 @@ func (self *ReplicationTestSuite) TestSendingEvents() {
 		Set("Events", []interface{}{"Test.Artifact"}))
 
 	events = nil
-	err = journal_service.PushRowsToArtifact(self.ConfigObj,
+	err = journal_service.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		my_event, "Test.Artifact", "C.1234", "F.123")
 	assert.NoError(self.T(), err)
 
@@ -199,7 +220,7 @@ func (self *ReplicationTestSuite) TestSendingEvents() {
 	// is often on the critical path. We just dump 1000 messages
 	// into the queue - this should overflow into the file.
 	for i := 0; i < 1000; i++ {
-		err = journal_service.PushRowsToArtifact(self.ConfigObj,
+		err = journal_service.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 			my_event, "Test.Artifact", "C.1234", "F.123")
 		assert.NoError(self.T(), err)
 	}

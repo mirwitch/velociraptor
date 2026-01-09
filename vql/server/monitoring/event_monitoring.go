@@ -10,6 +10,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -24,7 +25,7 @@ func (self GetClientMonitoring) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.READ_RESULTS)
 	if err != nil {
 		scope.Log("get_client_monitoring: %s", err)
 		return vfilter.Null{}
@@ -37,9 +38,15 @@ func (self GetClientMonitoring) Call(
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("get_client_monitoring: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("get_client_monitoring: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -54,9 +61,10 @@ func (self GetClientMonitoring) Call(
 
 func (self GetClientMonitoring) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "get_client_monitoring",
-		Doc:     "Retrieve the current client monitoring state.",
-		ArgType: type_map.AddType(scope, &GetClientMonitoringArgs{}),
+		Name:     "get_client_monitoring",
+		Doc:      "Retrieve the current client monitoring state.",
+		ArgType:  type_map.AddType(scope, &GetClientMonitoringArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 
@@ -71,7 +79,7 @@ func (self SetClientMonitoring) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.COLLECT_CLIENT)
 	if err != nil {
 		scope.Log("set_client_monitoring: %s", err)
 		return vfilter.Null{}
@@ -84,9 +92,15 @@ func (self SetClientMonitoring) Call(
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("set_client_monitoring: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("set_client_monitoring: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -132,9 +146,10 @@ func (self SetClientMonitoring) Call(
 
 func (self SetClientMonitoring) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "set_client_monitoring",
-		Doc:     "Sets the current client monitoring state.",
-		ArgType: type_map.AddType(scope, &SetClientMonitoringArgs{}),
+		Name:     "set_client_monitoring",
+		Doc:      "Sets the current client monitoring state.",
+		ArgType:  type_map.AddType(scope, &SetClientMonitoringArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_CLIENT).Build(),
 	}
 }
 
@@ -147,7 +162,7 @@ func (self GetServerMonitoring) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.READ_RESULTS)
 	if err != nil {
 		scope.Log("get_server_monitoring: %s", err)
 		return vfilter.Null{}
@@ -160,9 +175,15 @@ func (self GetServerMonitoring) Call(
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("get_server_monitoring: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("get_server_monitoring: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -187,9 +208,10 @@ func (self GetServerMonitoring) Call(
 
 func (self GetServerMonitoring) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "get_server_monitoring",
-		Doc:     "Retrieve the current client monitoring state.",
-		ArgType: type_map.AddType(scope, &GetServerMonitoringArgs{}),
+		Name:     "get_server_monitoring",
+		Doc:      "Retrieve the current client monitoring state.",
+		ArgType:  type_map.AddType(scope, &GetServerMonitoringArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 
@@ -204,7 +226,7 @@ func (self SetServerMonitoring) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.COLLECT_SERVER)
 	if err != nil {
 		scope.Log("set_server_monitoring: %s", err)
 		return vfilter.Null{}
@@ -217,9 +239,15 @@ func (self SetServerMonitoring) Call(
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("set_server_monitoring: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("set_server_monitoring: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
@@ -253,7 +281,7 @@ func (self SetServerMonitoring) Call(
 	}
 
 	principal := vql_subsystem.GetPrincipal(scope)
-	err = server_manager.Update(config_obj, principal, value)
+	err = server_manager.Update(ctx, config_obj, principal, value)
 	if err != nil {
 		scope.Log("set_server_monitoring: %s", err.Error())
 		return vfilter.Null{}
@@ -264,9 +292,10 @@ func (self SetServerMonitoring) Call(
 
 func (self SetServerMonitoring) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "set_server_monitoring",
-		Doc:     "Sets the current server monitoring state (this function is deprecated, use add_server_monitoring and remove_server_monitoring).",
-		ArgType: type_map.AddType(scope, &SetServerMonitoringArgs{}),
+		Name:     "set_server_monitoring",
+		Doc:      "Sets the current server monitoring state (this function is deprecated, use add_server_monitoring and remove_server_monitoring).",
+		ArgType:  type_map.AddType(scope, &SetServerMonitoringArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_SERVER).Build(),
 	}
 }
 

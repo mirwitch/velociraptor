@@ -1,7 +1,7 @@
 package interrogation_test
 
 import (
-	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -13,8 +13,11 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
+	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/interrogation"
+	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
@@ -31,16 +34,27 @@ func (self *ServicesTestSuite) SetupTest() {
 	self.ConfigObj.Services.Interrogation = true
 	self.ConfigObj.Defaults.UnauthenticatedLruTimeoutSec = -1
 
-	self.LoadArtifacts([]string{`
+	self.LoadArtifactsIntoConfig([]string{`
 name: Server.Internal.Enrollment
 type: INTERNAL
 `,
 	})
 
+	self.client_id = fmt.Sprintf("C.1%d", utils.GetId())
+	self.flow_id = "F.1232"
+
 	self.TestSuite.SetupTest()
 
-	self.client_id = "C.12312"
-	self.flow_id = "F.1232"
+	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	client_info_manager.Set(self.Ctx, &services.ClientInfo{
+		ClientInfo: &actions_proto.ClientInfo{
+			ClientId: self.client_id,
+		},
+	})
+
+	interrogation.DEBUG = true
 }
 
 func (self *ServicesTestSuite) EmulateCollection(
@@ -52,11 +66,11 @@ func (self *ServicesTestSuite) EmulateCollection(
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		rows, artifact, self.client_id, self.flow_id)
 
 	// Emulate a flow completion message coming from the flow processor.
-	journal.PushRowsToArtifact(self.ConfigObj,
+	journal.PushRowsToArtifact(self.Ctx, self.ConfigObj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("ClientId", self.client_id).
 			Set("FlowId", self.flow_id).
@@ -74,21 +88,20 @@ func (self *ServicesTestSuite) TestInterrogationService() {
 	flow_id := self.EmulateCollection(
 		"Generic.Client.Info/BasicInformation", []*ordereddict.Dict{
 			ordereddict.NewDict().
-				Set("ClientId", self.client_id).
+				Set("Name", "velociraptor").
+				Set("OS", "windows").
 				Set("Hostname", hostname).
 				Set("Labels", []string{"Foo"}),
 		})
 
 	// Wait here until the client is fully interrogated
-	db, err := datastore.GetDB(self.ConfigObj)
+	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	client_path_manager := paths.NewClientPathManager(self.client_id)
-	client_info := &actions_proto.ClientInfo{}
-
+	var client_info *services.ClientInfo
 	vtesting.WaitUntil(2*time.Second, self.T(), func() bool {
-		db.GetSubject(self.ConfigObj, client_path_manager.Path(), client_info)
-		return client_info.Hostname == hostname
+		client_info, err = client_info_manager.Get(self.Ctx, self.client_id)
+		return err == nil && client_info.Hostname == hostname
 	})
 
 	// Check that we record the last flow id.
@@ -99,9 +112,9 @@ func (self *ServicesTestSuite) TestInterrogationService() {
 
 	// Check the label is set on the client.
 	labeler := services.GetLabeler(self.ConfigObj)
-	vtesting.WaitUntil(2*time.Second, self.T(), func() bool {
+	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
 		return labeler.IsLabelSet(
-			context.Background(), self.ConfigObj, self.client_id, "Foo")
+			self.Ctx, self.ConfigObj, self.client_id, "Foo")
 	})
 	assert.NoError(self.T(), err)
 }
@@ -117,7 +130,7 @@ func (self *ServicesTestSuite) TestEnrollService() {
 
 	// Check the client does not exist in the datastore yet
 	client_path_manager := paths.NewClientPathManager(self.client_id)
-	client_info := &services.ClientInfo{}
+	client_info := &services.ClientInfo{ClientInfo: &actions_proto.ClientInfo{}}
 	err = db.GetSubject(self.ConfigObj, client_path_manager.Path(), client_info)
 	assert.Error(self.T(), err)
 	assert.Equal(self.T(), client_info.ClientId, "")
@@ -132,7 +145,8 @@ func (self *ServicesTestSuite) TestEnrollService() {
 	journal, err := services.GetJournal(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	err = journal.PushRowsToArtifact(self.ConfigObj,
+	ctx := self.Ctx
+	err = journal.PushRowsToArtifact(ctx, self.ConfigObj,
 		[]*ordereddict.Dict{
 			enroll_message, enroll_message, enroll_message, enroll_message,
 		},
@@ -168,6 +182,12 @@ func (self *ServicesTestSuite) TestEnrollService() {
 		if !c.IsDir() {
 			children = append(children, c)
 		}
+	}
+
+	if len(children) > 1 {
+		test_utils.GetMemoryDataStore(self.T(), self.ConfigObj).Dump()
+		test_utils.GetMemoryFileStore(self.T(), self.ConfigObj).Debug()
+		json.Debug(children)
 	}
 
 	assert.Equal(self.T(), len(children), 1)

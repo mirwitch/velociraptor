@@ -38,10 +38,21 @@ import (
 	"www.velocidex.com/golang/vfilter"
 )
 
-const (
-	ValidateArtifact  = true
-	ArtifactIsBuiltIn = true
-)
+type ArtifactOptions struct {
+	// Protects the artifact from being overwritten.
+	ArtifactIsBuiltIn bool
+
+	// Artifact is actually built into the binary
+	ArtifactIsCompiledIn bool
+
+	// Validate the artifact compiles
+	ValidateArtifact bool
+
+	AllowOverridingAlias bool
+
+	// Attach these tags to the artifact in the repository.
+	Tags []string
+}
 
 func GetRepositoryManager(config_obj *config_proto.Config) (RepositoryManager, error) {
 	org_manager, err := GetOrgManager()
@@ -58,6 +69,7 @@ type ScopeBuilder struct {
 	// In server context this contains the full server config required
 	// for server plugins.
 	Config *config_proto.Config
+	Ctx    context.Context
 
 	// If running in client context we only present the client config.
 	ClientConfig *config_proto.ClientConfig
@@ -68,38 +80,43 @@ type ScopeBuilder struct {
 	Repository   Repository
 }
 
-// An artifact repository holds definitions for artifacts.
+// An artifact repository holds definitions for artifacts. This object
+// specifically does not IO by itself, but it is fully managed by the
+// RepositoryManager which implements the backend work.
 type Repository interface {
-	// Load an entire directory recursively.
-	LoadDirectory(config_obj *config_proto.Config,
-		dirname string, override_builtins bool) (int, error)
-
 	// Make a copy of this repository.
 	Copy() Repository
 
 	// Load definition in yaml
-	LoadYaml(data string, validate, built_in bool) (
+	LoadYaml(data string, options ArtifactOptions) (
 		*artifacts_proto.Artifact, error)
 
 	// Load an artifact protobuf.
-	LoadProto(artifact *artifacts_proto.Artifact, validate bool) (
+	LoadProto(artifact *artifacts_proto.Artifact, options ArtifactOptions) (
 		*artifacts_proto.Artifact, error)
 
 	// Get an artifact by name.
-	Get(config_obj *config_proto.Config,
+	Get(ctx context.Context, config_obj *config_proto.Config,
 		name string) (*artifacts_proto.Artifact, bool)
 
-	GetSource(config_obj *config_proto.Config,
+	GetSource(ctx context.Context, config_obj *config_proto.Config,
 		name string) (*artifacts_proto.ArtifactSource, bool)
 
 	// An optimization that avoids copying the entire artifact definition
-	GetArtifactType(config_obj *config_proto.Config, artifact_name string) (string, error)
+	GetArtifactType(ctx context.Context, config_obj *config_proto.Config,
+		artifact_name string) (string, error)
 
 	// Remove a named artifact from the repository.
 	Del(name string)
 
 	// List
 	List(ctx context.Context, config_obj *config_proto.Config) ([]string, error)
+
+	// List all unique tags
+	Tags(ctx context.Context, config_obj *config_proto.Config) ([]string, error)
+
+	SetParent(parent Repository,
+		parent_config_obj *config_proto.Config)
 }
 
 // Manages the global artifact repository
@@ -134,12 +151,20 @@ type RepositoryManager interface {
 	BuildScopeFromScratch(builder ScopeBuilder) vfilter.Scope
 
 	// Store the file to the repository. It will be stored in the datastore as well.
-	SetArtifactFile(config_obj *config_proto.Config, principal string,
+	SetArtifactFile(
+		ctx context.Context, config_obj *config_proto.Config, principal string,
 		data, required_prefix string) (*artifacts_proto.Artifact, error)
 
+	SetArtifactMetadata(
+		ctx context.Context, config_obj *config_proto.Config,
+		principal, name string,
+		metadata *artifacts_proto.ArtifactMetadata) error
+
 	// Delete the file from the global repository and the data store.
-	DeleteArtifactFile(config_obj *config_proto.Config,
-		principal, name string) error
+	DeleteArtifactFile(ctx context.Context,
+		config_obj *config_proto.Config, principal, name string) error
+
+	ReformatVQL(ctx context.Context, artifact_yaml string) (string, error)
 }
 
 type MockablePlugin interface {

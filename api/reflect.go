@@ -1,54 +1,71 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package api
 
 import (
+	"context"
 	"regexp"
 	"strings"
+	"sync"
 
-	"github.com/Velocidex/yaml/v2"
-	context "golang.org/x/net/context"
 	"google.golang.org/protobuf/types/known/emptypb"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	"www.velocidex.com/golang/velociraptor/artifacts/assets"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/types"
 )
 
 var (
-	doc_regex = regexp.MustCompile("doc=(.+)")
+	doc_regex          = regexp.MustCompile("doc=(.+)")
+	mu                 sync.Mutex
+	cachedDescriptions []*api_proto.Completion
 )
 
-// Loads the api description from the embedded asset
-func LoadApiDescription() ([]*api_proto.Completion, error) {
-	assets.Init()
+// Get the top level description line.
+func elideDescription(in string) string {
+	parts := strings.SplitN(in, ".", 2)
+	return utils.Elide(parts[0], 80)
+}
 
-	data, err := assets.ReadFile("docs/references/vql.yaml")
-	if err != nil {
-		return nil, err
+func loadApiDescriptions() []*api_proto.Completion {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(cachedDescriptions) > 0 {
+		return cachedDescriptions
 	}
 
-	result := []*api_proto.Completion{}
-	err = yaml.Unmarshal(data, &result)
-	return result, err
+	descriptions, err := utils.LoadApiDescription()
+	if err != nil {
+		descriptions = IntrospectDescription()
+	}
+
+	for _, d := range descriptions {
+		d.Description = elideDescription(d.Description)
+	}
+
+	// Cache it for next time.
+	cachedDescriptions = descriptions
+
+	return cachedDescriptions
 }
 
 func IntrospectDescription() []*api_proto.Completion {
@@ -61,20 +78,36 @@ func IntrospectDescription() []*api_proto.Completion {
 	info := scope.Describe(type_map)
 
 	for _, item := range info.Functions {
+		var metadata map[string]string
+		if item.Metadata != nil {
+			metadata = make(map[string]string)
+			for _, i := range item.Metadata.Items() {
+				metadata[i.Key] = utils.ToString(i.Value)
+			}
+		}
 		result = append(result, &api_proto.Completion{
 			Name:        item.Name,
-			Description: item.Doc,
+			Description: elideDescription(item.Doc),
 			Type:        "Function",
 			Args:        getArgDescriptors(item.ArgType, type_map, scope),
+			Metadata:    metadata,
 		})
 	}
 
 	for _, item := range info.Plugins {
+		var metadata map[string]string
+		if item.Metadata != nil {
+			metadata = make(map[string]string)
+			for _, i := range item.Metadata.Items() {
+				metadata[i.Key] = utils.ToString(i.Value)
+			}
+		}
 		result = append(result, &api_proto.Completion{
 			Name:        item.Name,
-			Description: item.Doc,
+			Description: elideDescription(item.Doc),
 			Type:        "Plugin",
 			Args:        getArgDescriptors(item.ArgType, type_map, scope),
+			Metadata:    metadata,
 		})
 	}
 
@@ -85,6 +118,8 @@ func (self *ApiServer) GetKeywordCompletions(
 	ctx context.Context,
 	in *emptypb.Empty) (*api_proto.KeywordCompletions, error) {
 
+	defer Instrument("GetKeywordCompletions")()
+
 	users := services.GetUserManager()
 	_, org_config_obj, err := users.GetUserFromContext(ctx)
 	if err != nil {
@@ -93,6 +128,7 @@ func (self *ApiServer) GetKeywordCompletions(
 
 	result := &api_proto.KeywordCompletions{
 		Items: []*api_proto.Completion{
+			{Name: "EXPLAIN", Type: "Keyword"},
 			{Name: "SELECT", Type: "Keyword"},
 			{Name: "FROM", Type: "Keyword"},
 			{Name: "LET", Type: "Keyword"},
@@ -100,14 +136,11 @@ func (self *ApiServer) GetKeywordCompletions(
 			{Name: "LIMIT", Type: "Keyword"},
 			{Name: "GROUP BY", Type: "Keyword"},
 			{Name: "ORDER BY", Type: "Keyword"},
+			{Name: "DESC", Type: "Keyword"},
 		},
 	}
 
-	descriptions, err := LoadApiDescription()
-	if err != nil {
-		descriptions = IntrospectDescription()
-	}
-	result.Items = append(result.Items, descriptions...)
+	result.Items = append(result.Items, loadApiDescriptions()...)
 
 	manager, err := services.GetRepositoryManager(org_config_obj)
 	if err != nil {
@@ -123,7 +156,7 @@ func (self *ApiServer) GetKeywordCompletions(
 	}
 
 	for _, name := range names {
-		artifact, pres := repository.Get(org_config_obj, name)
+		artifact, pres := repository.Get(ctx, org_config_obj, name)
 		if !pres {
 			continue
 		}
@@ -144,9 +177,8 @@ func getArgDescriptors(
 	args := []*api_proto.ArgDescriptor{}
 	arg_desc, pres := type_map.Get(scope, arg_type)
 	if pres && arg_desc != nil && arg_desc.Fields != nil {
-		for _, k := range arg_desc.Fields.Keys() {
-			v_any, _ := arg_desc.Fields.Get(k)
-			v, ok := v_any.(*types.TypeReference)
+		for _, i := range arg_desc.Fields.Items() {
+			v, ok := i.Value.(*types.TypeReference)
 			if !ok {
 				continue
 			}
@@ -166,8 +198,8 @@ func getArgDescriptors(
 				doc = matches[1]
 			}
 			args = append(args, &api_proto.ArgDescriptor{
-				Name:        k,
-				Description: doc + required,
+				Name:        i.Key,
+				Description: elideDescription(doc) + required,
 				Type:        target,
 			})
 		}
@@ -181,7 +213,7 @@ func getArtifactParamDescriptors(artifact *artifacts_proto.Artifact) []*api_prot
 	for _, parameter := range artifact.Parameters {
 		args = append(args, &api_proto.ArgDescriptor{
 			Name:        parameter.Name,
-			Description: parameter.Description,
+			Description: elideDescription(parameter.Description),
 			Type:        "Artifact Parameter",
 		})
 	}

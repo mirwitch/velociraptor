@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package ntfs
@@ -7,9 +8,9 @@ import (
 	"time"
 
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/accessors/file"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/constants"
-	"www.velocidex.com/golang/velociraptor/vql/windows/wmi"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -22,63 +23,54 @@ type WindowsNTFSFileSystemAccessor struct {
 	age time.Time
 }
 
-func discoverVSS() ([]*accessors.VirtualFileInfo, error) {
-	shadow_volumes, err := wmi.Query(
-		"SELECT DeviceObject, VolumeName, InstallDate, "+
-			"OriginatingMachine from Win32_ShadowCopy",
-		"ROOT\\CIMV2")
+func (self *WindowsNTFSFileSystemAccessor) Lstat(path string) (accessors.FileInfo, error) {
+	// Parse the path into an OSPath
+	os_path, err := self.ParsePath(path)
 	if err != nil {
 		return nil, err
 	}
 
-	result := []*accessors.VirtualFileInfo{}
-	for _, row := range shadow_volumes {
-		device_name, pres := row.GetString("DeviceObject")
-		if pres {
-			device_path, err := accessors.NewWindowsNTFSPath(device_name)
-			if err != nil {
-				return nil, err
-			}
-			virtual_directory := &accessors.VirtualFileInfo{
-				IsDir_: true,
-				Path:   device_path,
-				Data_:  row,
-			}
-			result = append(result, virtual_directory)
-		}
-	}
-
-	return result, nil
+	return self.LstatWithOSPath(os_path)
 }
 
-func discoverLogicalDisks() ([]*accessors.VirtualFileInfo, error) {
-	shadow_volumes, err := wmi.Query(
-		"SELECT DeviceID, Description, VolumeName, FreeSpace, "+
-			"Size, SystemName, VolumeSerialNumber "+
-			"from Win32_LogicalDisk WHERE FileSystem = 'NTFS'",
-		"ROOT\\CIMV2")
+func (self *WindowsNTFSFileSystemAccessor) LstatWithOSPath(
+	os_path *accessors.OSPath) (accessors.FileInfo, error) {
+
+	defer Instrument("LstatWithOSPath")()
+
+	err := file.CheckPrefix(os_path)
 	if err != nil {
 		return nil, err
 	}
 
-	result := []*accessors.VirtualFileInfo{}
-	for _, row := range shadow_volumes {
-		device_name, pres := row.GetString("DeviceID")
-		if pres {
-			device_path, err := accessors.NewWindowsNTFSPath("\\\\.\\" + device_name)
-			if err != nil {
-				return nil, err
+	// Calling an LStat on the device shall return file info about the
+	// device itself (including size). e.g. Lstat("\\C:\") -> info about the volume.
+	if len(os_path.Components) == 1 {
+		// Try to match the device to the component required. This can
+		// be either a VSS volume or a Logical disk volume.
+		devices, err := Cache.DiscoverVSS()
+		if err != nil {
+			return nil, err
+		}
+
+		for _, d := range devices {
+			if d.Name() == os_path.Components[0] {
+				return d, nil
 			}
-			virtual_directory := &accessors.VirtualFileInfo{
-				IsDir_: true,
-				Path:   device_path,
-				Data_:  row,
+		}
+		devices, err = Cache.DiscoverLogicalDisks()
+		if err != nil {
+			return nil, err
+		}
+
+		for _, d := range devices {
+			if d.Name() == os_path.Components[0] {
+				return d, nil
 			}
-			result = append(result, virtual_directory)
 		}
 	}
 
-	return result, nil
+	return self.MountFileSystemAccessor.LstatWithOSPath(os_path)
 }
 
 func (self *WindowsNTFSFileSystemAccessor) New(
@@ -106,7 +98,7 @@ func (self *WindowsNTFSFileSystemAccessor) New(
 		age: time.Now(),
 	}
 
-	vss, err := discoverVSS()
+	vss, err := Cache.DiscoverVSS()
 	if err == nil {
 		for _, fi := range vss {
 			root_fs.SetVirtualFileInfo(fi)
@@ -118,7 +110,7 @@ func (self *WindowsNTFSFileSystemAccessor) New(
 		}
 	}
 
-	logical, err := discoverLogicalDisks()
+	logical, err := Cache.DiscoverLogicalDisks()
 	if err == nil {
 		for _, fi := range logical {
 			root_fs.SetVirtualFileInfo(fi)
@@ -134,11 +126,20 @@ func (self *WindowsNTFSFileSystemAccessor) New(
 	return result, nil
 }
 
-func init() {
-	// For backwards compatibility.
-	accessors.Register("lazy_ntfs", &WindowsNTFSFileSystemAccessor{},
-		`Access the NTFS filesystem by parsing NTFS structures.`)
+func (self WindowsNTFSFileSystemAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name:        "ntfs",
+		Description: `Access the NTFS filesystem by parsing NTFS structures.`,
+	}
+}
 
-	accessors.Register("ntfs", &WindowsNTFSFileSystemAccessor{},
-		`Access the NTFS filesystem by parsing NTFS structures.`)
+func init() {
+	// For backwards compatibility. It is the same as "ntfs"
+	accessors.Register(accessors.DescribeAccessor(
+		&WindowsNTFSFileSystemAccessor{},
+		accessors.AccessorDescriptor{
+			Name:        "lazy_ntfs",
+			Description: `Access the NTFS filesystem by parsing NTFS structures.`,
+		}))
+	accessors.Register(&WindowsNTFSFileSystemAccessor{})
 }

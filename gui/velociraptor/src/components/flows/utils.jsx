@@ -15,6 +15,19 @@ const requestToParameters = (request) => {
             _.each(spec.parameters.env, param=>{
                 artifact_parameters[param.key] = param.value;
             });
+            if (spec.max_batch_wait) {
+                artifact_parameters["max_batch_wait"] = spec.max_batch_wait;
+            }
+            if (spec.max_batch_rows) {
+                artifact_parameters["max_batch_rows"] = spec.max_batch_rows;
+            }
+            if (spec.cpu_limit) {
+                artifact_parameters["cpu_limit"] = spec.cpu_limit;
+            }
+            if (spec.timeout) {
+                artifact_parameters["timeout"] = spec.timeout;
+            }
+
             parameters[spec.artifact] = artifact_parameters;
         });
 
@@ -74,8 +87,12 @@ const runArtifact = (client_id, artifact, params, on_success, token)=>{
     });
 };
 
+const getNotebookId = (flow_id, client_id)=>{
+    return "N." + flow_id + "-" + client_id;
+};
 
 export {
     requestToParameters,
     runArtifact,
+    getNotebookId,
 }

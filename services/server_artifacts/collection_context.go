@@ -15,9 +15,12 @@ import (
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	"www.velocidex.com/golang/velociraptor/artifacts"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
+	"www.velocidex.com/golang/velociraptor/executor/throttler"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
+	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	artifact_paths "www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/result_sets"
@@ -37,7 +40,12 @@ type contextManager struct {
 
 	mu sync.Mutex
 
-	ctx        context.Context
+	// This is our parent context - it needs to remain alive after
+	// Cancel() so we can write the collection results
+	ctx context.Context
+
+	// The sub context will be cancelled by Cancel()
+	sub_ctx    context.Context
 	cancel     func()
 	wg         *sync.WaitGroup
 	session_id string
@@ -50,56 +58,57 @@ type contextManager struct {
 
 	row_limit  int64
 	byte_limit int64
+
+	dirty bool
 }
 
 func NewCollectionContextManager(
 	ctx context.Context,
 	wg *sync.WaitGroup,
 	config_obj *config_proto.Config,
-	msg *crypto_proto.VeloMessage) (CollectionContextManager, error) {
+	req *crypto_proto.FlowRequest,
+	collection_context *flows_proto.ArtifactCollectorContext) (
+	CollectionContextManager, error) {
 
-	client_id := "server"
-	flow_id := msg.SessionId
-	if msg.FlowRequest == nil {
-		return nil, errors.New("Invalid request")
-	}
+	flow_id := collection_context.SessionId
 
+	// The cancel is actually embedded in the CollectionContextManager
+	// and will be closed when Close() is called.
+
+	//nolint:govet
 	sub_ctx, cancel := context.WithCancel(ctx)
+
 	log_writer, err := NewServerLogWriter(sub_ctx, config_obj, flow_id)
 	if err != nil {
+		//nolint:govet
 		return nil, err
 	}
 
 	row_limit := int64(1000000)
-	if msg.FlowRequest.MaxRows > 0 {
-		row_limit = int64(msg.FlowRequest.MaxRows)
+	if req.MaxRows > 0 {
+		row_limit = int64(req.MaxRows)
 	}
 
 	byte_limit := int64(1000000000)
-	if msg.FlowRequest.MaxUploadBytes > 0 {
-		byte_limit = int64(msg.FlowRequest.MaxUploadBytes)
+	if req.MaxUploadBytes > 0 {
+		byte_limit = int64(req.MaxUploadBytes)
 	}
 
 	self := &contextManager{
 		config_obj: config_obj,
-		context: &flows_proto.ArtifactCollectorContext{
-			ClientId:  client_id,
-			SessionId: flow_id,
-		},
-		ctx:        sub_ctx,
+		context:    collection_context,
+		ctx:        ctx,
+		sub_ctx:    sub_ctx,
 		cancel:     cancel,
 		wg:         &sync.WaitGroup{},
-		session_id: flow_id,
+		session_id: collection_context.SessionId,
 		log_writer: &counterWriter{ResultSetWriter: log_writer},
 		row_limit:  row_limit,
 		byte_limit: byte_limit,
+		dirty:      true,
 	}
 
-	// Write the collection context periodically to disk so the GUI
-	// can track progress.
-	self.StartRefresh(wg)
-
-	return self, self.Load(self.context)
+	return self, nil
 }
 
 func (self *contextManager) ChargeRow() {
@@ -145,7 +154,7 @@ func (self *contextManager) GetQueryContext(
 
 	// Get the base name of the artifact
 	artifact_name := artifacts.DeobfuscateString(
-		self.config_obj, actions.GetQueryName(query.Query))
+		self.config_obj, utils.GetQueryName(query.Query))
 	base, _ := paths.SplitFullSourceName(artifact_name)
 
 	// Will be done when query is closed.
@@ -202,19 +211,27 @@ func (self *contextManager) StartRefresh(wg *sync.WaitGroup) {
 
 		for {
 			select {
-			case <-self.ctx.Done():
-				self.Save()
+			case <-self.sub_ctx.Done():
+				err := self.Save()
+				if err != nil {
+					logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+					logger.Error("<red>contextManager Save</> %v", err)
+				}
 				return
 
-			case <-time.After(time.Duration(10) * time.Second):
-				self.Save()
+			case <-time.After(utils.Jitter(time.Duration(10) * time.Second)):
+				err := self.Save()
+				if err != nil {
+					logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+					logger.Error("<red>contextManager Save</> %v", err)
+				}
+
 			}
 		}
 	}()
 }
 
-func (self *contextManager) Load(
-	context *flows_proto.ArtifactCollectorContext) error {
+func (self *contextManager) Load() error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
@@ -224,7 +241,8 @@ func (self *contextManager) Load(
 	}
 
 	details, err := launcher.GetFlowDetails(
-		self.config_obj, context.ClientId, context.SessionId)
+		self.ctx, self.config_obj, services.GetFlowOptions{},
+		self.context.ClientId, self.context.SessionId)
 	if err != nil {
 		return err
 	}
@@ -234,6 +252,7 @@ func (self *contextManager) Load(
 	}
 
 	self.context = details.Context
+	self.dirty = false
 	return nil
 }
 
@@ -244,16 +263,21 @@ func (self *contextManager) Save() error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
+	if !self.dirty {
+		return nil
+	}
+
 	launcher, err := services.GetLauncher(self.config_obj)
 	if err != nil {
 		return err
 	}
 
-	return launcher.WriteFlow(
-		self.ctx, self.config_obj, context)
+	return launcher.Storage().WriteFlow(
+		self.ctx, // Write with parent context as query may have cancelled.
+		self.config_obj, context, utils.BackgroundWriter)
 }
 
-func (self *contextManager) Cancel(principal string) {
+func (self *contextManager) Cancel(ctx context.Context, principal string) {
 	self.mu.Lock()
 	for _, query_ctx := range self.query_contexts {
 		query_ctx.UpdateStatus(func(s *crypto_proto.VeloStatus) {
@@ -263,23 +287,43 @@ func (self *contextManager) Cancel(principal string) {
 	}
 	self.mu.Unlock()
 
+	self.maybeSendCompletionMessage(ctx)
 	self.cancel()
-
 	self.wg.Wait()
-	self.maybeSendCompletionMessage()
 }
 
-func (self *contextManager) Close() {
+func (self *contextManager) Close(ctx context.Context) {
+	self.maybeSendCompletionMessage(ctx)
+	self.cancel()
 	self.wg.Wait()
-	self.maybeSendCompletionMessage()
 }
 
 // Called when each query is completed. Will send the message once for
 // the entire flow completion.
-func (self *contextManager) maybeSendCompletionMessage() {
+func (self *contextManager) maybeSendCompletionMessage(ctx context.Context) {
 	flow_context := self.GetContext()
-	if flow_context.State == flows_proto.ArtifactCollectorContext_RUNNING {
+	if flow_context.UserNotified ||
+		flow_context.State == flows_proto.ArtifactCollectorContext_RUNNING {
 		return
+	}
+
+	// Remember that we notified this already.
+	self.mu.Lock()
+	self.context.UserNotified = true
+	self.mu.Unlock()
+
+	launcher, err := services.GetLauncher(self.config_obj)
+	if err != nil {
+		return
+	}
+
+	// Write the context synchronously because listeners may be wait
+	// for the messages.
+	err = launcher.Storage().WriteFlow(
+		ctx, self.config_obj, flow_context, utils.SyncCompleter)
+	if err != nil {
+		logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+		logger.Error("<red>maybeSendCompletionMessage WriteFlow</> %v", err)
 	}
 
 	row := ordereddict.NewDict().
@@ -292,10 +336,8 @@ func (self *contextManager) maybeSendCompletionMessage() {
 	if err != nil {
 		return
 	}
-	journal.PushRowsToArtifact(self.config_obj,
-		[]*ordereddict.Dict{row},
-		"System.Flow.Completion", "server", self.session_id,
-	)
+	journal.PushRowsToArtifactAsync(ctx, self.config_obj,
+		row, "System.Flow.Completion")
 }
 
 func (self *contextManager) RunQuery(
@@ -306,7 +348,7 @@ func (self *contextManager) RunQuery(
 	query_context := self.GetQueryContext(arg)
 	defer query_context.Close()
 
-	sub_ctx, cancel := context.WithCancel(self.ctx)
+	sub_ctx, cancel := context.WithCancel(self.sub_ctx)
 	defer cancel()
 
 	// Set up the logger for writing query logs. Note this must be
@@ -336,8 +378,14 @@ func (self *contextManager) RunQuery(
 	}
 
 	principal := arg.Principal
-	if principal == "" && self.config_obj.Client != nil {
-		principal = self.config_obj.Client.PinnedServerName
+	if principal == "" {
+		return errors.New("Principal must be set")
+	}
+
+	// Allow the query to run as a different user.
+	effective_principal := arg.EffectivePrincipal
+	if effective_principal == "" {
+		effective_principal = principal
 	}
 
 	flow_path_manager := paths.NewFlowPathManager("server", self.session_id)
@@ -353,12 +401,22 @@ func (self *contextManager) RunQuery(
 
 		// Run this query on behalf of the caller so they are
 		// subject to ACL checks
-		ACLManager: acl_managers.NewServerACLManager(self.config_obj, principal),
+		ACLManager: acl_managers.NewServerACLManager(self.config_obj, effective_principal),
 		Logger:     log.New(query_context.Logger(), "", 0),
 	})
 	defer scope.Close()
 
-	scope.Log("Running query on behalf of user %v", principal)
+	// Add some additional context for debugging
+	artifact_name := artifacts.DeobfuscateString(
+		self.config_obj, utils.GetQueryName(arg.Query))
+	scope.SetContext(constants.SCOPE_QUERY_NAME, artifact_name)
+
+	if effective_principal == principal {
+		scope.Log("Running query %v on behalf of user %v", artifact_name, principal)
+	} else {
+		scope.Log("Running query %v on behalf of user %v with effective permissions for %v",
+			artifact_name, principal, effective_principal)
+	}
 
 	env := ordereddict.NewDict()
 	for _, env_spec := range arg.Env {
@@ -375,15 +433,40 @@ func (self *contextManager) RunQuery(
 		}
 	}()
 
-	scope.Log("<green>Starting</> query execution.")
+	scope.Log("<green>Starting</> query %v execution.", artifact_name)
+
+	rate := arg.OpsPerSecond
+	cpu_limit := arg.CpuLimit
+	iops_limit := arg.IopsLimit
+
+	throttler, closer := throttler.NewThrottler(self.ctx, scope, self.config_obj,
+		float64(rate), float64(cpu_limit), float64(iops_limit))
+
+	if arg.ProgressTimeout > 0 {
+		duration := time.Duration(arg.ProgressTimeout) * time.Second
+		throttler = actions.NewProgressThrottler(
+			sub_ctx, scope, cancel, throttler, duration)
+		scope.Log("query: Installing a progress alarm for %v", duration)
+	}
+	scope.SetThrottler(throttler)
+	err = scope.AddDestructor(closer)
+	if err != nil {
+		closer()
+		return err
+	}
 
 	// All the queries will use the same scope. This allows one
 	// query to define functions for the next query in order.
 	for _, query := range arg.Query {
 		query_log := actions.QueryLog.AddQuery(query.VQL)
 
+		// Might not be called until all queries are processed but it
+		// is ok to call Close() multiple times on the query log.
+		defer query_log.Close()
+
 		vql, err := vfilter.Parse(query.VQL)
 		if err != nil {
+			query_log.Close()
 			return err
 		}
 
@@ -393,6 +476,7 @@ func (self *contextManager) RunQuery(
 			// are normally LET queries.
 			for _ = range vql.Eval(sub_ctx, scope) {
 			}
+			query_log.Close()
 			continue
 		}
 

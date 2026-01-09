@@ -1,43 +1,46 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package main
 
 import (
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"os"
 	"strings"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/Velocidex/yaml/v2"
+	errors "github.com/go-errors/errors"
+	"software.sslmate.com/src/go-pkcs12"
 
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/crypto"
+	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/users"
 	"www.velocidex.com/golang/velociraptor/startup"
+	vsurvey "www.velocidex.com/golang/velociraptor/tools/survey"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -75,6 +78,9 @@ var (
 		"output", "The filename to write the config file on.").
 		Required().String()
 
+	config_api_client_pkcs12_output = config_api_client_command.Flag(
+		"pkcs12", "A filename to write the pkcs12 certificate file").String()
+
 	config_generate_command = config_command.Command(
 		"generate",
 		"Generate a new config file to stdout (with new keys).")
@@ -100,12 +106,23 @@ var (
 		File()
 
 	config_rotate_server_key = config_command.Command(
-		"rotate_key",
-		"Generate a new config file with a rotates server key.")
+		"rotate_keys",
+		"Regenerate server private keys and reissue certificates.")
+
+	config_rotate_server_key_validity = config_rotate_server_key.Flag(
+		"validity",
+		"How long should the new certs be valid for in days (default 365).").Int64()
 
 	config_reissue_server_key = config_command.Command(
-		"reissue_key",
-		"Reissue all certificates with the same keys.")
+		"reissue_certs",
+		"Reissue server certificates for the existing private keys.")
+
+	config_reissue_server_key_validity = config_reissue_server_key.Flag(
+		"validity",
+		"How long should the new certs be valid for in days (default 365).").Int64()
+
+	config_frontend_command = config_command.Command(
+		"frontend", "Experimental: Create multi-frontend configuration")
 )
 
 func maybeGetOrgConfig(
@@ -126,6 +143,8 @@ func maybeGetOrgConfig(
 }
 
 func doShowConfig() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		LoadAndValidate()
 	if err != nil {
@@ -178,61 +197,15 @@ func doShowConfig() error {
 	return nil
 }
 
-func generateNewKeys(config_obj *config_proto.Config) error {
-	ca_bundle, err := crypto.GenerateCACert(2048)
-	if err != nil {
-		return fmt.Errorf("Unable to create CA cert: %w", err)
-	}
-
-	config_obj.Client.CaCertificate = ca_bundle.Cert
-	config_obj.CA.PrivateKey = ca_bundle.PrivateKey
-
-	nonce := make([]byte, 8)
-	_, err = rand.Read(nonce)
-	if err != nil {
-		return fmt.Errorf("Unable to create nonce: %w", err)
-	}
-	config_obj.Client.Nonce = base64.StdEncoding.EncodeToString(nonce)
-
-	// Make another nonce for VQL obfuscation.
-	_, err = rand.Read(nonce)
-	if err != nil {
-		return fmt.Errorf("Unable to create nonce: %w", err)
-	}
-	config_obj.ObfuscationNonce = base64.StdEncoding.EncodeToString(nonce)
-
-	// Generate frontend certificate. Frontend certificates must
-	// have a constant common name - clients will refuse to talk
-	// with another common name.
-	frontend_cert, err := crypto.GenerateServerCert(
-		config_obj, config_obj.Client.PinnedServerName)
-	if err != nil {
-		return fmt.Errorf("Unable to create Frontend cert: %w", err)
-	}
-
-	config_obj.Frontend.Certificate = frontend_cert.Cert
-	config_obj.Frontend.PrivateKey = frontend_cert.PrivateKey
-
-	// Generate gRPC gateway certificate.
-	gw_certificate, err := crypto.GenerateServerCert(
-		config_obj, config_obj.API.PinnedGwName)
-	if err != nil {
-		return fmt.Errorf("Unable to create Frontend cert: %w", err)
-	}
-
-	config_obj.GUI.GwCertificate = gw_certificate.Cert
-	config_obj.GUI.GwPrivateKey = gw_certificate.PrivateKey
-
-	return nil
-}
-
 func doGenerateConfigNonInteractive() error {
+	logging.DisableLogging()
+
 	// We have to suppress writing to stdout so users can redirect
 	// output to a file.
 	logging.SuppressLogging = true
 	config_obj := config.GetDefaultConfig()
 
-	err := generateNewKeys(config_obj)
+	err := vsurvey.GenerateNewKeys(config_obj)
 	if err != nil {
 		return fmt.Errorf("Unable to create config: %w", err)
 	}
@@ -257,15 +230,24 @@ func doGenerateConfigNonInteractive() error {
 }
 
 func doRotateKeyConfig() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredFrontend().LoadAndValidate()
 	if err != nil {
 		return err
 	}
 
+	if *config_rotate_server_key_validity > 0 {
+		if config_obj.Security == nil {
+			config_obj.Security = &config_proto.Security{}
+		}
+		config_obj.Security.CertificateValidityDays = *config_rotate_server_key_validity
+	}
+
 	// Frontends must have a well known common name.
 	frontend_cert, err := crypto.GenerateServerCert(
-		config_obj, config_obj.Client.PinnedServerName)
+		config_obj, utils.GetSuperuserName(config_obj))
 	if err != nil {
 		return fmt.Errorf("Unable to create Frontend cert: %w", err)
 	}
@@ -275,7 +257,7 @@ func doRotateKeyConfig() error {
 
 	// Generate gRPC gateway certificate.
 	gw_certificate, err := crypto.GenerateServerCert(
-		config_obj, config_obj.API.PinnedGwName)
+		config_obj, utils.GetGatewayName(config_obj))
 	if err != nil {
 		return err
 	}
@@ -293,15 +275,23 @@ func doRotateKeyConfig() error {
 }
 
 func doReissueServerKeys() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredFrontend().LoadAndValidate()
 	if err != nil {
 		return err
 	}
 
+	if *config_reissue_server_key_validity > 0 {
+		if config_obj.Defaults == nil {
+			config_obj.Defaults = &config_proto.Defaults{}
+		}
+		config_obj.Defaults.CertificateValidityDays = *config_reissue_server_key_validity
+	}
+
 	logger := logging.GetLogger(config_obj, &logging.ToolComponent)
 
-	// Frontends must have a well known common name.
 	frontend_cert, err := crypto.ReissueServerCert(
 		config_obj, config_obj.Frontend.Certificate,
 		config_obj.Frontend.PrivateKey)
@@ -332,18 +322,9 @@ func doReissueServerKeys() error {
 	return nil
 }
 
-func getClientConfig(config_obj *config_proto.Config) *config_proto.Config {
-	// Copy only settings relevant to the client from the main
-	// config.
-	client_config := &config_proto.Config{
-		Version: config_obj.Version,
-		Client:  config_obj.Client,
-	}
-
-	return client_config
-}
-
 func doDumpClientConfig() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredClient().LoadAndValidate()
 	if err != nil {
@@ -353,6 +334,7 @@ func doDumpClientConfig() error {
 	ctx, cancel := install_sig_handler()
 	defer cancel()
 
+	config_obj.Services = services.GenericToolServices()
 	sm, err := startup.StartToolServices(ctx, config_obj)
 	if err != nil {
 		return fmt.Errorf("Starting services: %w", err)
@@ -364,7 +346,7 @@ func doDumpClientConfig() error {
 		return err
 	}
 
-	client_config := getClientConfig(config_obj)
+	client_config := config.GetClientConfig(config_obj)
 	res, err := yaml.Marshal(client_config)
 	if err != nil {
 		return fmt.Errorf("Unable to encode config: %w", err)
@@ -375,6 +357,8 @@ func doDumpClientConfig() error {
 }
 
 func doDumpApiClientConfig() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredCA().
 		WithRequiredUser().
@@ -383,9 +367,13 @@ func doDumpApiClientConfig() error {
 		return err
 	}
 
-	if *config_api_client_common_name == config_obj.Client.PinnedServerName {
-		kingpin.Fatalf("Name reserved! You may not name your " +
-			"api keys with this name.")
+	err = users.ValidateUsername(config_obj, *config_api_client_common_name)
+	if err != nil {
+		return err
+	}
+
+	if config_obj.Client == nil {
+		return errors.New("Config does not have a client config!")
 	}
 
 	config_obj.Services = services.GenericToolServices()
@@ -405,12 +393,9 @@ func doDumpApiClientConfig() error {
 		return fmt.Errorf("Unable to generate certificate: %w", err)
 	}
 
+	password := ""
 	if *config_api_client_password_protect {
-		password := ""
-		err = survey.AskOne(
-			&survey.Password{Message: "Password:"},
-			&password,
-			survey.WithValidator(survey.Required))
+		password, err = vsurvey.GetAPIClientPassword()
 		if err != nil {
 			return err
 		}
@@ -428,7 +413,34 @@ func doDumpApiClientConfig() error {
 		}
 
 		bundle.PrivateKey = string(pem.EncodeToMemory(block))
-		return nil
+	}
+
+	// Possibly dump out the pkcs12 key
+	if *config_api_client_pkcs12_output != "" {
+		ca_cert, err := crypto_utils.ParseX509CertFromPemStr([]byte(
+			config_obj.Client.CaCertificate))
+		if err != nil {
+			return err
+		}
+
+		data, err := pkcs12.Encode(rand.Reader, bundle.PrivateKeyObj,
+			bundle.Certificate, []*x509.Certificate{ca_cert}, password)
+		if err != nil {
+			return err
+		}
+
+		fd, err := os.OpenFile(*config_api_client_pkcs12_output,
+			os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+		if err != nil {
+			return err
+		}
+		_, err = fd.Write(data)
+		if err != nil {
+			return err
+		}
+		fd.Close()
+
+		fmt.Printf("Wrote PKCS12 file on %v.\n", *config_api_client_pkcs12_output)
 	}
 
 	api_client_config := &config_proto.ApiClientConfig{
@@ -480,7 +492,8 @@ func doDumpApiClientConfig() error {
 
 		// Make sure the user actually exists.
 		user_manager := services.GetUserManager()
-		_, err = user_manager.GetUser(ctx, *config_api_client_common_name)
+		_, err = user_manager.GetUser(ctx,
+			utils.GetSuperuserName(config_obj), *config_api_client_common_name)
 		if err != nil {
 			// Need to ensure we have a user
 			err := user_manager.SetUser(ctx, &api_proto.VelociraptorUser{
@@ -495,6 +508,31 @@ func doDumpApiClientConfig() error {
 		fmt.Printf("No role added to user %v. You will need to do this later using the 'acl grant' command.", *config_api_client_common_name)
 	}
 	return nil
+}
+
+func doGenerateConfigInteractive() error {
+	config_obj, err := vsurvey.GetInteractiveConfig()
+	if err != nil {
+		return err
+	}
+
+	return vsurvey.StoreServerConfig(config_obj)
+}
+
+func doConfigFrontend() error {
+	logging.DisableLogging()
+
+	config_obj, err := makeDefaultConfigLoader().
+		WithRequiredFrontend().LoadAndValidate()
+	if err != nil {
+		return err
+	}
+
+	if config_obj.Frontend == nil {
+		return errors.New("Must provide a frontend config")
+	}
+
+	return vsurvey.GenerateFrontendPackages(config_obj)
 }
 
 func init() {
@@ -521,6 +559,9 @@ func init() {
 
 		case config_api_client_command.FullCommand():
 			FatalIfError(config_api_client_command, doDumpApiClientConfig)
+
+		case config_frontend_command.FullCommand():
+			FatalIfError(config_frontend_command, doConfigFrontend)
 
 		default:
 			return false

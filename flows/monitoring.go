@@ -6,6 +6,7 @@ package flows
 
 import (
 	"bytes"
+	"context"
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/prometheus/client_golang/prometheus"
@@ -14,7 +15,6 @@ import (
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
-	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/json"
 	artifact_paths "www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/result_sets"
@@ -36,7 +36,7 @@ type jsonBatch struct {
 
 // Receive monitoring messages from the client.
 func MonitoringProcessMessage(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	collection_context *CollectionContext,
 	message *crypto_proto.VeloMessage) error {
 
@@ -48,7 +48,7 @@ func MonitoringProcessMessage(
 
 	switch message.RequestId {
 	case constants.TransferWellKnownFlowId:
-		return appendUploadDataToFile(
+		return appendUploadDataToFile(ctx,
 			config_obj, collection_context, message)
 
 	}
@@ -81,7 +81,7 @@ func MonitoringProcessMessage(
 // Logs from monitoring flow need to be handled especially since they
 // are written with a time index.
 func flushContextLogsMonitoring(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	collection_context *CollectionContext) error {
 
 	// A single packet may have multiple log messages from
@@ -90,7 +90,6 @@ func flushContextLogsMonitoring(
 	writers := make(map[string]result_sets.TimedResultSetWriter)
 
 	// Append logs to messages from previous packets.
-	file_store_factory := file_store.GetFileStore(config_obj)
 	for _, row := range collection_context.Logs {
 		artifact_name := row.Artifact
 		if artifact_name == "" {
@@ -100,7 +99,7 @@ func flushContextLogsMonitoring(
 		// Try to get the writer from the cache.
 		rs_writer, pres := writers[artifact_name]
 		if !pres {
-			log_path_manager, err := artifact_paths.NewArtifactLogPathManager(
+			log_path_manager, err := artifact_paths.NewArtifactLogPathManager(ctx,
 				config_obj, collection_context.ClientId,
 				collection_context.SessionId, artifact_name)
 			if err != nil {
@@ -109,7 +108,7 @@ func flushContextLogsMonitoring(
 
 			// Write the logs asynchronously
 			rs_writer, err = result_sets.NewTimedResultSetWriter(
-				file_store_factory, log_path_manager, json.DefaultEncOpts(),
+				config_obj, log_path_manager, json.DefaultEncOpts(),
 				utils.BackgroundWriter)
 			if err != nil {
 				return err
@@ -142,7 +141,7 @@ func (self *CollectionContext) batchRows(
 }
 
 func flushMonitoringLogs(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	collection_context *CollectionContext) error {
 
 	journal, err := services.GetJournal(config_obj)
@@ -152,6 +151,7 @@ func flushMonitoringLogs(
 
 	for query_name, jsonl_buff := range collection_context.monitoring_batch {
 		err := journal.PushJsonlToArtifact(
+			ctx,
 			config_obj,
 			jsonl_buff.Bytes(), jsonl_buff.row_count,
 			query_name,

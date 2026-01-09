@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package utils
 
@@ -30,8 +30,8 @@ import (
 	"fmt"
 
 	"github.com/go-errors/errors"
-	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -45,6 +45,9 @@ func GetPrivateKeyFromScope(scope vfilter.Scope) (*rsa.PrivateKey, error) {
 		return nil, errors.New("Must be running on server!")
 	}
 
+	if config_obj.Frontend == nil {
+		return nil, errors.New("No frontend configuration given")
+	}
 	private_key := config_obj.Frontend.PrivateKey
 
 	key, err := ParseRsaPrivateKeyFromPemStr([]byte(private_key))
@@ -143,11 +146,11 @@ func ParseX509CSRFromPemStr(pem_str []byte) (*x509.CertificateRequest, error) {
 	}
 }
 
-/* Velociraptor Client IDs are derived from the public key of the client.
+/*
+	Velociraptor Client IDs are derived from the public key of the client.
 
 This makes it impossible to impersonate a client unless one has the
 client's corresponding private key.
-
 */
 func ClientIDFromPublicKey(public_key *rsa.PublicKey) string {
 	raw_n := public_key.N.Bytes()
@@ -211,48 +214,43 @@ func VerifyConfig(config_obj *config_proto.Config) error {
 		return errors.New("No server URLs configured!")
 	}
 
-	writeback, err := config.GetWriteback(config_obj.Client)
-	if err != nil {
-		writeback = &config_proto.Writeback{}
-	}
+	writeback_service := writeback.GetWritebackService()
+	return writeback_service.MutateWriteback(config_obj,
+		func(wb *config_proto.Writeback) error {
+			if wb.PrivateKey != "" {
+				// Add a client id for information here.
+				if wb.ClientId == "" {
+					private_key, err := ParseRsaPrivateKeyFromPemStr(
+						[]byte(wb.PrivateKey))
+					if err != nil {
+						return errors.Wrap(err, 0)
+					}
 
-	if writeback.PrivateKey == "" {
-		fmt.Println("Generating new private key....")
-		pem, err := GeneratePrivateKey()
-		if err != nil {
-			return errors.Wrap(err, 0)
-		}
+					wb.ClientId = ClientIDFromPublicKey(
+						&private_key.PublicKey)
+					return writeback.WritebackUpdateLevel1
+				}
 
-		private_key, err := ParseRsaPrivateKeyFromPemStr(pem)
-		if err != nil {
-			return errors.Wrap(err, 0)
-		}
+				return writeback.WritebackNoUpdate
+			}
 
-		// Add a client id for information here
-		writeback.ClientId = ClientIDFromPublicKey(&private_key.PublicKey)
-		writeback.PrivateKey = string(pem)
-		err = config.UpdateWriteback(config_obj.Client, writeback)
-		if err != nil {
-			return fmt.Errorf("During UpdateWriteback: %w", err)
-		}
-	}
+			fmt.Println("Generating new private key....")
+			pem, err := GeneratePrivateKey()
+			if err != nil {
+				return errors.Wrap(err, 0)
+			}
 
-	// Make sure the client if is set in the writeback.
-	if writeback.ClientId == "" {
-		private_key, err := ParseRsaPrivateKeyFromPemStr([]byte(writeback.PrivateKey))
-		if err != nil {
-			return errors.Wrap(err, 0)
-		}
+			private_key, err := ParseRsaPrivateKeyFromPemStr(pem)
+			if err != nil {
+				return errors.Wrap(err, 0)
+			}
 
-		// Add a client id for information here
-		writeback.ClientId = ClientIDFromPublicKey(&private_key.PublicKey)
-		err = config.UpdateWriteback(config_obj.Client, writeback)
-		if err != nil {
-			return fmt.Errorf("During UpdateWriteback: %w", err)
-		}
-	}
+			// Add a client id for information here
+			wb.ClientId = ClientIDFromPublicKey(&private_key.PublicKey)
+			wb.PrivateKey = string(pem)
 
-	return nil
+			return writeback.WritebackUpdateLevel1
+		})
 }
 
 func GetSubjectName(cert *x509.Certificate) string {

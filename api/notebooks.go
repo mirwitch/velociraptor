@@ -1,31 +1,25 @@
 package api
 
 import (
-	"crypto/md5"
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Velocidex/ordereddict"
 	errors "github.com/go-errors/errors"
-	"github.com/sirupsen/logrus"
-	context "golang.org/x/net/context"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"www.velocidex.com/golang/velociraptor/acls"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
-	file_store "www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/paths"
-	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql/server/notebooks"
+)
+
+const (
+	SKIP_UPLOADS = false
 )
 
 // Get all the current user's notebooks and those notebooks shared
@@ -47,8 +41,7 @@ func (self *ApiServer) GetNotebooks(
 	permissions := acls.READ_RESULTS
 	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
-			"User is not allowed to read notebooks.")
+		return nil, PermissionDenied(err, "User is not allowed to read notebooks.")
 	}
 
 	result := &api_proto.Notebooks{}
@@ -58,45 +51,66 @@ func (self *ApiServer) GetNotebooks(
 		return nil, Status(self.verbose, err)
 	}
 
-	// We want a single notebook metadata.
-	if in.NotebookId != "" {
-		notebook_metadata, err := notebook_manager.GetNotebook(ctx, in.NotebookId)
-		// Handle the EOF especially: it means there is no such
-		// notebook and return an empty result set.
-		if errors.Is(err, os.ErrNotExist) ||
-			(notebook_metadata != nil && notebook_metadata.NotebookId == "") {
-			return result, nil
-		}
-
+	// List all the timelines
+	if in.IncludeTimelines {
+		// This is only called for global notebooks because client and
+		// hunt notebooks always specify the exact notebook id.
+		notebooks, err := notebook_manager.GetAllNotebooks(ctx,
+			services.NotebookSearchOptions{
+				Username:  principal,
+				Timelines: true,
+			})
 		if err != nil {
-			logging.GetLogger(
-				org_config_obj, &logging.FrontendComponent).
-				Error("Unable to open notebook: %v", err)
 			return nil, Status(self.verbose, err)
 		}
 
-		// Document not owned or collaborated with.
-		if !notebook_manager.CheckNotebookAccess(notebook_metadata, principal) {
-			logging.LogAudit(org_config_obj, principal, "notebook not shared.",
-				logrus.Fields{
-					"action":   "Access Denied",
-					"notebook": in.NotebookId,
-					"error":    err.Error(),
-				})
-			return nil, InvalidStatus("User has no access to this notebook")
-		}
+		for _, n := range notebooks {
+			result.Items = append(result.Items,
+				proto.Clone(n).(*api_proto.NotebookMetadata))
 
-		result.Items = append(result.Items, notebook_metadata)
+			if uint64(len(result.Items)) > in.Count {
+				break
+			}
+		}
 		return result, nil
 	}
 
-	notebooks, err := notebook_manager.GetSharedNotebooks(ctx,
-		principal, in.Offset, in.Count)
+	if in.NotebookId == "" {
+		return nil, Status(self.verbose, errors.New("NotebookId must be specified"))
+	}
+
+	notebook_metadata, err := notebook_manager.GetNotebook(
+		ctx, in.NotebookId, in.IncludeUploads)
+	// Handle the EOF especially: it means there is no such
+	// notebook and return an empty result set.
+	if errors.Is(err, os.ErrNotExist) ||
+		(notebook_metadata != nil && notebook_metadata.NotebookId == "") {
+		return result, nil
+	}
+
 	if err != nil {
+		logging.GetLogger(
+			org_config_obj, &logging.FrontendComponent).
+			Error("Unable to open notebook: %v", err)
 		return nil, Status(self.verbose, err)
 	}
 
-	result.Items = notebooks
+	// Document not owned or collaborated with.
+	if !notebook_manager.CheckNotebookAccess(notebook_metadata, principal) {
+		err := services.LogAudit(ctx,
+			org_config_obj, principal, "notebook not shared.",
+			ordereddict.NewDict().
+				Set("action", "Access Denied").
+				Set("notebook", in.NotebookId))
+		if err != nil {
+			logger := logging.GetLogger(org_config_obj, &logging.FrontendComponent)
+			logger.Error("<red>notebook not shared</> %v %v", principal, in.NotebookId)
+		}
+
+		return nil, InvalidStatus("User has no access to this notebook")
+	}
+
+	result.Items = append(result.Items, notebook_metadata)
 	return result, nil
 }
 
@@ -116,7 +130,7 @@ func (self *ApiServer) NewNotebook(
 	permissions := acls.NOTEBOOK_EDITOR
 	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to create notebooks.")
 	}
 
@@ -149,7 +163,7 @@ func (self *ApiServer) NewNotebookCell(
 	permissions := acls.NOTEBOOK_EDITOR
 	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to edit notebooks.")
 	}
 
@@ -180,7 +194,7 @@ func (self *ApiServer) UpdateNotebook(
 	permissions := acls.NOTEBOOK_EDITOR
 	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to edit notebooks.")
 	}
 
@@ -191,17 +205,13 @@ func (self *ApiServer) UpdateNotebook(
 		return nil, Status(self.verbose, err)
 	}
 
-	old_notebook, err := notebook_manager.GetNotebook(ctx, in.NotebookId)
+	old_notebook, err := notebook_manager.GetNotebook(ctx, in.NotebookId, SKIP_UPLOADS)
 	if err != nil {
 		return nil, Status(self.verbose, err)
 	}
 
 	if !notebook_manager.CheckNotebookAccess(old_notebook, principal) {
 		return nil, InvalidStatus("Notebook is not shared with user.")
-	}
-
-	if old_notebook.ModifiedTime != in.ModifiedTime {
-		return nil, InvalidStatus("Edit clash detected.")
 	}
 
 	// When updating an existing notebook only certain fields may
@@ -224,6 +234,52 @@ func (self *ApiServer) UpdateNotebook(
 	return in, notebook_manager.UpdateNotebook(ctx, in)
 }
 
+func (self *ApiServer) DeleteNotebook(
+	ctx context.Context,
+	in *api_proto.NotebookMetadata) (*emptypb.Empty, error) {
+
+	defer Instrument("DeleteNotebook")()
+
+	if !strings.HasPrefix(in.NotebookId, "N.") {
+		return nil, InvalidStatus("Invalid NoteboookId")
+	}
+
+	users := services.GetUserManager()
+	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+	principal := user_record.Name
+
+	permissions := acls.NOTEBOOK_EDITOR
+	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
+	if !perm || err != nil {
+		return nil, PermissionDenied(err,
+			"User is not allowed to delete notebooks.")
+	}
+
+	// If the notebook is not properly shared with the user they
+	// may not edit it.
+	notebook_manager, err := services.GetNotebookManager(org_config_obj)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	old_notebook, err := notebook_manager.GetNotebook(ctx, in.NotebookId, SKIP_UPLOADS)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	if !notebook_manager.CheckNotebookAccess(old_notebook, principal) {
+		return nil, InvalidStatus("Notebook is not shared with user.")
+	}
+
+	err = notebook_manager.DeleteNotebook(ctx, in.NotebookId, nil,
+		true /* really_do_it */)
+
+	return &emptypb.Empty{}, Status(self.verbose, err)
+}
+
 func (self *ApiServer) GetNotebookCell(
 	ctx context.Context,
 	in *api_proto.NotebookCellRequest) (*api_proto.NotebookCell, error) {
@@ -231,11 +287,11 @@ func (self *ApiServer) GetNotebookCell(
 	defer Instrument("GetNotebookCell")()
 
 	if !strings.HasPrefix(in.NotebookId, "N.") {
-		return nil, InvalidStatus("Invalid NoteboookId")
+		return nil, InvalidStatus("Invalid NotebookId")
 	}
 
 	if !strings.HasPrefix(in.CellId, "NC.") {
-		return nil, InvalidStatus("Invalid NoteboookCellId")
+		return nil, InvalidStatus("Invalid NotebookCellId")
 	}
 
 	users := services.GetUserManager()
@@ -248,7 +304,7 @@ func (self *ApiServer) GetNotebookCell(
 	permissions := acls.READ_RESULTS
 	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to read notebooks.")
 	}
 
@@ -257,7 +313,7 @@ func (self *ApiServer) GetNotebookCell(
 		return nil, Status(self.verbose, err)
 	}
 
-	notebook_metadata, err := notebook_manager.GetNotebook(ctx, in.NotebookId)
+	notebook_metadata, err := notebook_manager.GetNotebook(ctx, in.NotebookId, SKIP_UPLOADS)
 	if err != nil {
 		return nil, Status(self.verbose, err)
 	}
@@ -266,7 +322,7 @@ func (self *ApiServer) GetNotebookCell(
 		return nil, InvalidStatus("Notebook is not shared with user.")
 	}
 
-	return notebook_manager.GetNotebookCell(ctx, in.NotebookId, in.CellId)
+	return notebook_manager.GetNotebookCell(ctx, in.NotebookId, in.CellId, in.Version)
 }
 
 func (self *ApiServer) UpdateNotebookCell(
@@ -276,11 +332,11 @@ func (self *ApiServer) UpdateNotebookCell(
 	defer Instrument("UpdateNotebookCell")()
 
 	if !strings.HasPrefix(in.NotebookId, "N.") {
-		return nil, InvalidStatus("Invalid NoteboookId")
+		return nil, InvalidStatus("Invalid NotebookId")
 	}
 
 	if !strings.HasPrefix(in.CellId, "NC.") {
-		return nil, InvalidStatus("Invalid NoteboookCellId")
+		return nil, InvalidStatus("Invalid NotebookCellId")
 	}
 
 	users := services.GetUserManager()
@@ -293,7 +349,7 @@ func (self *ApiServer) UpdateNotebookCell(
 	permissions := acls.NOTEBOOK_EDITOR
 	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to edit notebooks.")
 	}
 
@@ -303,7 +359,7 @@ func (self *ApiServer) UpdateNotebookCell(
 	}
 
 	// Check that the user has access to this notebook.
-	notebook_metadata, err := notebook_manager.GetNotebook(ctx, in.NotebookId)
+	notebook_metadata, err := notebook_manager.GetNotebook(ctx, in.NotebookId, SKIP_UPLOADS)
 	if err != nil {
 		return nil, Status(self.verbose, err)
 	}
@@ -312,22 +368,23 @@ func (self *ApiServer) UpdateNotebookCell(
 		return nil, InvalidStatus("Notebook is not shared with user.")
 	}
 
-	return notebook_manager.UpdateNotebookCell(
+	res, err := notebook_manager.UpdateNotebookCell(
 		ctx, notebook_metadata, principal, in)
+	return res, Status(self.verbose, err)
 }
 
-func (self *ApiServer) CancelNotebookCell(
+func (self *ApiServer) RevertNotebookCell(
 	ctx context.Context,
-	in *api_proto.NotebookCellRequest) (*emptypb.Empty, error) {
+	in *api_proto.NotebookCellRequest) (*api_proto.NotebookCell, error) {
 
-	defer Instrument("CancelNotebookCell")()
+	defer Instrument("RevertNotebookCell")()
 
 	if !strings.HasPrefix(in.NotebookId, "N.") {
-		return nil, InvalidStatus("Invalid NoteboookId")
+		return nil, InvalidStatus("Invalid NotebookId")
 	}
 
 	if !strings.HasPrefix(in.CellId, "NC.") {
-		return nil, InvalidStatus("Invalid NoteboookCellId")
+		return nil, InvalidStatus("Invalid NotebookCellId")
 	}
 
 	users := services.GetUserManager()
@@ -340,7 +397,55 @@ func (self *ApiServer) CancelNotebookCell(
 	permissions := acls.NOTEBOOK_EDITOR
 	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
+			"User is not allowed to edit notebooks.")
+	}
+
+	notebook_manager, err := services.GetNotebookManager(org_config_obj)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	// Check that the user has access to this notebook.
+	notebook_metadata, err := notebook_manager.GetNotebook(ctx, in.NotebookId, SKIP_UPLOADS)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	if !notebook_manager.CheckNotebookAccess(notebook_metadata, principal) {
+		return nil, InvalidStatus("Notebook is not shared with user.")
+	}
+
+	res, err := notebook_manager.RevertNotebookCellVersion(
+		ctx, in.NotebookId, in.CellId, in.Version)
+	return res, Status(self.verbose, err)
+}
+
+func (self *ApiServer) CancelNotebookCell(
+	ctx context.Context,
+	in *api_proto.NotebookCellRequest) (*emptypb.Empty, error) {
+
+	defer Instrument("CancelNotebookCell")()
+
+	if !strings.HasPrefix(in.NotebookId, "N.") {
+		return nil, InvalidStatus("Invalid NotebookId")
+	}
+
+	if !strings.HasPrefix(in.CellId, "NC.") {
+		return nil, InvalidStatus("Invalid NotebookCellId")
+	}
+
+	users := services.GetUserManager()
+	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+	principal := user_record.Name
+
+	permissions := acls.NOTEBOOK_EDITOR
+	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
+	if !perm || err != nil {
+		return nil, PermissionDenied(err,
 			"User is not allowed to edit notebooks.")
 	}
 
@@ -350,7 +455,7 @@ func (self *ApiServer) CancelNotebookCell(
 	}
 
 	return &emptypb.Empty{}, notebook_manager.CancelNotebookCell(
-		ctx, in.NotebookId, in.CellId)
+		ctx, in.NotebookId, in.CellId, in.Version)
 }
 
 func (self *ApiServer) UploadNotebookAttachment(
@@ -369,7 +474,7 @@ func (self *ApiServer) UploadNotebookAttachment(
 	permissions := acls.NOTEBOOK_EDITOR
 	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to edit notebooks.")
 	}
 
@@ -377,7 +482,11 @@ func (self *ApiServer) UploadNotebookAttachment(
 	if err != nil {
 		return nil, Status(self.verbose, err)
 	}
-	return notebook_manager.UploadNotebookAttachment(ctx, in)
+	res, err := notebook_manager.UploadNotebookAttachment(ctx, in)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+	return res, nil
 }
 
 func (self *ApiServer) CreateNotebookDownloadFile(
@@ -396,146 +505,62 @@ func (self *ApiServer) CreateNotebookDownloadFile(
 	permissions := acls.PREPARE_RESULTS
 	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to export notebooks.")
 	}
 
+	wg := &sync.WaitGroup{}
+
 	switch in.Type {
 	case "zip":
-		return &emptypb.Empty{}, exportZipNotebook(
-			org_config_obj, in.NotebookId, principal)
+		_, err := notebooks.ExportNotebookToZip(ctx,
+			org_config_obj, wg, in.NotebookId,
+			principal, in.PreferredName)
+
+		return &emptypb.Empty{}, Status(self.verbose, err)
+
 	default:
-		return &emptypb.Empty{}, exportHTMLNotebook(
-			org_config_obj, in.NotebookId, principal)
+		_, err := notebooks.ExportNotebookToHTML(
+			org_config_obj, wg, in.NotebookId,
+			principal, in.PreferredName)
+		return &emptypb.Empty{}, Status(self.verbose, err)
 	}
 }
 
-// Create a portable notebook into a zip file.
-func exportZipNotebook(
-	config_obj *config_proto.Config,
-	notebook_id, principal string) error {
-	db, err := datastore.GetDB(config_obj)
+func (self *ApiServer) RemoveNotebookAttachment(
+	ctx context.Context,
+	in *api_proto.NotebookFileUploadRequest) (*emptypb.Empty, error) {
+
+	defer Instrument("RemoveNotebookAttachment")()
+
+	users := services.GetUserManager()
+	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
 	if err != nil {
-		return err
+		return nil, Status(self.verbose, err)
+	}
+	principal := user_record.Name
+
+	permissions := acls.PREPARE_RESULTS
+	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
+	if !perm || err != nil {
+		return nil, PermissionDenied(err,
+			"User is not allowed to update notebooks.")
 	}
 
-	notebook := &api_proto.NotebookMetadata{}
-	notebook_path_manager := paths.NewNotebookPathManager(notebook_id)
-	err = db.GetSubject(config_obj, notebook_path_manager.Path(), notebook)
+	notebook_manager, err := services.GetNotebookManager(org_config_obj)
 	if err != nil {
-		return err
+		return nil, Status(self.verbose, err)
 	}
 
-	notebook_manager, err := services.GetNotebookManager(config_obj)
+	notebook, err := notebook_manager.GetNotebook(ctx, in.NotebookId, SKIP_UPLOADS)
 	if err != nil {
-		return err
-	}
-	if !notebook_manager.CheckNotebookAccess(notebook, principal) {
-		return InvalidStatus("Notebook is not shared with user.")
-	}
-
-	filename := notebook_path_manager.ZipExport()
-
-	// Allow 1 hour to export the notebook.
-	sub_ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-
-	go func() {
-		defer cancel()
-
-		wg := &sync.WaitGroup{}
-
-		err := reporting.ExportNotebookToZip(
-			sub_ctx, config_obj, wg, notebook_path_manager)
-		if err != nil {
-			logger := logging.GetLogger(config_obj, &logging.GUIComponent)
-			logger.WithFields(logrus.Fields{
-				"notebook_id": notebook.NotebookId,
-				"export_file": filename,
-				"error":       err.Error(),
-			}).Error("CreateNotebookDownloadFile")
-			return
-		}
-
-		// Wait for the export to finish before we return.
-		wg.Wait()
-	}()
-
-	return nil
-}
-
-func exportHTMLNotebook(config_obj *config_proto.Config,
-	notebook_id, principal string) error {
-	db, err := datastore.GetDB(config_obj)
-	if err != nil {
-		return err
-	}
-
-	notebook := &api_proto.NotebookMetadata{}
-	notebook_path_manager := paths.NewNotebookPathManager(notebook_id)
-	err = db.GetSubject(config_obj, notebook_path_manager.Path(), notebook)
-	if err != nil {
-		return err
-	}
-
-	notebook_manager, err := services.GetNotebookManager(config_obj)
-	if err != nil {
-		return err
+		return nil, Status(self.verbose, err)
 	}
 
 	if !notebook_manager.CheckNotebookAccess(notebook, principal) {
-		return InvalidStatus("Notebook is not shared with user.")
+		return nil, InvalidStatus("Notebook is not shared with user.")
 	}
 
-	file_store_factory := file_store.GetFileStore(config_obj)
-	filename := notebook_path_manager.HtmlExport()
-
-	writer, err := file_store_factory.WriteFile(filename)
-	if err != nil {
-		return err
-	}
-
-	sha_sum := sha256.New()
-	md5_sum := md5.New()
-	tee_writer := utils.NewTee(writer, sha_sum, md5_sum)
-
-	stats := &api_proto.ContainerStats{
-		Timestamp:  uint64(time.Now().Unix()),
-		Type:       "html",
-		Components: path_specs.AsGenericComponentList(filename),
-	}
-	stats_path := notebook_path_manager.PathStats(filename)
-
-	err = db.SetSubject(config_obj, stats_path, stats)
-	if err != nil {
-		return err
-	}
-
-	// Allow 1 hour to export the notebook.
-	sub_ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-
-	go func() {
-		defer writer.Close()
-		defer cancel()
-
-		defer func() {
-			stats.Hash = hex.EncodeToString(sha_sum.Sum(nil))
-			stats.TotalDuration = uint64(time.Now().Unix()) - stats.Timestamp
-
-			db.SetSubject(config_obj, stats_path, stats)
-		}()
-
-		err := reporting.ExportNotebookToHTML(
-			sub_ctx, config_obj, notebook.NotebookId, tee_writer)
-		if err != nil {
-			logger := logging.GetLogger(config_obj, &logging.GUIComponent)
-			logger.WithFields(logrus.Fields{
-				"notebook_id": notebook.NotebookId,
-				"export_file": filename,
-				"error":       err.Error(),
-			}).Error("CreateNotebookDownloadFile")
-			return
-		}
-	}()
-
-	return nil
+	return &emptypb.Empty{}, notebook_manager.RemoveNotebookAttachment(ctx,
+		in.NotebookId, in.Components)
 }

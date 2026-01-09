@@ -6,15 +6,16 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
-	"www.velocidex.com/golang/velociraptor/paths"
-	"www.velocidex.com/golang/velociraptor/reporting"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type CreateNotebookDownloadArgs struct {
-	NotebookId string `vfilter:"required,field=notebook_id,doc=Client ID to export."`
+	NotebookId string `vfilter:"required,field=notebook_id,doc=Notebook ID to export."`
+	Filename   string `vfilter:"optional,field=filename,doc=The name of the export. If not set this will be named according to the notebook id and timestamp"`
 }
 
 type CreateNotebookDownload struct{}
@@ -36,16 +37,22 @@ func (self *CreateNotebookDownload) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	err = services.RequireFrontend()
+	if err != nil {
+		scope.Log("create_notebook_download: %v", err)
+		return vfilter.Null{}
+	}
+
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
 		scope.Log("create_notebook_download: Command can only run on the server")
 		return vfilter.Null{}
 	}
 
-	notebook_path_manager := paths.NewNotebookPathManager(arg.NotebookId)
 	wg := &sync.WaitGroup{}
-
-	err = reporting.ExportNotebookToZip(ctx, config_obj, wg, notebook_path_manager)
+	principal := vql_subsystem.GetPrincipal(scope)
+	path, err := ExportNotebookToZip(ctx,
+		config_obj, wg, arg.NotebookId, principal, arg.Filename)
 	if err != nil {
 		scope.Log("create_notebook_download: %s", err)
 		return vfilter.Null{}
@@ -54,14 +61,15 @@ func (self *CreateNotebookDownload) Call(ctx context.Context,
 	// Wait here until the notebook is fully exported.
 	wg.Wait()
 
-	return notebook_path_manager.ZipExport()
+	return path
 }
 
 func (self CreateNotebookDownload) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "create_notebook_download",
-		Doc:     "Creates a notebook export zip file.",
-		ArgType: type_map.AddType(scope, &CreateNotebookDownloadArgs{}),
+		Name:     "create_notebook_download",
+		Doc:      "Creates a notebook export zip file.",
+		ArgType:  type_map.AddType(scope, &CreateNotebookDownloadArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.PREPARE_RESULTS).Build(),
 	}
 }
 

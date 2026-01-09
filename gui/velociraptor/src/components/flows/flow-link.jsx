@@ -13,7 +13,7 @@ import FlowOverview from './flow-overview.jsx';
 import FlowUploads from './flow-uploads.jsx';
 import FlowResults from './flow-results.jsx';
 import FlowLogs from './flow-logs.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 
 class FlowPopupInspector extends React.Component {
     static propTypes = {
@@ -21,14 +21,16 @@ class FlowPopupInspector extends React.Component {
     };
 
     state = {
-        // Show by default the results tab.
+        // Show by default the logs tab.
         tab: "logs",
     }
 
     render() {
         let flow = this.props.flow;
         if (!flow || !flow.session_id)  {
-            return <h5 className="no-content">Please click a collection in the above table</h5>;
+            return <h5 className="no-content">
+                     { T("Please click a collection in the above table") }
+                   </h5>;
         }
 
         return (
@@ -71,7 +73,7 @@ export default class FlowLink extends React.Component {
     }
 
     componentDidMount() {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
     }
 
     componentWillUnmount() {

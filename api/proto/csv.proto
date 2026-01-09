@@ -2,6 +2,7 @@ syntax = "proto3";
 
 import "proto/semantic.proto";
 import "artifacts/proto/artifact.proto";
+import "timelines/proto/timelines.proto";
 
 package proto;
 
@@ -36,11 +37,15 @@ message GetTableRequest {
     // For notebook tables.
     string notebook_id = 9;
     string cell_id = 10;
+    string cell_version = 29;
+
     int64 table_id = 11;
 
     // For timelines
     string timeline = 16;
+
     // Skip these timeline components.
+    repeated string include_components = 31;
     repeated string skip_components = 17;
 
     // For download handler when creating an export file - control
@@ -58,6 +63,11 @@ message GetTableRequest {
     bool sort_direction = 20;
     string filter_column = 21;
     string filter_regex = 22;
+
+    // Set with the output of GetTableResponse to view the stack
+    // table. If this is set the transform options above refer to the
+    // stack table itself.
+    repeated string stack_path = 30;
 
     // This transformation takes a range from the larger result set
     // and pages within that range.
@@ -78,7 +88,12 @@ message GetTableRequest {
 }
 
 message Row {
-    repeated string cell = 1;
+    // Deprecated - Old code serializes each cell separately.
+    // repeated string cell = 1;
+
+    // The row encoded as a JSON array: Current code encodes the
+    // entire JSON []interface{} into a single JSON string.
+    string json = 2;
 }
 
 message GetTableResponse {
@@ -92,6 +107,12 @@ message GetTableResponse {
 
     repeated ColumnType column_types = 4;
 
+    // Used for time based data.
     int64 start_time = 5;
     int64 end_time = 6;
+
+    repeated Timeline timelines = 8;
+
+    // If there is a stack table this is the path to it.
+    repeated string stack_path = 7;
 }

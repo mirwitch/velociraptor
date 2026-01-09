@@ -13,6 +13,16 @@ import (
 	"www.velocidex.com/golang/vfilter"
 )
 
+type OffsetFileInfo struct {
+	accessors.FileInfo
+
+	_full_path *accessors.OSPath
+}
+
+func (self *OffsetFileInfo) OSPath() *accessors.OSPath {
+	return self._full_path
+}
+
 type OffsetReader struct {
 	reader io.ReadSeekCloser
 	info   accessors.FileInfo
@@ -22,6 +32,10 @@ type OffsetReader struct {
 
 	// Constant offset we add the the delegate reader.
 	base_offset int64
+
+	// The OSPath object that is required to access this
+	// file. (includes delegate and offset).
+	_full_path *accessors.OSPath
 }
 
 func (self *OffsetReader) Close() error {
@@ -61,7 +75,10 @@ func (self *OffsetReader) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (self *OffsetReader) LStat() (accessors.FileInfo, error) {
-	return self.info, nil
+	return &OffsetFileInfo{
+		FileInfo:   self.info,
+		_full_path: self._full_path,
+	}, nil
 }
 
 func GetOffsetFile(full_path *accessors.OSPath, scope vfilter.Scope) (
@@ -101,7 +118,13 @@ func GetOffsetFile(full_path *accessors.OSPath, scope vfilter.Scope) (
 
 	stat, err := accessor.Lstat(delegate_path)
 	if err != nil {
-		return nil, err
+		// If we can not call stat on the file it is not a fatal
+		// error. For example, raw files are not always statable - in
+		// that case we provide a fake stat object.
+		stat = &accessors.VirtualFileInfo{
+			Path:  full_path,
+			Size_: 1<<63 - 1,
+		}
 	}
 
 	return &OffsetReader{
@@ -109,18 +132,16 @@ func GetOffsetFile(full_path *accessors.OSPath, scope vfilter.Scope) (
 		info:        stat,
 		offset:      offset,
 		base_offset: offset,
+		_full_path:  full_path,
 	}, nil
 }
 
 func init() {
-	accessors.Register("offset", zip.NewGzipFileSystemAccessor(
-		accessors.MustNewLinuxOSPath(""), GetOffsetFile),
-		`Allow reading another file from a specific offset.
-
-For Example
-
-FileName = pathspec(
-      DelegateAccessor="data", DelegatePath=MyData,
-      Path=[dict(Offset=0,Length=5), dict(Offset=10,Length=5)])
-`)
+	accessors.Register(accessors.DescribeAccessor(
+		zip.NewGzipFileSystemAccessor(
+			accessors.MustNewLinuxOSPath(""), GetOffsetFile),
+		accessors.AccessorDescriptor{
+			Name:        "offset",
+			Description: `Allow reading another file from a specific offset.`,
+		}))
 }

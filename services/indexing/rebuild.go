@@ -6,50 +6,37 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/btree"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/services"
 )
 
 // Load all the client records slowly and rebuild the index. This
 // takes a long time. It mirrors the job of the interrogation service
 // and so should be kept in sync with it.
-func (self *Indexer) LoadIndexFromDatastore(
+func (self *Indexer) RebuildIndex(
 	ctx context.Context, config_obj *config_proto.Config) error {
 
+	// Clear the index completely.
+	btree := btree.New(10)
+
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("<green>Indexing Service</>: Rebuilding Full index from filestore - this can take a while.")
-
-	db, err := datastore.GetDB(config_obj)
-	if err != nil {
-		return err
-	}
-
-	children, err := db.ListChildren(config_obj, paths.CLIENTS_ROOT)
+	client_info_manager, err := services.GetClientInfoManager(config_obj)
 	if err != nil {
 		return err
 	}
 
 	now := time.Now()
 	count := 0
-	for _, child := range children {
+	for client_id := range client_info_manager.ListClients(ctx) {
 		select {
 		case <-ctx.Done():
 			return errors.New("Cancelled")
 		default:
 		}
 
-		if child.IsDir() {
-			continue
-		}
-
-		client_id := child.Base()
-		if !strings.HasPrefix(client_id, "C.") {
-			continue
-		}
-
-		client_info, err := self.FastGetApiClient(ctx, config_obj, child.Base())
+		client_info, err := client_info_manager.Get(ctx, client_id)
 		if err != nil {
 			continue
 		}
@@ -57,33 +44,40 @@ func (self *Indexer) LoadIndexFromDatastore(
 		count++
 
 		// The all item corresponds to the "." search term.
-		self.SetIndex(client_id, "all")
+		_ = self.setIndexTree(client_id, "all", btree)
+		_ = self.setIndexTree(client_id, client_id, btree)
 
-		if client_info.OsInfo.Hostname != "" {
-			self.SetIndex(client_id, "host:"+client_info.OsInfo.Hostname)
+		if client_info.Hostname != "" {
+			_ = self.setIndexTree(client_id, "host:"+client_info.Hostname, btree)
 		}
 
 		// Add labels to the index.
 		for _, label := range client_info.Labels {
-			self.SetIndex(client_id, "label:"+strings.ToLower(label))
+			_ = self.setIndexTree(client_id, "label:"+strings.ToLower(label), btree)
 		}
 
 		// Add MAC addresses to the index.
-		if client_info.OsInfo != nil {
-			for _, mac := range client_info.OsInfo.MacAddresses {
-				self.SetIndex(client_id, "mac:"+mac)
-			}
+		for _, mac := range client_info.MacAddresses {
+			_ = self.setIndexTree(client_id, "mac:"+mac, btree)
+		}
+
+		// Now add user custom search verbs.
+		for k, v := range client_info.Metadata {
+			_ = self.setIndexTree(client_id, k+":"+v, btree)
 		}
 	}
 
-	logger.Info("<green>Indexing service</> search index loaded %v items in %v",
+	logger.Debug("<green>Indexing service</> search index loaded %v items in %v",
 		count, time.Now().Sub(now))
 
 	// Merge the new index quickly and mark ourselves as ready.
+	// Hold a lock on the index while we rebuild it.
 	self.mu.Lock()
+	defer self.mu.Unlock()
+
 	self.ready = true
-	self.dirty = true
-	self.mu.Unlock()
+	self.btree = btree
+	self.items = btree.Len()
 
 	return nil
 }

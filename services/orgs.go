@@ -11,14 +11,16 @@ import (
 )
 
 const (
-	ROOT_ORG_ID = "root"
+	ROOT_ORG_ID   = "root"
+	ROOT_ORG_NAME = "<root>"
+	RandomNonce   = ""
 )
 
 var (
 	mu          sync.Mutex
 	org_manager OrgManager
 
-	NotFoundError = errors.New("Org not found")
+	OrgNotFoundError = errors.New("Org not found")
 )
 
 // Currently the org manager is the only binary wide global - all
@@ -57,18 +59,24 @@ type ServiceContainer interface {
 	NotebookManager() (NotebookManager, error)
 	ClientEventManager() (ClientEventTable, error)
 	ServerEventManager() (ServerEventManager, error)
+	ServerArtifactRunner() (ServerArtifactRunner, error)
 	Notifier() (Notifier, error)
 	ACLManager() (ACLManager, error)
+	AuditManager() (AuditManager, error)
+	Scheduler() (Scheduler, error)
+	SecretsService() (SecretsService, error)
+	BackupService() (BackupService, error)
+	ExportManager() (ExportManager, error)
 }
 
 // The org manager manages multi-tenancies.
 type OrgManager interface {
 	GetOrgConfig(org_id string) (*config_proto.Config, error)
 	OrgIdByNonce(nonce string) (string, error)
-	CreateNewOrg(name, id string) (*api_proto.OrgRecord, error)
+	CreateNewOrg(name, id, nonce string) (*api_proto.OrgRecord, error)
 	ListOrgs() []*api_proto.OrgRecord
 	GetOrg(org_id string) (*api_proto.OrgRecord, error)
-	DeleteOrg(ctx context.Context, org_id string) error
+	DeleteOrg(ctx context.Context, principal, org_id string) error
 
 	// The manager is responsible for running multiple services - one
 	// for each org. This ensures org services are separated out and
@@ -77,10 +85,13 @@ type OrgManager interface {
 }
 
 func GetOrgName(config_obj *config_proto.Config) string {
-	if config_obj.OrgId == "" {
-		return "Root Org"
+	org_id := config_obj.OrgId
+	org_name := config_obj.OrgName
+
+	if org_id == "" {
+		org_id = ROOT_ORG_ID
+		org_name = ROOT_ORG_NAME
 	}
 
-	return fmt.Sprintf("Org %v (%v)",
-		config_obj.OrgName, config_obj.OrgId)
+	return fmt.Sprintf("Org %v (%v)", org_name, org_id)
 }

@@ -2,14 +2,11 @@ package notebooks
 
 import (
 	"context"
-	"os"
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
-	"www.velocidex.com/golang/velociraptor/datastore"
-	"www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/file_store/api"
-	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -30,6 +27,7 @@ func (self *DeleteNotebookPlugin) Call(ctx context.Context,
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "notebook_delete", args)()
 
 		arg := &DeleteNotebookArgs{}
 
@@ -45,92 +43,30 @@ func (self *DeleteNotebookPlugin) Call(ctx context.Context,
 			return
 		}
 
+		err = services.RequireFrontend()
+		if err != nil {
+			scope.Log("notebook_delete: %v", err)
+			return
+		}
+
 		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
-			scope.Log("Command can only run on the server")
+			scope.Log("notebook_delete: Command can only run on the server")
 			return
 		}
 
-		db, err := datastore.GetDB(config_obj)
+		notebook_manager, err := services.GetNotebookManager(config_obj)
 		if err != nil {
+			scope.Log("notebook_delete: %v", err)
 			return
 		}
 
-		file_store_factory := file_store.GetFileStore(config_obj)
-
-		notebook_path_manager := paths.NewNotebookPathManager(arg.NotebookId)
-
-		if arg.ReallyDoIt {
-			err = db.DeleteSubject(config_obj, notebook_path_manager.Path())
-			if err != nil {
-				scope.Log("notebook_delete: %s", err.Error())
-				return
-			}
-		}
-
-		// Indiscriminately delete all the client's datastore files.
-		err = datastore.Walk(config_obj, db, notebook_path_manager.DSDirectory(),
-			datastore.WalkWithoutDirectories,
-			func(filename api.DSPathSpec) error {
-				select {
-				case <-ctx.Done():
-					return nil
-
-				case output_chan <- ordereddict.NewDict().
-					Set("notebook_id", arg.NotebookId).
-					Set("type", "Notebook").
-					Set("vfs_path", filename).
-					Set("really_do_it", arg.ReallyDoIt):
-				}
-
-				if arg.ReallyDoIt {
-					err = db.DeleteSubject(config_obj, filename)
-					if err != nil {
-						return err
-					}
-				}
-				return nil
-			})
+		err = notebook_manager.DeleteNotebook(ctx, arg.NotebookId,
+			output_chan, arg.ReallyDoIt)
 		if err != nil {
-			scope.Log("notebook_delete: %s", err.Error())
+			scope.Log("notebook_delete: %v", err)
 			return
 		}
-
-		// Remove the empty directories
-		err = datastore.Walk(config_obj, db, notebook_path_manager.DSDirectory(),
-			datastore.WalkWithDirectories,
-			func(filename api.DSPathSpec) error {
-				db.DeleteSubject(config_obj, filename)
-				return nil
-			})
-
-		// Delete the filestore files.
-		err = api.Walk(file_store_factory, notebook_path_manager.Directory(),
-			func(filename api.FSPathSpec, info os.FileInfo) error {
-				select {
-				case <-ctx.Done():
-					return nil
-
-				case output_chan <- ordereddict.NewDict().
-					Set("notebook_id", arg.NotebookId).
-					Set("type", "Filestore").
-					Set("vfs_path", filename).
-					Set("really_do_it", arg.ReallyDoIt):
-				}
-
-				if arg.ReallyDoIt {
-					err := file_store_factory.Delete(filename)
-					if err != nil {
-						scope.Log("notebook_delete: %s", err.Error())
-					}
-				}
-				return nil
-			})
-		if err != nil {
-			scope.Log("notebook_delete: %s", err.Error())
-			return
-		}
-
 	}()
 
 	return output_chan
@@ -139,9 +75,10 @@ func (self *DeleteNotebookPlugin) Call(ctx context.Context,
 func (self DeleteNotebookPlugin) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "notebook_delete",
-		Doc:     "Delete a notebook with all its cells. ",
-		ArgType: type_map.AddType(scope, &DeleteNotebookArgs{}),
+		Name:     "notebook_delete",
+		Doc:      "Delete a notebook with all its cells. ",
+		ArgType:  type_map.AddType(scope, &DeleteNotebookArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.SERVER_ADMIN).Build(),
 	}
 }
 

@@ -1,17 +1,26 @@
 package data
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/go-errors/errors"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/vfilter/types"
 )
 
 type ScopeFilesystemAccessor struct {
 	scope vfilter.Scope
+}
+
+func (self ScopeFilesystemAccessor) Describe() *accessors.AccessorDescriptor {
+	return &accessors.AccessorDescriptor{
+		Name:        "scope",
+		Description: `Present the content of a scope variable as a file.`,
+	}
 }
 
 func (self ScopeFilesystemAccessor) New(scope vfilter.Scope) (
@@ -20,12 +29,21 @@ func (self ScopeFilesystemAccessor) New(scope vfilter.Scope) (
 }
 
 func (self ScopeFilesystemAccessor) getData(variable string) (string, error) {
-	variable_data, pres := self.scope.Resolve(variable)
-	if !pres {
-		return "", os.ErrNotExist
+	var result vfilter.Any = self.scope
+	var pres bool
+
+	for _, member := range strings.Split(variable, ".") {
+		switch t := result.(type) {
+		case types.LazyExpr:
+			result = t.Reduce(context.Background())
+		}
+		result, pres = self.scope.Associative(result, member)
+		if !pres {
+			return "", utils.NotFoundError
+		}
 	}
 
-	switch t := variable_data.(type) {
+	switch t := result.(type) {
 	case string:
 		return t, nil
 
@@ -33,19 +51,19 @@ func (self ScopeFilesystemAccessor) getData(variable string) (string, error) {
 		return string(t), nil
 
 	default:
-		return fmt.Sprintf("%v", variable_data), nil
+		return fmt.Sprintf("%v", result), nil
 	}
 }
 
 func (self ScopeFilesystemAccessor) ParsePath(path string) (
 	*accessors.OSPath, error) {
-	return accessors.NewLinuxOSPath(path)
+	return accessors.MustNewPathspecOSPath("").Clear().Append(path), nil
 }
 
 func (self ScopeFilesystemAccessor) LstatWithOSPath(path *accessors.OSPath) (
 	accessors.FileInfo, error) {
 	if len(path.Components) != 1 {
-		return nil, os.ErrNotExist
+		return nil, utils.NotFoundError
 	}
 
 	return self.Lstat(path.Components[0])
@@ -82,7 +100,7 @@ func (self ScopeFilesystemAccessor) ReadDirWithOSPath(path *accessors.OSPath) (
 func (self ScopeFilesystemAccessor) OpenWithOSPath(path *accessors.OSPath) (
 	accessors.ReadSeekCloser, error) {
 	if len(path.Components) != 1 {
-		return nil, os.ErrNotExist
+		return nil, utils.NotFoundError
 	}
 
 	return self.Open(path.Components[0])
@@ -100,6 +118,5 @@ func (self ScopeFilesystemAccessor) Open(path string) (
 }
 
 func init() {
-	accessors.Register("scope", &ScopeFilesystemAccessor{},
-		`Similar to the "data" accessor, this makes a string appears as a file. However, instead of the Filename containing the file content itself, the Filename refers to the name of a variable in the current scope that contains the data. This is useful when the binary data is not unicode safe and can not be properly represented by JSON.`)
+	accessors.Register(&ScopeFilesystemAccessor{})
 }

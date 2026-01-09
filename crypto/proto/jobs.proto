@@ -33,9 +33,28 @@ message FlowRequest {
     // collection. Does not count log messages.
     uint64 max_rows = 4;
 
+    // A limit on the total number of log messages allowed from the
+    // flow - exceeding this will suppress further logging.
+    uint64 max_logs = 7;
+
     // If the client exceeds this, the client will abort the
     // collection.
     uint64 max_upload_bytes = 5;
+
+    // Execute this trace query while the main collection is running.
+    repeated VQLCollectorArgs trace = 6;
+
+    // If specified we use this regex to detect errors in log
+    // messages. This regex will determine if the flow should be
+    // flagged with an error depending on the log message.
+    string log_error_regex = 8;
+
+    enum Compression {
+        NONE = 0;
+        ZLIB = 1;
+    }
+
+    Compression compression = 9;
 }
 
 
@@ -101,6 +120,7 @@ message VeloMessage {
   VeloStatus status = 25;
   ForemanCheckin ForemanCheckin = 27;  // Upon initial connection.
   FileBuffer FileBuffer = 28;  // For uploads.
+  UploadTransaction UploadTransaction = 44;
   Certificate CSR = 29;   // For enrollment.
   VQLResponse VQLResponse = 33;
   LogMessage LogMessage = 34;
@@ -116,6 +136,13 @@ message VeloMessage {
   // Requests a flow to be collected - contains all the queries that
   // make up the collection.
   FlowRequest FlowRequest = 42;
+
+  // Instructs the client to resume transactions
+  ResumeTransactions ResumeTransactions = 45;
+
+  // Check up on in progress flows. Causes the client to return a set
+  // of FlowStats for inflight flows.
+  FlowStatsRequest flow_stats_request = 43;
 
   Cancel Cancel = 32;
   ForemanCheckin UpdateForeman = 35;
@@ -176,6 +203,7 @@ message FlowStats {
     uint64 total_uploaded_bytes = 3;
     uint64 total_collected_rows = 4;
     uint64 total_logs = 5;
+    uint64 transactions_outstanding = 10;
 
     uint64 timestamp = 6;
 
@@ -188,6 +216,14 @@ message FlowStats {
     bool flow_complete = 8;
 }
 
+// Sent from the server to the client to check up on in flight flows.
+message FlowStatsRequest {
+    repeated string flow_id = 1;
+}
+
+message FlowStatsSummaryItem {
+    string flow_id = 1;
+}
 
 // This is a status response that is sent for each complete
 // query. Velociraptor collections consist of multiple queries (for
@@ -205,6 +241,8 @@ message VeloStatus {
         // completed.
         PROGRESS = 4;
         GENERIC_ERROR = 10;
+
+        UNKNOWN_FLOW = 11;
     };
 
     ReturnedStatus status = 1;
@@ -240,6 +278,8 @@ message VeloStatus {
     // in this collection.
     int64 query_id = 8;
     int64 total_queries = 9;
+
+    uint64 transactions_outstanding = 16;
 };
 
 // This is a list of job messages.
@@ -412,4 +452,22 @@ message PublicKey {
     // The timestamp when the key was saved (the client
     // enrolled). This is used to deduce the first_seen_time.
     uint64 enroll_time = 2;
+}
+
+
+message ResumeTransactions {
+    string flow_id = 1;
+    string client_id = 2;
+    uint64 timeout = 7;
+    uint64 max_upload_bytes = 3;
+
+    enum Compression {
+        NONE = 0;
+        ZLIB = 1;
+    }
+    Compression compression = 4;
+
+    repeated UploadTransaction transactions = 5;
+
+    repeated VeloStatus query_stats = 6;
 }

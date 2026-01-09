@@ -6,14 +6,16 @@ description: |
   determine when binaries are run in the past. On Windows10 we can see
   the last 8 execution times and creation time (9 potential executions).
 
-  There are several parameter's available for this artifact.
+  There are several parameters available for this artifact.
     - dateAfter enables search for prefetch evidence after this date.
     - dateBefore enables search for prefetch evidence before this date.
     - binaryRegex enables to filter on binary name, e.g evil.exe.
     - hashRegex enables to filter on prefetch hash.
 
   NOTE: The Prefetch file format is described extensively in libscca
-  and painstakingly reversed by Joachim Metz (Shouts and Thank you!).
+  and painstakingly reversed by Joachim Metz (Shouts and Thank
+  you!). Thanks to https://github.com/secDre4mer for additional
+  information.
 
 reference:
   - https://www.forensicswiki.org/wiki/Prefetch
@@ -59,7 +61,8 @@ export: |
                "17": "WinXP (17)",
                "23": "Vista (23)",
                "26": "Win8.1 (26)",
-               "30": "Win10 (30)"
+               "30": "Win10 (30)",
+               "31": "Win11 (31)"
              }
          }],
          ["Signature", 4, "String", {"length": 4}],
@@ -77,6 +80,7 @@ export: |
                  "Vista (23)": "FileInformationVista",
                  "Win8.1 (26)": "FileInformationWin81",
                  "Win10 (30)": "FileInformationWin10",
+                 "Win11 (31)": "FileInformationWin10"
              }
          }]
         ]],
@@ -95,7 +99,7 @@ export: |
          # This is realy just one time but we make it an
          # array to be compatible with the others.
          ["LastRunTimes", 36, "Array", {
-              "type": "Timestamp",
+              "type": "TimestampRecord",
               "count": 1
            }],
          ["RunCount", 60, "unsigned long"],
@@ -125,7 +129,7 @@ export: |
          # This is realy just one time but we make it an
          # array to be compatible with the others.
          ["LastRunTimes", 44, "Array", {
-              "type": "Timestamp",
+              "type": "TimestampRecord",
               "count": 1
            }],
          ["RunCount", 68, "unsigned long"],
@@ -156,7 +160,7 @@ export: |
          # This is realy just one time but we make it an
          # array to be compatible with the others.
          ["LastRunTimes", 44, "Array", {
-              "type": "Timestamp",
+              "type": "TimestampRecord",
               "count": 8,
            }],
          ["RunCount", 124, "unsigned long"],
@@ -184,7 +188,7 @@ export: |
          ["__VolumesInformationSize", 32, "unsigned long"],
          ["__TotalDirectoryCount", 36, "unsigned long"],
          ["LastRunTimes", 44, "Array", {
-              "type": "Timestamp",
+              "type": "TimestampRecord",
               "count": 8
            }],
          ["__RunCount1", 124, "unsigned long"],
@@ -193,6 +197,12 @@ export: |
          ["RunCount", 0, Value, {
             value: "x=>if(condition=x.__RunCountPre=0, then=x.__RunCount1, else=x.__RunCount2)",
          }],
+         ["ExecutablePath", "x=>x.__ExecutablePathOffset - x.OffsetOf", String, {
+            length: "x=>x.__ExecutablePathSize * 2",
+            encoding: "utf16",
+         }],
+         ["__ExecutablePathOffset", 128, "unsigned long"],
+         ["__ExecutablePathSize", 132, "unsigned long"],
 
          # Metrics offset is absolute.
          ["Metrics", "x=>x.__FileMetricsOffset - x.StartOf", "Array", {
@@ -205,7 +215,7 @@ export: |
           }],
         ]],
 
-        ["Timestamp", 8, [
+        ["TimestampRecord", 8, [
           ["Date", 0, "WinFileTime"],
           ["Int", 0, "unsigned long long"]
         ]],
@@ -287,13 +297,17 @@ export: |
         '''
 
         LET ParsePrefetch(PrefetchFile) = SELECT
-          parse_binary(accessor="data", filename=Data,
+          parse_binary(accessor="data", filename=Data || "",
             profile=PrefetchProfile, struct="SCCAHeader") AS SCCAHeader
         FROM switch(a={
             -- Handle compressed MAM prefetch files.
             SELECT
-              parse_binary(filename=PrefetchFile, profile=PrefetchProfile, struct="Header") AS Header,
-              parse_binary(filename=PrefetchFile, profile=PrefetchProfile, struct="Header").Decompressed AS Data
+              parse_binary(filename=PrefetchFile,
+                           profile=PrefetchProfile,
+                           struct="Header") AS Header,
+              parse_binary(filename=PrefetchFile,
+                           profile=PrefetchProfile,
+                           struct="Header").Decompressed AS Data
             FROM scope()
             WHERE Header.Signature = "MAM"
         },
@@ -303,6 +317,21 @@ export: |
             FROM scope()
         })
         WHERE SCCAHeader.Signature = "SCCA"
+
+        // These functions help to resolve the Kernel Device Filenames
+        // into a regular filename with drive letter.
+        LET DriveReplaceLookup <= SELECT
+           split(sep_string="\\", string=Name)[-1] AS Drive,
+           upcase(string=SymlinkTarget) AS Target,
+           len(list=SymlinkTarget) AS Len
+        FROM winobj()
+        WHERE Name =~ "^\\\\GLOBAL\\?\\?\\\\.:"
+
+        LET _DriveReplace(Path) = SELECT Drive + Path[Len:] AS ResolvedPath
+        FROM DriveReplaceLookup
+        WHERE upcase(string=Path[:Len]) = Target
+
+        LET DriveReplace(Path) = _DriveReplace(Path=Path)[0].ResolvedPath || Path
 
 sources:
   - query: |
@@ -319,14 +348,16 @@ sources:
                   SCCAHeader.Version AS Version,
                   filter(list=SCCAHeader.Info.LastRunTimes.Date, condition="x=>x.Unix > 0") AS LastRunTimes,
                   SCCAHeader.Info.RunCount AS RunCount,
-                  FullPath,
+                  SCCAHeader.Info.ExecutablePath AS ExecutablePath,
+                  DriveReplace(Path=SCCAHeader.Info.ExecutablePath) AS ExecutableDosPath,
+                  OSPath,
                   Name AS PrefetchFileName,
                   Btime as CreationTime,
                   Mtime as ModificationTime,
                   filter(list=SCCAHeader.Info.Metrics.Filename, regex=".exe$")[0] AS Binary,
                   if(condition= IncludeFilesAccessed, then=SCCAHeader.Info.Metrics.Filename) AS FilesAccessed,
                   if(condition= IncludeFilesAccessed, then=SCCAHeader.Info.VolumeInfo) AS VolumeInfo
-                FROM ParsePrefetch(PrefetchFile=FullPath)
+                FROM ParsePrefetch(PrefetchFile=OSPath)
                 WHERE
                     if(condition=binaryRegex, then= Executable =~ binaryRegex, else=TRUE) AND
                     if(condition=hashRegex, then= Hash =~ hashRegex, else=TRUE)
@@ -336,7 +367,7 @@ sources:
         LET executionTimes = SELECT * FROM flatten(
                 query = {
                     SELECT *,
-                        FullPath as FilteredPath,
+                        OSPath as FilteredPath,
                         LastRunTimes as ExecutionTime
                     FROM pf
                 })
@@ -348,7 +379,7 @@ sources:
         LET creationTimes = SELECT * FROM flatten(
                 query = {
                     SELECT *,
-                        FullPath as FilteredPath,
+                        OSPath as FilteredPath,
                         CreationTime as ExecutionTime
                     FROM pf
                     WHERE RunCount > 8
@@ -360,7 +391,7 @@ sources:
                         else=TRUE)
             GROUP BY ExecutionTime
 
-        // For stdOutput with timefilters we need to group by FullPath
+        // For stdOutput with timefilters we need to group by OSPath
         LET timeFiltered = SELECT FilteredPath
             FROM chain(
                 a = { SELECT * FROM executionTimes },
@@ -374,7 +405,7 @@ sources:
                 query={
                     SELECT *
                     FROM pf
-                    WHERE FullPath = FilteredPath
+                    WHERE OSPath = FilteredPath
                 })
 
         SELECT *

@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package linux
@@ -8,15 +9,18 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/elastic/go-libaudit"
-	"github.com/elastic/go-libaudit/aucoalesce"
-	"github.com/elastic/go-libaudit/auparse"
+	"github.com/elastic/go-libaudit/v2"
+	"github.com/elastic/go-libaudit/v2/aucoalesce"
+	"github.com/elastic/go-libaudit/v2/auparse"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/vfilter/utils/dict"
 )
 
 type streamHandler struct {
+	ctx         context.Context
 	scope       vfilter.Scope
 	output_chan chan vfilter.Row
 }
@@ -26,7 +30,8 @@ func (self *streamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 }
 
 func (self *streamHandler) EventsLost(count int) {
-	self.scope.Log("Detected the loss of %v sequences.", count)
+	// This is not a useful message - there is nothing we can do about it
+	//self.scope.Log("Detected the loss of %v sequences.", count)
 }
 
 func (self *streamHandler) outputMultipleMessages(msgs []*auparse.AuditMessage) {
@@ -34,15 +39,20 @@ func (self *streamHandler) outputMultipleMessages(msgs []*auparse.AuditMessage) 
 	if err != nil {
 		return
 	}
-	self.output_chan <- event
+
+	// Convert the events to dicts so they can be accessed easier.
+	dict := dict.RowToDict(self.ctx, self.scope, event)
+	dict.SetCaseInsensitive()
+	self.output_chan <- dict
 }
 
 type AuditPlugin struct{}
 
 func (self AuditPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name: "audit",
-		Doc:  "Register as an audit daemon in the kernel.",
+		Name:     "audit",
+		Doc:      "Register as an audit daemon in the kernel.",
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 
@@ -53,6 +63,7 @@ func (self AuditPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "audit", args)()
 
 		err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
 		if err != nil {
@@ -68,7 +79,7 @@ func (self AuditPlugin) Call(
 		defer client.Close()
 
 		reassembler, err := libaudit.NewReassembler(5, 2*time.Second,
-			&streamHandler{scope, output_chan})
+			&streamHandler{ctx, scope, output_chan})
 		if err != nil {
 			scope.Log("audit: %v", err)
 			return

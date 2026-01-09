@@ -42,11 +42,15 @@ parameters:
 sources:
 - query:
     SELECT * FROM info()
-`, true, true)
+`, services.ArtifactOptions{
+		ValidateArtifact:  true,
+		ArtifactIsBuiltIn: true})
 
 	repository.LoadYaml(`
 name: System.Hunt.Creation
-type: SERVER_EVENT`, true, true)
+type: SERVER_EVENT`, services.ArtifactOptions{
+		ValidateArtifact:  true,
+		ArtifactIsBuiltIn: true})
 
 	repository.LoadYaml(`
 name: AnotherTestArtifact
@@ -57,7 +61,10 @@ parameters:
 sources:
 - query:
     SELECT * FROM scope()
-`, true, true)
+`, services.ArtifactOptions{
+		ValidateArtifact:  true,
+		ArtifactIsBuiltIn: true})
+
 	request := &api_proto.Hunt{
 		HuntDescription: "My hunt",
 		StartRequest: &flows_proto.ArtifactCollectorArgs{
@@ -69,7 +76,7 @@ sources:
 	hunt_dispatcher, err := services.GetHuntDispatcher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	hunt_id, err := hunt_dispatcher.CreateHunt(
+	new_hunt, err := hunt_dispatcher.CreateHunt(
 		self.Ctx, self.ConfigObj, acl_manager, request)
 
 	assert.NoError(self.T(), err)
@@ -77,7 +84,7 @@ sources:
 	db, err := datastore.GetDB(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	hunt_path_manager := paths.NewHuntPathManager(hunt_id)
+	hunt_path_manager := paths.NewHuntPathManager(new_hunt.HuntId)
 	hunt_obj := &api_proto.Hunt{}
 	err = db.GetSubject(self.ConfigObj, hunt_path_manager.Path(), hunt_obj)
 	assert.NoError(self.T(), err)

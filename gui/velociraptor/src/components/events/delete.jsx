@@ -15,9 +15,10 @@ import VeloTimestamp from "../utils/time.jsx";
 export default class DeleteTimelineRanges extends Component {
     static propTypes = {
         client_id: PropTypes.string,
-        start_time: PropTypes.number,
-        end_time: PropTypes.number,
+        start_time: PropTypes.object,
+        end_time: PropTypes.object,
         onClose: PropTypes.func.isRequired,
+        artifact: PropTypes.string,
     }
 
     deleteData = () => {
@@ -39,6 +40,9 @@ export default class DeleteTimelineRanges extends Component {
     }
 
     render() {
+        let start_time = moment(this.props.start_time).format();
+        let end_time = moment(this.props.end_time).format();
+
         return (
             <>
               <Modal show={true}
@@ -53,9 +57,10 @@ export default class DeleteTimelineRanges extends Component {
 
                   {T("Are you sure you want to delete all logs within the time range?")}
 
-                  <VeloTimestamp iso={this.props.start_time}/> -
-                  <VeloTimestamp iso={this.props.end_time}/>
-
+                  <div>
+                    <VeloTimestamp iso={start_time}/> -
+                    <VeloTimestamp iso={end_time}/>
+                  </div>
                 </Modal.Body>
 
                 <Modal.Footer>

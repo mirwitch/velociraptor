@@ -1,9 +1,8 @@
 package api
 
 import (
-	context "golang.org/x/net/context"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"context"
+
 	"www.velocidex.com/golang/velociraptor/acls"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	"www.velocidex.com/golang/velociraptor/services"
@@ -12,6 +11,8 @@ import (
 func (self *ApiServer) ReformatVQL(
 	ctx context.Context,
 	in *api_proto.ReformatVQLMessage) (*api_proto.ReformatVQLMessage, error) {
+
+	defer Instrument("ReformatVQL")()
 
 	// Empty creators are called internally.
 	users := services.GetUserManager()
@@ -23,10 +24,21 @@ func (self *ApiServer) ReformatVQL(
 	permissions := acls.READ_RESULTS
 	perm, err := services.CheckAccess(org_config_obj, user_record.Name, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to read notebooks.")
 	}
 
+	if in.Artifact != "" {
+		manager, err := services.GetRepositoryManager(org_config_obj)
+		if err != nil {
+			return nil, Status(self.verbose, err)
+		}
+
+		reformated_vql, err := manager.ReformatVQL(ctx, in.Artifact)
+		return &api_proto.ReformatVQLMessage{
+			Artifact: reformated_vql,
+		}, Status(self.verbose, err)
+	}
 	notebook_manager, err := services.GetNotebookManager(org_config_obj)
 	if err != nil {
 		return nil, Status(self.verbose, err)

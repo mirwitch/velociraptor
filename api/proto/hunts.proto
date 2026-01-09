@@ -107,6 +107,9 @@ message Hunt {
             description: "Hunt's description",
         }];
 
+    // Hunts can be tagged.
+    repeated string tags = 23;
+
     ArtifactCollectorArgs start_request = 16 [(sem_type) = {
             description: "Launch this collection on the client if the condition is true",
         }];
@@ -136,6 +139,9 @@ message Hunt {
         RUNNING = 2 [(description) = "Hunt is running and ready."];
         STOPPED = 3 [(description) = "Hunt has stopped."];
         ARCHIVED = 4 [(description) = "Hunt has been archived."];
+
+        // Set internally when the hunt is being deleted.
+        DELETED = 5;
     };
 
     State state = 8 [(sem_type) = {
@@ -159,14 +165,18 @@ message ListHuntsRequest {
     // If specified we return a partial structure.
     bool summary = 4;
     bool include_archived = 3;
+
+    string user_filter = 5;
 }
 
 message ListHuntsResponse {
+    int64 total = 2;
     repeated Hunt items = 1;
 }
 
 message GetHuntRequest {
     string hunt_id = 1;
+    bool include_request = 2;
 }
 
 message GetHuntResultsRequest {
@@ -187,9 +197,19 @@ message HuntMutation {
     string description = 3;
     Hunt.State state = 4;
     uint64 start_time = 5;
+    uint64 expires = 7;
 
     // A mutation can directly assign an existing flow to the
     // hunt. This allows a flow to be rerun and added to the hunt
     // later.
     FlowAssignment assignment = 6;
+
+    repeated string tags = 8;
+
+    // The user who is initiating the mutation.
+    string user = 9;
+}
+
+message HuntTags {
+    repeated string tags = 1;
 }

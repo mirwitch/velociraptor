@@ -3,12 +3,15 @@ package inventory_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io/ioutil"
 	"net/http"
 	"testing"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sebdah/goldie"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
@@ -26,16 +29,16 @@ import (
 
 type MockClient struct {
 	responses map[string]string
+	requests  []string
 
 	count int
 }
 
-func (self MockClient) Do(req *http.Request) (*http.Response, error) {
+func (self *MockClient) Do(req *http.Request) (*http.Response, error) {
 	url := req.URL.String()
 
 	response := self.responses[url]
-	delete(self.responses, url)
-
+	self.requests = append(self.requests, url)
 	self.count++
 
 	return &http.Response{
@@ -62,26 +65,25 @@ func (self *ServicesTestSuite) TestGihubTools() {
 	inventory, err := services.GetInventory(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	err = inventory.AddTool(
+	err = inventory.AddTool(ctx,
 		self.ConfigObj, &artifacts_proto.Tool{
 			Name:             tool_name,
 			GithubProject:    "Velocidex/velociraptor",
 			GithubAssetRegex: "windows-amd64.exe",
-		}, services.ToolOptions{})
+		}, services.ToolOptions{
+			ArtifactDefinition: true,
+		})
 	assert.NoError(self.T(), err)
 
-	// Adding the tool simply fetches the github url but not the
-	// actual file (the URL is still pending).
-	assert.Equal(self.T(), self.mock.count, 0)
+	// Adding the tool does not result in any HTTP requests!
+	assert.Equal(self.T(), len(self.mock.requests), 0)
 
-	tool, err := inventory.GetToolInfo(ctx, self.ConfigObj, tool_name)
+	// Materialize the tool now - this will force HTTP requests
+	tool, err := inventory.GetToolInfo(ctx, self.ConfigObj, tool_name, "")
 	assert.NoError(self.T(), err)
 
-	assert.Equal(self.T(), len(self.mock.responses), 0)
-
-	// Both HTTP requests were made - Getting the tool info
-	// downloads the file from the server.
-	assert.Equal(self.T(), len(self.mock.responses), 0)
+	// Both URLs were fetched
+	assert.Equal(self.T(), len(self.mock.requests), 2)
 
 	assert.Equal(self.T(), tool.Name, "SampleTool")
 	assert.Equal(self.T(), tool.Url, "htttp://www.example.com/file.exe")
@@ -90,7 +92,8 @@ func (self *ServicesTestSuite) TestGihubTools() {
 
 	// What does the launcher do?
 	request := &actions_proto.VQLCollectorArgs{}
-	err = launcher.AddToolDependency(ctx, self.ConfigObj, tool_name, request)
+	err = launcher.AddToolDependency(
+		ctx, self.ConfigObj, tool_name, "", request)
 	assert.NoError(self.T(), err)
 
 	golden.Set("VQLCollectorArgs", request)
@@ -151,7 +154,10 @@ tools:
 	assert.NoError(self.T(), err)
 
 	repository := manager.NewRepository()
-	_, err = repository.LoadYaml(test_artifact, services.ValidateArtifact, services.ArtifactIsBuiltIn)
+	_, err = repository.LoadYaml(test_artifact,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: true})
 	assert.NoError(self.T(), err)
 
 	self.installGitHubMock()
@@ -176,8 +182,12 @@ tools:
 	inventory_service, err := services.GetInventory(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	tool, err := inventory_service.GetToolInfo(ctx, self.ConfigObj, tool_name)
+	tool, err := inventory_service.GetToolInfo(ctx, self.ConfigObj, tool_name, "")
 	assert.NoError(self.T(), err)
+
+	// Make sure the tool contains the version block
+	assert.Equal(self.T(), 1, len(tool.Versions))
+	assert.Equal(self.T(), "TestArtifact", tool.Versions[0].Artifact)
 
 	// Make sure the tool is served directly from upstream.
 	assert.Equal(self.T(), response[0].Env[2].Key, "Tool_SampleTool_URL")
@@ -191,6 +201,74 @@ tools:
 	serialized, err := json.MarshalIndentNormalized(golden)
 	assert.NoError(self.T(), err)
 	goldie.Assert(self.T(), "TestGihubToolsUninitialized", serialized)
+}
+
+func (self *ServicesTestSuite) TestExpectedHash() {
+	ctx := context.Background()
+
+	// Define a new artifact that requires a new tool
+	test_artifact := `
+name: TestArtifact
+tools:
+- name: SampleTool
+  github_project: Velocidex/velociraptor
+  github_asset_regex: windows-amd64.exe
+  expected_hash: 001122
+`
+	manager, err := services.GetRepositoryManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	repository := manager.NewRepository()
+	_, err = repository.LoadYaml(test_artifact,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: false})
+	assert.NoError(self.T(), err)
+
+	self.installGitHubMock()
+
+	hash := getHash("File Content")
+
+	// Launch the artifact - this will result in the tool being
+	// downloaded and the hash calculated on demand.
+	launcher, err := services.GetLauncher(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	// Should fail because the tool hash is not the same as the
+	// expected hash.
+	_, err = launcher.CompileCollectorArgs(
+		ctx, self.ConfigObj, acl_managers.NullACLManager{}, repository,
+		services.CompilerOptions{},
+		&flows_proto.ArtifactCollectorArgs{
+			Artifacts: []string{"TestArtifact"},
+		})
+	assert.Error(self.T(), err)
+	assert.Contains(self.T(), err.Error(), "Downloaded tool hash of "+hash)
+
+	// Now update the tool definition to trust the hash.
+	inventory_service, err := services.GetInventory(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	// Check the tool definition in the inventory.
+	tool, err := inventory_service.ProbeToolInfo(
+		ctx, self.ConfigObj, "SampleTool", "")
+	assert.NoError(self.T(), err)
+
+	// Make sure the invalid hash is recorded.
+	assert.Equal(self.T(), hash, tool.InvalidHash)
+
+	// Now update the tool definition by accepting the hash
+	tool.ExpectedHash = tool.InvalidHash
+	err = inventory_service.AddTool(ctx, self.ConfigObj,
+		tool, services.ToolOptions{
+			AdminOverride: true,
+		})
+	assert.NoError(self.T(), err)
+
+	// Force the tool to download again.
+	tool, err = inventory_service.GetToolInfo(ctx, self.ConfigObj, "SampleTool", "")
+	assert.NoError(self.T(), err)
+	goldie.AssertJson(self.T(), "TestExpectedHash", tool)
 }
 
 // Test that a tool can be upgraded.
@@ -210,10 +288,11 @@ func (self *ServicesTestSuite) TestUpgrade() {
 	inventory_service, err := services.GetInventory(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	err = inventory_service.AddTool(self.ConfigObj, tool_definition, services.ToolOptions{})
+	err = inventory_service.AddTool(ctx, self.ConfigObj,
+		tool_definition, services.ToolOptions{})
 	assert.NoError(self.T(), err)
 
-	tool, err := inventory_service.GetToolInfo(ctx, self.ConfigObj, tool_name)
+	tool, err := inventory_service.GetToolInfo(ctx, self.ConfigObj, tool_name, "")
 	assert.NoError(self.T(), err)
 
 	// First version.
@@ -223,11 +302,12 @@ func (self *ServicesTestSuite) TestUpgrade() {
 	// Now force the tool to update by re-adding it but this time it is a new version.
 	self.installGitHubMockVersion2()
 
-	err = inventory_service.AddTool(self.ConfigObj, tool_definition, services.ToolOptions{})
+	err = inventory_service.AddTool(ctx, self.ConfigObj, tool_definition,
+		services.ToolOptions{})
 	assert.NoError(self.T(), err)
 
 	// Check the tool information.
-	tool, err = inventory_service.GetToolInfo(ctx, self.ConfigObj, tool_name)
+	tool, err = inventory_service.GetToolInfo(ctx, self.ConfigObj, tool_name, "")
 	assert.NoError(self.T(), err)
 
 	// Make sure the tool is updated and the hash is changed.
@@ -252,7 +332,10 @@ tools:
 	assert.NoError(self.T(), err)
 
 	repository := manager.NewRepository()
-	_, err = repository.LoadYaml(test_artifact, services.ValidateArtifact, services.ArtifactIsBuiltIn)
+	_, err = repository.LoadYaml(test_artifact,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: true})
 	assert.NoError(self.T(), err)
 
 	self.installGitHubMock()
@@ -274,7 +357,7 @@ tools:
 	inventory_service, err := services.GetInventory(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	tool, err := inventory_service.GetToolInfo(ctx, self.ConfigObj, "SampleTool")
+	tool, err := inventory_service.GetToolInfo(ctx, self.ConfigObj, "SampleTool", "")
 	assert.NoError(self.T(), err)
 
 	golden := ordereddict.NewDict().Set("Tool", tool).Set("Request", response[0])
@@ -305,22 +388,31 @@ tools:
 	assert.NoError(self.T(), err)
 
 	repository, _ := manager.GetGlobalRepository(self.ConfigObj)
-	_, err = repository.LoadYaml(test_artifact, services.ValidateArtifact, services.ArtifactIsBuiltIn)
+	_, err = repository.LoadYaml(test_artifact,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: true})
 	assert.NoError(self.T(), err)
 
-	_, pres := repository.Get(self.ConfigObj, "TestArtifact")
+	ctx := self.Ctx
+	_, pres := repository.Get(ctx, self.ConfigObj, "TestArtifact")
 	assert.True(self.T(), pres)
 
-	_, err = repository.LoadYaml(test_artifact2, services.ValidateArtifact, services.ArtifactIsBuiltIn)
+	_, err = repository.LoadYaml(test_artifact2,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: true})
+
 	assert.NoError(self.T(), err)
 
-	_, pres = repository.Get(self.ConfigObj, "TestArtifact2")
+	_, pres = repository.Get(ctx, self.ConfigObj, "TestArtifact2")
 	assert.True(self.T(), pres)
 
 	inventory_service, err := services.GetInventory(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	tool, err := inventory_service.ProbeToolInfo("SampleTool")
+	tool, err := inventory_service.ProbeToolInfo(
+		ctx, self.ConfigObj, "SampleTool", "")
 	assert.NoError(self.T(), err)
 
 	// The tool definition retains the original URL
@@ -343,7 +435,7 @@ tools:
 	inventory_service, err := services.GetInventory(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	err = inventory_service.AddTool(self.ConfigObj,
+	err = inventory_service.AddTool(self.Ctx, self.ConfigObj,
 		&artifacts_proto.Tool{
 			Name: "SampleTool",
 			Hash: "XXXXX",
@@ -356,13 +448,18 @@ tools:
 	assert.NoError(self.T(), err)
 
 	repository, _ := manager.GetGlobalRepository(self.ConfigObj)
-	_, err = repository.LoadYaml(test_artifact, services.ValidateArtifact, services.ArtifactIsBuiltIn)
+	_, err = repository.LoadYaml(test_artifact,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: true})
+
 	assert.NoError(self.T(), err)
 
-	_, pres := repository.Get(self.ConfigObj, "TestArtifact")
+	_, pres := repository.Get(self.Ctx, self.ConfigObj, "TestArtifact")
 	assert.True(self.T(), pres)
 
-	tool, err := inventory_service.ProbeToolInfo("SampleTool")
+	tool, err := inventory_service.ProbeToolInfo(
+		self.Ctx, self.ConfigObj, "SampleTool", "")
 	assert.NoError(self.T(), err)
 
 	assert.Equal(self.T(), tool.Url, "")
@@ -386,10 +483,13 @@ tools:
 	assert.NoError(self.T(), err)
 
 	repository, _ := manager.GetGlobalRepository(self.ConfigObj)
-	_, err = repository.LoadYaml(test_artifact, services.ValidateArtifact, services.ArtifactIsBuiltIn)
+	_, err = repository.LoadYaml(test_artifact, services.ArtifactOptions{
+		ValidateArtifact:  true,
+		ArtifactIsBuiltIn: true})
+
 	assert.NoError(self.T(), err)
 
-	_, pres := repository.Get(self.ConfigObj, "TestArtifact")
+	_, pres := repository.Get(self.Ctx, self.ConfigObj, "TestArtifact")
 	assert.True(self.T(), pres)
 
 	// The admin sets a very minimal tool definition which would
@@ -398,14 +498,15 @@ tools:
 	inventory_service, err := services.GetInventory(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	err = inventory_service.AddTool(self.ConfigObj,
+	err = inventory_service.AddTool(self.Ctx, self.ConfigObj,
 		&artifacts_proto.Tool{
 			Name: "SampleTool",
 			Hash: "XXXXX",
 		}, services.ToolOptions{AdminOverride: true})
 	assert.NoError(self.T(), err)
 
-	tool, err := inventory_service.ProbeToolInfo("SampleTool")
+	tool, err := inventory_service.ProbeToolInfo(
+		self.Ctx, self.ConfigObj, "SampleTool", "")
 	assert.NoError(self.T(), err)
 
 	assert.Equal(self.T(), tool.Url, "")
@@ -418,26 +519,268 @@ func (self *ServicesTestSuite) TestAdminOverrideAdminSet() {
 	inventory_service, err := services.GetInventory(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	err = inventory_service.AddTool(self.ConfigObj,
+	err = inventory_service.AddTool(self.Ctx, self.ConfigObj,
 		&artifacts_proto.Tool{
 			Name: "SampleTool",
 			Hash: "XXXXX",
 		}, services.ToolOptions{AdminOverride: true})
 	assert.NoError(self.T(), err)
 
-	err = inventory_service.AddTool(self.ConfigObj,
+	err = inventory_service.AddTool(self.Ctx, self.ConfigObj,
 		&artifacts_proto.Tool{
 			Name: "SampleTool",
 			Hash: "YYYYY",
 		}, services.ToolOptions{AdminOverride: true})
 	assert.NoError(self.T(), err)
 
-	tool, err := inventory_service.ProbeToolInfo("SampleTool")
+	tool, err := inventory_service.ProbeToolInfo(
+		self.Ctx, self.ConfigObj, "SampleTool", "")
 	assert.NoError(self.T(), err)
 
 	assert.Equal(self.T(), tool.Url, "")
 	assert.Equal(self.T(), tool.Hash, "YYYYY")
 	assert.False(self.T(), tool.ServeLocally)
+}
+
+// Upload multiple versions - should co-exist.
+func (self *ServicesTestSuite) TestMultipleVersions() {
+	inventory_service, err := services.GetInventory(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	// Add the same tool with different versions
+	err = inventory_service.AddTool(self.Ctx, self.ConfigObj,
+		&artifacts_proto.Tool{
+			Name:    "SampleTool",
+			Version: "1",
+			Hash:    "XXXXX",
+		}, services.ToolOptions{AdminOverride: true})
+	assert.NoError(self.T(), err)
+
+	err = inventory_service.AddTool(self.Ctx, self.ConfigObj,
+		&artifacts_proto.Tool{
+			Name:    "SampleTool",
+			Version: "2",
+			Hash:    "YYYYY",
+		}, services.ToolOptions{AdminOverride: true})
+	assert.NoError(self.T(), err)
+
+	tool, err := inventory_service.ProbeToolInfo(
+		self.Ctx, self.ConfigObj, "SampleTool", "1")
+	assert.NoError(self.T(), err)
+	assert.Equal(self.T(), tool.Url, "")
+	assert.Equal(self.T(), tool.Hash, "XXXXX")
+	assert.False(self.T(), tool.ServeLocally)
+
+	tool, err = inventory_service.ProbeToolInfo(
+		self.Ctx, self.ConfigObj, "SampleTool", "2")
+	assert.NoError(self.T(), err)
+	assert.Equal(self.T(), tool.Url, "")
+	assert.Equal(self.T(), tool.Hash, "YYYYY")
+	assert.False(self.T(), tool.ServeLocally)
+}
+
+func (self *ServicesTestSuite) TestMultipleSemanticVersions() {
+	// Define a new artifact that requires a new tool
+	self.LoadArtifacts(`
+name: TestArtifactSemver1
+tools:
+- name: SampleToolSemver
+  url: http://www.example.com/SampleTool0.6.5.exe
+  version: "0.6.5"
+sources:
+- query: SELECT Version065 FROM scope()
+`, `
+name: TestArtifactSemver2
+tools:
+- name: SampleToolSemver
+  url: http://www.example.com/SampleTool0.6.5-rc2.exe
+  version: "0.6.5-rc2"
+sources:
+- query: SELECT Version065_rc2 FROM scope()
+`, `
+name: TestArtifactSemverNoVersion
+tools:
+- name: SampleToolSemver
+sources:
+- query: SELECT HighestVersion FROM scope()
+`, `
+name: TestArtifactConflictingVersion
+tools:
+- name: SampleToolSemver
+  url: http://www.example.com/ConflictingVersion.exe
+  version: "0.6.5-rc2"
+sources:
+- query: SELECT Version065_rc2 FROM scope()
+`)
+
+	self.mock = &MockClient{
+		responses: map[string]string{
+			"http://www.example.com/SampleTool0.6.5.exe":     "File Content 1",
+			"http://www.example.com/SampleTool0.6.5-rc2.exe": "File Content 2",
+		},
+	}
+
+	inventory_service, err := services.GetInventory(self.ConfigObj)
+	assert.NoError(self.T(), err)
+	inventory_service.(*inventory.InventoryService).Client = self.mock
+
+	// Tools are only loaded when we compile the artifact since they are lazy.
+	launcher, err := services.GetLauncher(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	manager, err := services.GetRepositoryManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	repository, err := manager.GetGlobalRepository(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	response, err := launcher.CompileCollectorArgs(
+		self.Ctx, self.ConfigObj, acl_managers.NullACLManager{}, repository,
+		services.CompilerOptions{},
+		&flows_proto.ArtifactCollectorArgs{
+			Artifacts: []string{
+				"TestArtifactSemver1",
+				"TestArtifactSemver2",
+				"TestArtifactSemverNoVersion",
+				"TestArtifactConflictingVersion",
+			},
+		})
+	assert.NoError(self.T(), err)
+
+	// When an artifact defines a tool with a version they will
+	// automatically use the version defined in that artifact.
+	assert.Contains(self.T(), response[0].Query[0].VQL, "Version065")
+	assert.Contains(self.T(), response[0].Env[1].Value, "SampleTool0.6.5.exe")
+
+	assert.Contains(self.T(), response[1].Query[0].VQL, "Version065_rc2")
+	assert.Contains(self.T(), response[1].Env[1].Value, "SampleTool0.6.5-rc2.exe")
+
+	// If an artifact does not specify the version it will pick the
+	// highest known version.
+	assert.Contains(self.T(), response[2].Query[0].VQL, "HighestVersion")
+	assert.Contains(self.T(), response[2].Env[1].Value, "SampleTool0.6.5.exe")
+
+	// When no version is specified gets the latest version
+	tool, err := inventory_service.ProbeToolInfo(
+		self.Ctx, self.ConfigObj, "SampleToolSemver", "")
+	assert.NoError(self.T(), err)
+
+	// Make sure we get the latest version (0.6.5 is later than 0.6.5-rc2)
+	assert.Equal(self.T(), tool.Version, "0.6.5")
+	assert.Equal(self.T(), tool.Filename, "SampleTool0.6.5.exe")
+
+	tool, err = inventory_service.GetToolInfo(
+		self.Ctx, self.ConfigObj, "SampleToolSemver", "")
+	assert.NoError(self.T(), err)
+
+	assert.Equal(self.T(), tool.Version, "0.6.5")
+	assert.Equal(self.T(), tool.Filename, "SampleTool0.6.5.exe")
+
+	// But we can still explicitely get the old version if we wanted to
+	tool, err = inventory_service.GetToolInfo(
+		self.Ctx, self.ConfigObj, "SampleToolSemver", "0.6.5-rc2")
+	assert.NoError(self.T(), err)
+
+	assert.Equal(self.T(), tool.Version, "0.6.5-rc2")
+	assert.Equal(self.T(), tool.Filename, "SampleTool0.6.5-rc2.exe")
+
+	// 0.6.5-rc2 has two conflicting versions, the Tool description
+	// should show both but not show any other version.
+	assert.Equal(self.T(), 2, len(tool.Versions))
+
+	// The active tool is defined in TestArtifactSemver2
+	assert.Equal(self.T(), "TestArtifactSemver2", tool.Artifact)
+
+	golden := ordereddict.NewDict().Set("Original Version", tool)
+
+	// Now simulate the user overriding the active version in the GUI.
+	err = inventory_service.AddTool(self.Ctx, self.ConfigObj,
+		tool.Versions[1], services.ToolOptions{
+			ArtifactDefinition: true,
+		})
+	assert.NoError(self.T(), err)
+
+	tool, err = inventory_service.GetToolInfo(
+		self.Ctx, self.ConfigObj, "SampleToolSemver", "0.6.5-rc2")
+	assert.NoError(self.T(), err)
+
+	// The active tool is defined in TestArtifactSemver2
+	assert.Equal(self.T(), "TestArtifactConflictingVersion", tool.Artifact)
+
+	golden.Set("Updated Version", tool)
+
+	goldie.Assert(self.T(), "TestMultipleSemanticVersions",
+		json.MustMarshalIndent(golden))
+}
+
+// Multiple artifacts with different versions
+func (self *ServicesTestSuite) TestMultipleVersionsInArtifacts() {
+	// Define a new artifact that requires a new tool
+	self.LoadArtifacts(`
+name: TestArtifact1
+tools:
+- name: SampleTool
+  url: http://www.example.com/SampleTool1.exe
+  version: "1"
+`, `
+name: TestArtifact2
+tools:
+- name: SampleTool
+  url: http://www.example.com/SampleTool2.exe
+  version: "2"
+`)
+
+	self.mock = &MockClient{
+		responses: map[string]string{
+			"http://www.example.com/SampleTool2.exe": "File Content 2",
+			"http://www.example.com/SampleTool1.exe": "File Content 1",
+		},
+	}
+
+	inventory_service, err := services.GetInventory(self.ConfigObj)
+	assert.NoError(self.T(), err)
+	inventory_service.(*inventory.InventoryService).Client = self.mock
+
+	launcher, err := services.GetLauncher(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	manager, err := services.GetRepositoryManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	repository, err := manager.GetGlobalRepository(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	response, err := launcher.CompileCollectorArgs(
+		self.Ctx, self.ConfigObj, acl_managers.NullACLManager{}, repository,
+		services.CompilerOptions{},
+		&flows_proto.ArtifactCollectorArgs{
+			Artifacts: []string{"TestArtifact1"},
+		})
+	assert.NoError(self.T(), err)
+
+	assert.Equal(self.T(), response[0].Env[0].Value,
+		getHash("File Content 1"))
+	assert.Equal(self.T(), response[0].Env[2].Value,
+		"http://www.example.com/SampleTool1.exe")
+
+	response, err = launcher.CompileCollectorArgs(
+		self.Ctx, self.ConfigObj, acl_managers.NullACLManager{}, repository,
+		services.CompilerOptions{},
+		&flows_proto.ArtifactCollectorArgs{
+			Artifacts: []string{"TestArtifact2"},
+		})
+	assert.NoError(self.T(), err)
+
+	assert.Equal(self.T(), response[0].Env[0].Value,
+		getHash("File Content 2"))
+	assert.Equal(self.T(), response[0].Env[2].Value,
+		"http://www.example.com/SampleTool2.exe")
+}
+
+func getHash(data string) string {
+	sha_sum := sha256.New()
+	sha_sum.Write([]byte(data))
+	return hex.EncodeToString(sha_sum.Sum(nil))
 }
 
 func TestInventoryService(t *testing.T) {

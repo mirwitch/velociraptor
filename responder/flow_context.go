@@ -2,17 +2,21 @@ package responder
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Velocidex/ordereddict"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	constants "www.velocidex.com/golang/velociraptor/constants"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -21,6 +25,9 @@ import (
 // client, and simply synced to the server. This dramatically reduces
 // the amount of work done on the server.
 type FlowContext struct {
+	// A counter of uploads sent in the entire collection.
+	upload_id int32
+
 	ctx        context.Context
 	config_obj *config_proto.Config
 	flow_id    string
@@ -29,11 +36,18 @@ type FlowContext struct {
 	req *crypto_proto.FlowRequest
 
 	// Flow wide totals
-	total_rows           uint64
-	total_uploaded_bytes uint64
+	total_rows               uint64
+	total_uploaded_bytes     uint64
+	total_jsonl_bytes        map[string]uint64
+	total_logs               uint64
+	logs_disabled            bool
+	transactions_outstanding uint64
 
 	// Send the messages to this channel
 	output chan *crypto_proto.VeloMessage
+
+	// The path to the checkpoint file.
+	checkpoint string
 
 	// Cancelling the FlowContext will cancel all its in flight
 	// queries.
@@ -46,9 +60,6 @@ type FlowContext struct {
 
 	// Logs and uploads are managed per collection, and are shared
 	// with all the queries.
-
-	// A counter of uploads sent in the entire collection.
-	upload_id int32
 
 	// A JSONL buffer with log messages collected for the entire flow.
 	mu                sync.Mutex
@@ -107,15 +118,20 @@ func newFlowContext(ctx context.Context,
 	// Allow the flow to be cancelled.
 	sub_ctx, cancel := context.WithCancel(ctx)
 	self := &FlowContext{
-		ctx:            sub_ctx,
-		cancel:         cancel,
-		wg:             &sync.WaitGroup{},
-		output:         output,
-		req:            req.FlowRequest,
-		frequency_msec: frequency_msec,
-		config_obj:     config_obj,
-		flow_id:        flow_id,
-		owner:          owner,
+		ctx:               sub_ctx,
+		cancel:            cancel,
+		wg:                &sync.WaitGroup{},
+		output:            output,
+		req:               req.FlowRequest,
+		frequency_msec:    frequency_msec,
+		config_obj:        config_obj,
+		flow_id:           flow_id,
+		owner:             owner,
+		total_jsonl_bytes: make(map[string]uint64),
+
+		// Disable checkpoints for now since the server will get the
+		// flow state anyway.
+		// checkpoint:     makeCheckpoint(config_obj, flow_id),
 	}
 
 	go func() {
@@ -139,7 +155,6 @@ func newFlowContext(ctx context.Context,
 	}()
 
 	return self
-
 }
 
 // Is the flow complete? A flow is complete when all its queries are
@@ -152,6 +167,13 @@ func (self *FlowContext) IsFlowComplete() bool {
 }
 
 func (self *FlowContext) isFlowComplete() bool {
+	// If we have no responders then we have not started executing
+	// anything yet.
+	if len(self.responders) == 0 {
+		return false
+	}
+
+	// We are only complete when *all* the responders are complete!
 	for _, r := range self.responders {
 		if !r.IsComplete() {
 			return false
@@ -160,24 +182,38 @@ func (self *FlowContext) isFlowComplete() bool {
 	return true
 }
 
-func (self *FlowContext) ChargeRows(rows uint64) {
+func (self *FlowContext) ChargeRows(rows uint64) error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
 	self.total_rows += rows
 	if self.req.MaxRows > 0 && self.total_rows > self.req.MaxRows {
-		msg := fmt.Sprintf("Rows %v exceeded limit %v for flow %v. Cancelling.",
+		return fmt.Errorf(
+			"Rows %v exceeded limit %v for flow %v. Cancelling.",
 			self.total_rows, self.req.MaxRows, self.flow_id)
 
-		self.addLogMessage("ERROR", msg)
-		if len(self.responders) > 0 {
-			self.responders[0].RaiseError(self.ctx, msg)
-		}
-		self._Cancel()
 	}
+	return nil
 }
 
-func (self *FlowContext) ChargeBytes(bytes uint64) {
+func (self *FlowContext) GetJSONLBytes(name string) uint64 {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	count, _ := self.total_jsonl_bytes[name]
+	return count
+}
+
+func (self *FlowContext) ChargeJSONLBytes(name string, bytes uint64) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	count, _ := self.total_jsonl_bytes[name]
+	count += bytes
+	self.total_jsonl_bytes[name] = count
+}
+
+func (self *FlowContext) ChargeBytes(bytes uint64) error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
@@ -186,12 +222,9 @@ func (self *FlowContext) ChargeBytes(bytes uint64) {
 		self.total_uploaded_bytes > self.req.MaxUploadBytes {
 		msg := fmt.Sprintf("Upload bytes %v exceeded limit %v for flow %v. Cancelling.",
 			self.total_uploaded_bytes, self.req.MaxUploadBytes, self.flow_id)
-		self.addLogMessage("ERROR", msg)
-		if len(self.responders) > 0 {
-			self.responders[0].RaiseError(self.ctx, msg)
-		}
-		self._Cancel()
+		return errors.New(msg)
 	}
+	return nil
 }
 
 // Cancel all the responders and wait for them to complete. This may
@@ -206,7 +239,7 @@ func (self *FlowContext) Cancel() {
 func (self *FlowContext) _Cancel() {
 	// Cancel all outstanding queries
 	for _, r := range self.responders {
-		r.RaiseError(self.ctx, "Cancelled")
+		r.Cancel(self.ctx)
 	}
 
 	self.addLogMessage("ERROR",
@@ -227,8 +260,34 @@ func (self *FlowContext) Close() {
 
 func (self *FlowContext) _Close() {
 	if self.owner != nil {
-		self.owner.removeFlowContext(self.flow_id)
+		self.owner.RemoveFlowContext(self.flow_id)
 	}
+	if self.checkpoint != "" {
+		os.Remove(self.checkpoint)
+
+		writeback_service := writeback.GetWritebackService()
+		_ = writeback_service.MutateWriteback(self.config_obj,
+			func(wb *config_proto.Writeback) error {
+				new_list := make([]*config_proto.FlowCheckPoint,
+					0, len(wb.Checkpoints))
+				for _, cp := range wb.Checkpoints {
+					if cp.Path != self.checkpoint {
+						new_list = append(new_list, cp)
+					}
+				}
+
+				if len(new_list) == len(wb.Checkpoints) {
+					return writeback.WritebackNoUpdate
+				}
+
+				wb.Checkpoints = new_list
+				return writeback.WritebackUpdateLevel2
+			})
+
+		// Do not write a checkpoint any more.
+		self.checkpoint = ""
+	}
+
 	self.flushLogMessages(self.ctx)
 	self.sendStats()
 	self.cancel()
@@ -281,22 +340,63 @@ func (self *FlowContext) flushLogMessages(ctx context.Context) {
 	}
 }
 
-func (self *FlowContext) AddLogMessage(level string, msg string) {
+// Alert messages are sent in their own packet because the server will
+// redirect them into the alert queue.
+func (self *FlowContext) sendAlertMessage(
+	ctx context.Context, level string,
+	// msg contains serialized services.AlertMessage
+	msg string) {
+
+	self.mu.Lock()
+	id := self.log_messages_id
+	self.log_messages_id++
+	self.mu.Unlock()
+
+	self.output <- &crypto_proto.VeloMessage{
+		SessionId: self.flow_id,
+		RequestId: constants.LOG_SINK,
+		LogMessage: &crypto_proto.LogMessage{
+			Id:           int64(id),
+			NumberOfRows: 1,
+			Jsonl: json.Format(
+				"{\"client_time\":%d,\"level\":%q,\"message\":%q}\n",
+				int(utils.GetTime().Now().Unix()), level, msg),
+			Level: logging.ALERT,
+		}}
+}
+
+func (self *FlowContext) AddLogMessage(
+	ctx context.Context, level string, msg string) {
+	if level == logging.ALERT {
+		self.sendAlertMessage(ctx, level, msg)
+		return
+	}
+
 	self.mu.Lock()
 	defer self.mu.Unlock()
+
+	// Suppress logs
+	self.total_logs++
+	if self.logs_disabled {
+		return
+	}
+
+	max_logs := uint64(100000)
+	if self.req.MaxLogs > 0 {
+		max_logs = self.req.MaxLogs
+	}
+
+	if self.total_logs >= max_logs {
+		self.addLogMessage(level,
+			"Log Limit Exceeded - suppressing further logs")
+		self.logs_disabled = true
+		return
+	}
 
 	self.addLogMessage(level, msg)
 }
 
 func (self *FlowContext) addLogMessage(level string, msg string) {
-
-	// Capture the first message at error level. This allows the
-	// server to skip parsing the jsonl bundle completely.
-	// FIXME: Support server provided error regex patterns
-	if level == logging.ERROR && self.error_message == "" {
-		self.error_message = msg
-	}
-
 	self.log_message_count++
 	self.log_messages = append(self.log_messages, json.Format(
 		"{\"client_time\":%d,\"level\":%q,\"message\":%q}\n",
@@ -318,7 +418,8 @@ func (self *FlowContext) NewResponder(
 	// Done in the Close() method.
 	self.wg.Add(1)
 	responder := newFlowResponder(
-		self.ctx, self.config_obj, self.wg, self.output, self)
+		self.ctx, self.config_obj, self.wg, self.output,
+		self.req, self)
 	self.responders = append(self.responders, responder)
 
 	return self.ctx, responder
@@ -348,11 +449,58 @@ func (self *FlowContext) MaybeSendStats() *crypto_proto.VeloMessage {
 // send the stats immediately.
 func (self *FlowContext) sendStats() {
 	if !self.final_stats_sent {
+		stats := self.getStats()
+		if self.final_stats_sent {
+			logger := logging.GetLogger(self.config_obj, &logging.ClientComponent)
+			logger.Debug("Sending final message for %v: %v",
+				self.flow_id, json.MustMarshalString(stats))
+		}
+
 		select {
 		case <-self.ctx.Done():
-		case self.output <- self.getStats():
+		case self.output <- stats:
 		}
 	}
+}
+
+func (self *FlowContext) GetStatsDicts() *ordereddict.Dict {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	query_status := []*ordereddict.Dict{}
+
+	// Fill in all the responder's stats.
+	for _, r := range self.responders {
+		status := r.GetStatus()
+
+		query_status = append(query_status, ordereddict.NewDict().
+			Set("Status", status.Status.String()).
+			Set("Error", status.ErrorMessage).
+			Set("Backtrace", status.Backtrace).
+			Set("Duration", time.Duration(status.Duration).Round(time.Second).String()).
+			Set("FirstActive", time.Unix(0, int64(status.FirstActive*1000)).
+				Format(time.RFC3339)).
+			Set("LastActive", time.Unix(0, int64(status.LastActive*1000)).
+				Format(time.RFC3339)).
+			Set("QueriesWithResponse", status.NamesWithResponse).
+			Set("ResultRows", status.ResultRows).
+			Set("LogRows", status.LogRows).
+			Set("UploadedFiles", status.UploadedFiles).
+			Set("UploadedBytes", status.UploadedBytes).
+			Set("ExpectedUploadedBytes", status.ExpectedUploadedBytes))
+	}
+
+	return ordereddict.NewDict().
+		Set("SessionId", self.flow_id).
+		Set("QueryStatus", query_status).
+		Set("FlowComplete", self.isFlowComplete())
+}
+
+func (self *FlowContext) GetStats() *crypto_proto.VeloMessage {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.getStats()
 }
 
 // Prepare a FlowStat message to send the server.
@@ -360,7 +508,9 @@ func (self *FlowContext) getStats() *crypto_proto.VeloMessage {
 	result := &crypto_proto.VeloMessage{
 		SessionId: self.flow_id,
 		RequestId: constants.STATS_SINK,
-		FlowStats: &crypto_proto.FlowStats{},
+		FlowStats: &crypto_proto.FlowStats{
+			TransactionsOutstanding: self.transactions_outstanding,
+		},
 	}
 
 	// Fill in all the responder's stats.
@@ -375,5 +525,32 @@ func (self *FlowContext) getStats() *crypto_proto.VeloMessage {
 		self.final_stats_sent = true
 	}
 
+	// Write the checkpoint file
+	if self.checkpoint != "" {
+		serialized, err := json.Marshal(result)
+		if err == nil {
+			fd, err := os.OpenFile(self.checkpoint,
+				os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0660)
+			if err == nil {
+				_, _ = fd.Write(serialized)
+			}
+			fd.Close()
+		}
+	}
+
 	return result
+}
+
+func (self *FlowContext) IncTransaction() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.transactions_outstanding++
+}
+
+func (self *FlowContext) DecTransaction() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.transactions_outstanding--
 }

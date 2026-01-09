@@ -18,7 +18,23 @@ function _ArtifactCollectorArgs_to_label_table(event_table) {
 
     _.each(event_table.specs, spec=>{
         let artifact_name = spec.artifact;
-        result.specs[artifact_name] = _ArtifactParameters2dict(spec.parameters);
+        let param_dict = _ArtifactParameters2dict(spec.parameters);
+        result.specs[artifact_name] = param_dict;
+        if(spec.cpu_limit) {
+            param_dict.cpu_limit = spec.cpu_limit;
+        }
+
+        if(spec.max_batch_wait) {
+            param_dict.max_batch_wait = spec.max_batch_wait;
+        }
+
+        if(spec.max_batch_rows) {
+            param_dict.max_batch_rows = spec.max_batch_rows;
+        }
+
+        if(spec.timeout) {
+            param_dict.timeout = spec.timeout;
+        }
     });
 
     // If there is no spec the add an empty one.
@@ -51,6 +67,9 @@ function _ArtifactCollectorArgs_to_label_table(event_table) {
              key2, value2,
         },
    }
+
+   The special parameters cpu_limit, max_batch_wait and max_batch_rows are
+   extracted into the spec protobuf from the general parameter object.
 */
 function proto2tables(table, cb) {
     let definitions = {};
@@ -63,6 +82,10 @@ function proto2tables(table, cb) {
         result[x.label] = event_table;
         all_artifacts = all_artifacts.concat(event_table.artifacts);
     });
+
+    if (_.isEmpty(all_artifacts)) {
+        return {};
+    }
 
     // Now lookup all the artifacts for their definitions and replace
     // in client_event_table.
@@ -112,11 +135,34 @@ function _label_table2ArtifactCollectorArgs(label_table) {
 
         let artifact_name = k;
         let parameters = {env: []};
+        let spec = {artifact: artifact_name,
+                    parameters: parameters};
+
         _.each(v, (v, k)=>{
+            if(k==="cpu_limit") {
+                spec.cpu_limit = parseInt(v);
+                return;
+            }
+
+            if(k==="max_batch_wait") {
+                spec.max_batch_wait = parseInt(v);
+                return;
+            }
+
+            if(k==="max_batch_rows") {
+                spec.max_batch_rows = parseInt(v);
+                return;
+            }
+
+            if(k==="timeout") {
+                spec.timeout = parseInt(v);
+                return;
+            }
+
             parameters.env.push({key: k, value: v});
         });
 
-        result.specs.push({artifact: artifact_name, parameters: parameters});
+        result.specs.push(spec);
     });
 
     return result;

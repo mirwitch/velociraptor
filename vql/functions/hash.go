@@ -1,19 +1,19 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package functions
 
@@ -29,6 +29,9 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -63,6 +66,7 @@ type HashFunctionArgs struct {
 	Path       *accessors.OSPath `vfilter:"required,field=path,doc=Path to open and hash."`
 	Accessor   string            `vfilter:"optional,field=accessor,doc=The accessor to use"`
 	HashSelect []string          `vfilter:"optional,field=hashselect,doc=The hash function to use (MD5,SHA1,SHA256)"`
+	MaxSize    uint64            `vfilter:"optional,field=max_size,doc=The maximum size of the file that will be hashed (default 100mb)"`
 }
 
 // HashFunction calculates a hash of a file. It may be expensive
@@ -72,6 +76,9 @@ type HashFunction struct{}
 func (self *HashFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer vql_subsystem.RegisterMonitor(ctx, "hash", args)()
+
 	arg := &HashFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -79,16 +86,19 @@ func (self *HashFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	if arg.MaxSize == 0 {
+		arg.MaxSize = vql_subsystem.GetIntFromRow(
+			scope, scope, constants.HASH_MAX_SIZE)
+	}
+
+	if arg.MaxSize == 0 {
+		arg.MaxSize = 100 * 1024 * 1024
+	}
+
 	cached_buffer := pool.Get().(*[]byte)
 	defer pool.Put(cached_buffer)
 
 	buf := *cached_buffer
-
-	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-	if err != nil {
-		scope.Log("hash: %s", err)
-		return vfilter.Null{}
-	}
 
 	fs, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
@@ -96,7 +106,7 @@ func (self *HashFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
-	file, err := fs.Open(arg.Path.String())
+	file, err := fs.OpenWithOSPath(arg.Path)
 	if err != nil {
 		//scope.Log("hash %s: %v", arg.Path.String(), err)
 		return vfilter.Null{}
@@ -128,6 +138,7 @@ func (self *HashFunction) Call(ctx context.Context,
 		}
 	}
 
+	var count uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -135,6 +146,13 @@ func (self *HashFunction) Call(ctx context.Context,
 
 		default:
 			n, err := file.Read(buf)
+
+			count += uint64(n)
+			if count > arg.MaxSize {
+				DeduplicatedLog(
+					ctx, scope, "Hash of %v aborted due to exceeding size", arg.Path)
+				n = 0
+			}
 
 			// We are done!
 			if n == 0 || err == io.EOF {
@@ -181,10 +199,11 @@ func (self *HashFunction) Call(ctx context.Context,
 
 func (self HashFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "hash",
-		Doc:     "Calculate the hash of a file.",
-		ArgType: type_map.AddType(scope, &HashFunctionArgs{}),
-		Version: 2,
+		Name:     "hash",
+		Doc:      "Calculate the hash of a file.",
+		ArgType:  type_map.AddType(scope, &HashFunctionArgs{}),
+		Version:  3,
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

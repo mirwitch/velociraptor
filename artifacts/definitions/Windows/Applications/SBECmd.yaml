@@ -2,7 +2,7 @@ name: Windows.Applications.SBECmd
 description: |
     Execute Eric Zimmerman's SBECmd and return output for analysis.
 
-    SBECmd is a CLI for analyzing shellbags data.
+    SBECmd is a CLI for analyzing Shellbags data.
 
     Objective:
 
@@ -17,7 +17,7 @@ description: |
       browsed by the user.
 
     NOTE: Velociraptor can now parse Shellbags natively with the
-    Windows.Forensics.Shellbags artifact.
+    `Windows.Forensics.Shellbags` artifact.
 
     MITRE ATT&CK ID: TA0009 - Collection
 
@@ -33,6 +33,10 @@ tools:
     url: https://github.com/Velocidex/Tools/raw/main/SBECmd/ShellBagsExplorer/SBECmd.exe
 
 precondition: SELECT OS From info() where OS = 'windows'
+
+implied_permissions:
+  - EXECVE
+  - FILESYSTEM_WRITE
 
 parameters:
   - name: userRegex
@@ -69,7 +73,7 @@ sources:
                     query={
                         SELECT *, Name
                         FROM execve(argv=[
-                            payload.FullPath[0],
+                            payload.OSPath[0],
                             "-d", HomeDirectory,
                             "--csv", tempfolder + "\\" + Name,
                             "--dedupe"])
@@ -89,8 +93,8 @@ sources:
          SELECT * FROM if(
            condition=UploadFiles,
            then={
-             SELECT Name, upload(file=FullPath,
-                                 name=relpath(base=tempfile, path=FullPath)) as FileDetails
+             SELECT Name, upload(file=OSPath,
+                                 name=relpath(base=tempfile, path=OSPath)) as FileDetails
              FROM glob(globs="/**", root=tempfolder)
            })
       },
@@ -99,7 +103,7 @@ sources:
            condition=RemovePayload,
            then={
              SELECT * FROM execve(argv=['powershell','Remove-Item',
-                                             payload.FullPath[0],'-Force' ])
+                                             payload.OSPath[0],'-Force' ])
            })
       })
       WHERE Stdout =~ "SBECmd"

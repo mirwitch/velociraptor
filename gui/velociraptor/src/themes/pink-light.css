@@ -86,6 +86,8 @@
   --color-scrollbar-track: var(--color-canvas-background);
   --color-scrollbar-thumb: var(--color-btn-default-background);
   --color-scrollbar-thumb-hover: var(--color-btn-default-background-hover);
+  --color-scrollbar-main: var(--color-accent-25);
+  --color-scrollbar-background: rgba(var(--color-accent), 0.1);
 
   --color-btn-border: var(--color-sidebar-foreground);
   --color-btn-default-border: var(--color-sidebar-foreground);
@@ -125,6 +127,8 @@
 
   --color-vfs-files-timestomped: #ed5d40;
   --color-level-error: #ed5d40;
+
+  --invalid-form-control-error: #ff6666;
 }
 
 body.pink-light {
@@ -172,21 +176,9 @@ body.pink-light {
   border-color: whitesmoke;
 }
 
-.pink-light .hamburger {
+.pink-light button.hamburger {
+  background-color: #fff0f5;
   color: var(--color-sidebar-foreground);
-}
-
-.pink-light #client-search-bar {
-  background: var(--color-canvas-background);
-  border: 1px solid var(--color-sidebar-foreground);
-  border-top-right-radius: 0;
-  border-bottom-right-radius: 0;
-  color: var(--color-foreground);
-  font-family: var(--font-family-sans-serif);
-  padding-top: 5px;
-  padding-bottom: 5px;
-  margin-left: 5px;
-  height: 26px;
 }
 
 .pink-light .dropdown .dropdown-toggle.btn.btn-default {
@@ -227,7 +219,6 @@ body.pink-light {
 }
 
 .pink-light .react-autosuggest__suggestions-container--open {
-  margin-left: 5px;
   background: var(--color-form-control-background);
   font-family: var(--font-family-sans-serif);
   font-size: var(--font-size-base);
@@ -254,9 +245,18 @@ body.pink-light {
   background: var(--color-sidebar-inactive-background-hover);
 }
 
-.pink-light a.active .navigator.nav-pills.nav li {
-  color: var(--color-sidebar-active-foreground);
+.pink-light .navigator.nav-pills.nav li:has(a.active) {
   background: var(--color-sidebar-active-background);
+}
+
+.pink-light .navigator.nav-pills.nav li a.active {
+  color: var(--color-sidebar-active-foreground);
+}
+
+.pink-light .navigator.nav-pills.nav .nav-link.disabled {
+  color: var(--color-sidebar-disabled-foreground);
+  background: var(--color-sidebar-background);
+  pointer-events: none;
 }
 
 .pink-light .navigator.nav-pills.nav .nav-link.disabled {
@@ -278,7 +278,7 @@ body.pink-light {
   background: var(--color-btn-default-background);
 }
 
-.pink-light .btn-default.active {
+.pink-light .btn.btn-default.active {
   box-shadow: none;
   color: var(--color-sidebar-background);
 }
@@ -320,7 +320,7 @@ body.pink-light {
 
 .pink-light .btn-outline-default {
   border-width: 0;
-  background: var(--color-btn-default-background);
+  background: none;
 }
 
 .pink-light .btn-outline-info,
@@ -358,7 +358,6 @@ body.pink-light {
 
 .pink-light .table thead th {
   border: none;
-  background: var(--color-table-row-selected);
   vertical-align: text-bottom;
 }
 
@@ -376,7 +375,6 @@ body.pink-light {
 }
 
 .pink-light .table tbody tr:nth-of-type(odd) {
-  background: unset;
   border: none;
 }
 
@@ -517,6 +515,11 @@ body.pink-light {
   filter: invert(0);
 }
 
+.pink-light .invalid.form-control,
+.pink-light .invalid.form-control:focus {
+  background: var(--invalid-form-control-error);
+}
+
 /* Tabs */
 .pink-light .tab-content {
   color: var(--color-foreground);
@@ -593,12 +596,6 @@ body.pink-light {
   font-weight: 400;
 }
 
-.pink-light input[type='checkbox'] {
-  transform: scale(1.2);
-  accent-color: var(--accent-color);
-  box-shadow: none;
-}
-
 /* Pagination */
 
 .pink-light .page-item .page-link {
@@ -633,6 +630,7 @@ body.pink-light {
 
 .pink-light .react-bootstrap-table-pagination-total {
   color: var(--color-foreground);
+  padding-left: 15px;
 }
 
 /* Artifact viewer screen */
@@ -730,8 +728,10 @@ body.pink-light {
 }
 
 /* react timelines */
-.pink-light .react-calendar-timeline .rct-sidebar {
+.pink-light .react-calendar-timeline .rct-sidebar,
+.pink-light .react-calendar-timeline .rct-dateHeader {
   color: var(--color-foreground);
+  font-size: var(--font-size-small);
 }
 
 /* file tree */
@@ -742,18 +742,22 @@ body.pink-light {
 
 /* Dropdown menus */
 .pink-light .dropdown-menu {
-  background: var(--color-canvas-background);
+  background: var(--color-sidebar-inactive-background-hover);
 }
 
 .pink-light .dropdown-item,
+.pink-light .dropdown-divider,
 .pink-light .dropdown-item:focus {
   font-family: var(--font-family-sans-serif);
   font-size: var(--font-size-base);
-  background: var(--color-canvas-background);
+  color: var(--color-foreground);
+  background: var(--color-sidebar-inactive-background-hover);
 }
 
+.pink-light .dropdown-item:hover,
 .pink-light .dropdown-item.active:hover {
   background: var(--color-accent-75);
+  color: var(--color-canvas-background);
 }
 
 .pink-light .dropdown-item.active,
@@ -762,74 +766,12 @@ body.pink-light {
   color: var(--color-foreground);
 }
 
-
-/* Datepicker */
-
-.pink-light .react-datetime-picker__wrapper {
-  border: 1px solid var(--color-btn-border);
-  border-radius: 0.25rem;
-  color: var(--color-foreground);
-}
-
-.pink-light .react-datepicker,
-.pink-light .react-datetime-picker__calendar .react-calendar,
-.pink-light .react-datetime-picker {
-  font-family: var(--font-family-sans-serif);
-  background: var(--color-form-control-background);
-  color: var(--color-foreground);
-  z-index: 10;
-}
-
-.pink-light .react-datetime-picker__button:enabled:hover .react-datetime-picker__button__icon,
-.pink-light .react-datetime-picker__button:enabled:focus .react-datetime-picker__button__icon,
-.pink-light .react-datetime-picker__button:hover {
-  stroke: var(--color-accent-100) !important;
-  filter: none;
-}
-
-.pink-light .react-calendar button:enabled:hover {
-  background-color: var(--color-accent-25);
-  border: none;
-}
-
-.pink-light .react-calendar__navigation button:disabled,
-.pink-light .react-calendar__navigation button:enabled:focus {
-  background-color: unset;
-}
-
-.pink-light .react-calendar__tile:enabled:hover {
-  background-color: var(--color-accent-25);
-  border: none;
-}
-
-.pink-light .react-calendar .react-calendar__tile--now {
-  background-color: var(--color-accent-50);
-  color: var(--color-foreground);
-}
-
-.pink-light .react-calendar .react-calendar__tile--active,
-.pink-light .react-calendar .react-calendar__tile--active:hover {
-  background-color: var(--color-accent-75);
-  font-weight: 700;
-  color: var(--color-foreground-inverse);
-}
-
-.pink-light .react-calendar__month-view__days__day--neighboringMonth {
-  color: var(--color-btn-border);
-}
-
 /* Footer */
-
 .pink-light .app-footer.fixed-bottom {
   background: var(--color-footer-background);
   color: var(--color-sidebar-inactive-foreground-hover);
   font-family: var(--font-family-sans-serif);
   border-top: none;
-}
-
-/* Spinner */
-.pink-light .overlay .fa-spinner {
-  filter: invert(0);
 }
 
 /* Shell output */
@@ -862,11 +804,30 @@ body.pink-light {
 }
 
 .pink-light .labels,
-.pink-light .velo__control,
 .pink-light .velo__menu {
   background: var(--color-canvas-background);
   border-color: var(--color-btn-default-border);
+  box-shadow: none;
   color: var(--color-foreground);
+}
+
+.pink-light .velo__control {
+  background: var(--color-canvas-background);
+  border-color: var(--color-btn-default-border);
+  color: var(--color-foreground);
+}
+
+.pink-light .velo__control--is-focused,
+.pink-light .velo__control--menu-is-open {
+  background: var(--color-canvas-background);
+  border-color: var(--color-btn-default-border);
+  box-shadow: none;
+  color: var(--color-foreground);
+}
+
+.pink-light .velo__control:hover {
+  border-color: var(--color-btn-default-border);
+  box-shadow: none;
 }
 
 .pink-light .velo__multi-value {
@@ -877,11 +838,6 @@ body.pink-light {
   color: var(--color-foreground);
 }
 
-.pink-light .velo__option:hover,
-.pink-light .velo__option--is-focused {
-  background: var(--color-btn-default-background-hover);
-}
-
 .pink-light ::placeholder {
   color: var(--color-sidebar-foreground) !important;
 }
@@ -890,13 +846,22 @@ body.pink-light {
   color: var(--color-sidebar-foreground);
 }
 
+.pink-light .ace_placeholder {
+  font-family: var(--font-family-sans-serif);
+  font-size: var(--font-size-base);
+  letter-spacing: 0.4px;
+  color: var(--color-sidebar-foreground) !important;
+}
+
 .pink-light .velo__multi-value {
   border: 1px solid var(--color-btn-border);
-  background-color: var(--color-canvas-background);
+  background-color: var(--color-accent-100);
 }
 
 .pink-light .velo__multi-value__label {
+  font-size: var(--font-size-small);
   color: var(--color-foreground);
+  background-color: var(--color-accent-75);
   border: none;
 }
 
@@ -907,8 +872,8 @@ body.pink-light {
 }
 
 .pink-light .velo__multi-value__remove:hover {
-  color: var(--color-foreground-inverse);
-  background-color: var(--color-btn-default-border);
+  color: var(--color-foreground);
+  background-color: var(--color-canvas-background);
   font-weight: 700;
 }
 
@@ -924,9 +889,22 @@ body.pink-light {
   color: var(--color-no-content);
 }
 
-.pink-light .tooltip.show {
+.pink-light .tooltip.show,
+.pink-light .tooltip.bs-tooltip-top {
   font-family: var(--font-family-sans-serif);
   font-size: var(--font-size-base);
+  background-color: #10181C;
+  color: var(--color-foreground);
+}
+
+.pink-light .tooltip-inner {
+  font-family: var(--font-family-sans-serif);
+  font-size: var(--font-size-base);
+  background-color: var(--color-tooltip-background);
+}
+
+.pink-light .bs-tooltip-top .tooltip-arrow::before {
+  border-top-color: var(--color-tooltip-background);
 }
 
 .pink-light button.log-level {
@@ -935,4 +913,53 @@ body.pink-light {
 
 .pink-light .flow-file-download-button {
     background: var(--color-accent-25);
+}
+
+.pink-light .json-expand-button {
+  color: #f57c00;
+}
+
+.pink-light .json-index {
+  color: darkgrey;
+}
+
+.pink-light .json-key {
+  color: #f06292;
+}
+
+.pink-light .json-string {
+  padding-left: 5px;
+  color: #388e3c;
+}
+
+.pink-light .json-number {
+  padding-left: 5px;
+  color: #1976d2;
+}
+
+.pink-light .json-null {
+padding-left: 5px;
+color: #8d6e63;
+}
+
+.pink-light .json-boolean {
+padding-left: 5px;
+color: #7e57c2;
+}
+
+.pink-light .new-artifact-search-table tr th,
+.pink-light .new-artifact-search-table tr td {
+    background-color: var(--color-tab);
+}
+
+/* Calendar */
+.pink-light .calendar-selector:hover {
+    background: var(--color-sidebar-inactive-background-hover);
+}
+
+.pink-light div.calendar-day:hover,
+.pink-light div.calendar-other-day:hover,
+.pink-light div.calendar-selected-date {
+    background: var(--color-accent-75);
+    color: var(--color-canvas-background);
 }

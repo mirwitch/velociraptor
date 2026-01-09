@@ -7,6 +7,8 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"github.com/glaslos/tlsh"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -22,6 +24,8 @@ type TLSHashFunction struct{}
 func (self *TLSHashFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+	defer vql_subsystem.RegisterMonitor(ctx, "tlsh_hash", args)()
+
 	arg := &HashFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -31,12 +35,6 @@ func (self *TLSHashFunction) Call(ctx context.Context,
 
 	cached_buffer := pool.Get().(*[]byte)
 	defer pool.Put(cached_buffer)
-
-	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-	if err != nil {
-		scope.Log("tlsh_hash: %s", err)
-		return vfilter.Null{}
-	}
 
 	fs, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
@@ -60,9 +58,10 @@ func (self *TLSHashFunction) Call(ctx context.Context,
 
 func (self TLSHashFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "tlsh_hash",
-		Doc:     "Calculate the tlsh hash of a file.",
-		ArgType: type_map.AddType(scope, &TLSHashFunctionArgs{}),
+		Name:     "tlsh_hash",
+		Doc:      "Calculate the tlsh hash of a file.",
+		ArgType:  type_map.AddType(scope, &TLSHashFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

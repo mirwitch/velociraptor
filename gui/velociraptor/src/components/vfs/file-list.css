@@ -18,7 +18,7 @@
 }
 
 .fill-parent.toolbar-margin {
-    top: 50px !important;
+    top: 50px;
 }
 
 
@@ -30,11 +30,11 @@
     margin-bottom: 5px;
 }
 
-.table tbody tr.row_selected td,
-.table tbody tr.row-selected {
+table.table tbody tr.row_selected td,
+table.table tbody tr.row-selected {
     background-color: var(--color-table-row-selected);
     color: var(--color-table-row-selected-text);
-  }
+}
 
 .table tbody tr.highlighted td {
     background-color: var(--color-table-row-highlighted);
@@ -54,7 +54,9 @@
 }
 
 .file-hints {
-    position: absolute;
+    min-height: 24px;
+    min-width: 32px;
+    cursor: context-menu;
 }
 
 .file-hints .hint-icon {
@@ -72,4 +74,8 @@ td.download-column {
 
 .vfs-toolbar {
     padding-right: 10px;
+}
+
+.min-width {
+    min-width: 10em;
 }

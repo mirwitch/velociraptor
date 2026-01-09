@@ -30,16 +30,12 @@ func ConvertJSONL(
 	var extra_value [][]byte
 
 	if extra_data != nil {
-		for _, k := range extra_data.Keys() {
-			value, pres := extra_data.Get(k)
-			if !pres {
-				continue
-			}
-			v, err := json.Marshal(value)
+		for _, i := range extra_data.Items() {
+			v, err := json.Marshal(i.Value)
 			if err != nil {
 				continue
 			}
-			extra_keys = append(extra_keys, k)
+			extra_keys = append(extra_keys, i.Key)
 			extra_value = append(extra_value, v)
 		}
 	}
@@ -47,12 +43,20 @@ func ConvertJSONL(
 	arena := &fastjson.Arena{}
 
 	for serialized := range json_in {
+		if len(serialized) == 0 {
+			continue
+		}
+
+		// Line feed if needed.
+		if serialized[len(serialized)-1] != '\n' {
+			serialized = append(serialized, '\n')
+		}
+
 		// In the special case where we do not need to modify the json
 		// or convert it to csv then we can skip parsing it
-		// alltogether.
+		// altogether.
 		if extra_data == nil && jsonl_out != nil && csv_out == nil {
-			jsonl_out.Write(serialized)
-			jsonl_out.Write([]byte{'\n'})
+			_, _ = jsonl_out.Write(serialized)
 			continue
 		}
 
@@ -70,16 +74,15 @@ func ConvertJSONL(
 			// If we dont need to add any columns we just copy the
 			// original JSONL without needing to encode it.
 			if extra_data == nil {
-				jsonl_out.Write(serialized)
-				jsonl_out.Write([]byte{'\n'})
+				_, _ = jsonl_out.Write(serialized)
 			} else {
-				jsonl_out.Write(
+				_, _ = jsonl_out.Write(
 					writeJsonObject(arena, obj, extra_keys, extra_value))
 			}
 		}
 
 		if csv_out != nil {
-			csv_out.Write(csv_encoder.Encode(obj))
+			_, _ = csv_out.Write(csv_encoder.Encode(obj))
 		}
 	}
 }
@@ -103,13 +106,10 @@ func NewCSVEncoder(extra_data *ordereddict.Dict) *CSVEncoder {
 	self.writer = csv.NewWriter(&self.buf)
 
 	if extra_data != nil {
-		for _, k := range extra_data.Keys() {
-			v, pres := extra_data.Get(k)
-			if pres {
-				self.extra_keys = append(self.extra_keys, k)
-				self.extra_values = append(self.extra_values,
-					AnyToString(v, DefaultEncOpts()))
-			}
+		for _, i := range extra_data.Items() {
+			self.extra_keys = append(self.extra_keys, i.Key)
+			self.extra_values = append(self.extra_values,
+				AnyToString(i.Value, DefaultEncOpts()))
 		}
 	}
 
@@ -132,7 +132,7 @@ func (self *CSVEncoder) Encode(obj *fastjson.Object) []byte {
 		}
 
 		// Encode the headers
-		self.writer.Write(self.columns)
+		_ = self.writer.Write(self.columns)
 	}
 
 	if len(self.columns) == 0 {
@@ -151,7 +151,28 @@ func (self *CSVEncoder) Encode(obj *fastjson.Object) []byte {
 			return
 		}
 
-		self.row[idx] = string(v.MarshalTo(nil))
+		// Encode the value into Velociraptor's CSV as described in
+		// file_store/csv/doc.go
+		switch v.Type() {
+
+		// Write strings directly without escaping - csv will escape
+		// if needed.
+		case fastjson.TypeString:
+			// It is already a string
+			b, err := v.StringBytes()
+			if err == nil {
+				self.row[idx] = string(b)
+			}
+
+			// Nulls should be written as a empty strings
+		case fastjson.TypeNull:
+			self.row[idx] = ""
+
+			// Everything else will be JSON encoded.
+		default:
+			self.row[idx] = string(v.MarshalTo(nil))
+		}
+
 	})
 
 	for i, k := range self.extra_keys {
@@ -163,7 +184,7 @@ func (self *CSVEncoder) Encode(obj *fastjson.Object) []byte {
 		self.row[idx] = self.extra_values[i]
 	}
 
-	self.writer.Write(self.row)
+	_ = self.writer.Write(self.row)
 	self.writer.Flush()
 
 	result := self.buf.Bytes()

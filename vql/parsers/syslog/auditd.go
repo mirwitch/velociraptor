@@ -1,3 +1,6 @@
+//go:build linux || freebsd
+// +build linux freebsd
+
 // Parse auditd log files.
 
 // Auditd writes multiple lines for the same event. We therefore need
@@ -10,9 +13,9 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/elastic/go-libaudit"
-	"github.com/elastic/go-libaudit/aucoalesce"
-	"github.com/elastic/go-libaudit/auparse"
+	"github.com/elastic/go-libaudit/v2"
+	"github.com/elastic/go-libaudit/v2/aucoalesce"
+	"github.com/elastic/go-libaudit/v2/auparse"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -34,6 +37,7 @@ func (self AuditdPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "parse_auditd", args)()
 
 		reassembler, err := libaudit.NewReassembler(5, 2*time.Second,
 			&streamHandler{scope: scope, ctx: ctx, output_chan: output_chan})
@@ -88,7 +92,7 @@ func (self *streamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 }
 
 func (self *streamHandler) EventsLost(count int) {
-	self.scope.Log("Detected the loss of %v sequences.", count)
+	// self.scope.Log("Detected the loss of %v sequences.", count)
 }
 
 func (self *streamHandler) outputMultipleMessages(
@@ -122,6 +126,7 @@ func (self WatchAuditdPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "watch_auditd", args)()
 
 		reassembler, err := libaudit.NewReassembler(5, 2*time.Second,
 			&streamHandler{scope: scope, ctx: ctx, output_chan: output_chan})
@@ -148,7 +153,7 @@ func (self WatchAuditdPlugin) Call(
 			}
 		}()
 
-		scanner := _WatchSyslogPlugin{}
+		scanner := WatchSyslogPlugin{}
 		for row := range scanner.Call(ctx, scope, args) {
 			line, pres := scope.Associative(row, "Line")
 			if !pres {

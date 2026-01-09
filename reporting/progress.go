@@ -2,64 +2,91 @@ package reporting
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
+	"www.velocidex.com/golang/velociraptor/services"
 )
 
 type progressReporter struct {
-	ctx            context.Context
+	// Upstream context allows us to watch for cancellation of the
+	// container writer.
+	ctx context.Context
+
+	// Signal stop for periodic stats updates.
+	mu             sync.Mutex
+	error          string
 	config_obj     *config_proto.Config
-	path           api.DSPathSpec
-	cancel         func()
 	zip_writer     *Container
 	container_path api.FSPathSpec
+	opts           services.ContainerOptions
 
 	Type string
 }
 
 func (self *progressReporter) writeStats() {
-	db, err := datastore.GetDB(self.config_obj)
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	export_manager, err := services.GetExportManager(self.config_obj)
 	if err != nil {
 		return
 	}
+
 	stats := self.zip_writer.Stats()
 	stats.Type = self.Type
 	stats.Components = path_specs.AsGenericComponentList(self.container_path)
-	_ = db.SetSubject(self.config_obj, self.path, stats)
+	stats.Error = self.error
+
+	_ = export_manager.SetContainerStats(self.ctx, self.config_obj, stats, self.opts)
 }
 
+// If we call Close() before the timeout then the collection worked
+// fine - even when the context is cancelled.
 func (self *progressReporter) Close() {
-	self.cancel()
+	// Write the stats one final time.
+	self.writeStats()
+
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	if self.error == "" {
+		self.error = "Complete"
+	}
 }
 
 func NewProgressReporter(
+	ctx context.Context,
 	config_obj *config_proto.Config,
-	path api.DSPathSpec,
 	container_path api.FSPathSpec,
+	opts services.ContainerOptions,
 	zip_writer *Container) *progressReporter {
-
-	// Export happens asynchrounously outside the context of the
-	// calling API.
-	ctx, cancel := context.WithCancel(context.Background())
 
 	self := &progressReporter{
 		ctx:            ctx,
 		config_obj:     config_obj,
-		path:           path,
-		cancel:         cancel,
 		zip_writer:     zip_writer,
 		container_path: container_path,
+		opts:           opts,
 		Type:           "zip",
 	}
 
 	go func() {
 		for {
 			select {
-			case <-self.ctx.Done():
+			case <-ctx.Done():
+
+				// Update the error stats if the context has timed
+				// out.
+				self.mu.Lock()
+				if self.error == "" {
+					self.error = "Timeout"
+				}
+				self.mu.Unlock()
+
 				self.writeStats()
 				return
 

@@ -2,31 +2,29 @@ import './user-label.css';
 import _ from 'lodash';
 import moment from 'moment';
 import 'moment-timezone';
+import qs from "qs";
 
 import React from 'react';
 import PropTypes from 'prop-types';
 import ButtonGroup from 'react-bootstrap/ButtonGroup';
 import Button from 'react-bootstrap/Button';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-
 import { withRouter }  from "react-router-dom";
 
 import Accordion from 'react-bootstrap/Accordion';
-import Card  from 'react-bootstrap/Card';
 import UserConfig from '../core/user.jsx';
 import Modal from 'react-bootstrap/Modal';
 import Form from 'react-bootstrap/Form';
 import Col from 'react-bootstrap/Col';
 import Row from 'react-bootstrap/Row';
 import api from '../core/api-service.jsx';
-import axios from 'axios';
-import VeloForm from '../forms/form.jsx';
+import {CancelToken} from 'axios';
 import T from '../i8n/i8n.jsx';
-import OverlayTrigger from 'react-bootstrap/OverlayTrigger';
-import Tooltip from 'react-bootstrap/Tooltip';
 import InputGroup from 'react-bootstrap/InputGroup';
 import Select from 'react-select';
+import ToolTip from '../widgets/tooltip.jsx';
 
+import { JSONparse } from '../utils/json_parse.jsx';
 
 class _PasswordChange extends React.Component {
     static propTypes = {
@@ -35,7 +33,7 @@ class _PasswordChange extends React.Component {
     }
 
     componentDidMount() {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
     }
 
     componentWillUnmount() {
@@ -90,6 +88,9 @@ class _PasswordChangeForm extends React.PureComponent {
     static propTypes = {
         username: PropTypes.string,
         onClose: PropTypes.func.isRequired,
+
+        // React router props.
+        history: PropTypes.object,
     }
 
     render() {
@@ -100,14 +101,11 @@ class _PasswordChangeForm extends React.PureComponent {
               </Form.Label>
               <Col sm="8">
                 <Accordion>
-                  <Card>
-                    <Accordion.Toggle as={Card.Header} eventKey="0">
+                  <Accordion.Item eventKey="0">
+                    <Accordion.Header>
                       {T("Update Password")}
-                      <span className="float-right">
-                        <FontAwesomeIcon icon="chevron-down"/>
-                      </span>
-                    </Accordion.Toggle>
-                    <Accordion.Collapse eventKey="0">
+                    </Accordion.Header>
+                    <Accordion.Body>
                       <PasswordChange
                         username={this.props.username}
                         onClose={()=>{
@@ -116,8 +114,8 @@ class _PasswordChangeForm extends React.PureComponent {
                             this.props.history.push("/welcome");
                             this.props.onClose();
                         }}/>
-                    </Accordion.Collapse>
-                  </Card>
+                    </Accordion.Body>
+                  </Accordion.Item>
                 </Accordion>
               </Col>
             </Form.Group>
@@ -127,11 +125,13 @@ class _PasswordChangeForm extends React.PureComponent {
 
 export const PasswordChangeForm = withRouter(_PasswordChangeForm);
 
-class UserSettings extends React.PureComponent {
+class UserSettingsDialog extends React.PureComponent {
     static contextType = UserConfig;
     static propTypes = {
         onClose: PropTypes.func.isRequired,
         setSetting: PropTypes.func.isRequired,
+        setClient: PropTypes.func.isRequired,
+        history: PropTypes.object,
     }
 
     componentDidMount = () => {
@@ -140,7 +140,7 @@ class UserSettings extends React.PureComponent {
                 theme: this.context.traits.theme || "veloci-light",
                 timezone: this.context.traits.timezone || "UTC",
                 lang: this.context.traits.lang || "en",
-                org: this.context.traits.org || "root",
+                org: window.globals.OrgId,
                 default_password: this.context.traits.default_password || "",
             });
         }
@@ -152,30 +152,72 @@ class UserSettings extends React.PureComponent {
         default_password: "",
         org: "",
         org_changed: false,
+        edited: false
     }
 
-    saveSettings = ()=> {
-        this.props.setSetting({
-            theme: this.state.theme,
-            timezone: this.state.timezone,
-            lang: this.state.lang,
-            org: this.state.org,
-            default_password: this.state.default_password,
-        });
+    saveSettings = (settings)=> {
+        // Only update the settings that changed.
+        let state = Object.assign({}, this.state);
+        if(settings) {
+            state = Object.assign(state, settings);
+        }
+
+        let params = {};
+        if (state.previous_org) {
+            params.previous_org = state.previous_org;
+        }
+
+        if (state.theme !== this.context.traits.theme) {
+            params.theme = state.theme;
+        }
+
+        if (state.timezone !== this.context.traits.timezone) {
+            params.timezone = state.timezone;
+        }
+
+        if (state.lang !== this.context.traits.lang) {
+            params.lang = state.lang;
+        }
+
+        if (state.org_changed) {
+            params.org = state.org;
+        }
+
+        if (state.default_password !== (this.context.traits.default_password || "")) {
+            params.default_password = state.default_password || "-";
+        }
+
+        // Update the base path if needed.
+        if (this.context.traits.base_path != "" &&
+            this.context.traits.base_path !== window.base_path) {
+            window.base_path = this.context.traits.base_path;
+        }
+
+        this.props.setSetting(params);
     }
 
     changeOrg = org=>{
-        // Force navigation to the
-        // welcome screen to make sure
-        // the GUI is reset
-        this.props.history.push("/welcome");
-        this.props.setSetting({
-            theme: this.state.theme,
-            timezone: this.state.timezone,
-            lang: this.state.lang,
-            org: org,
-            default_password: this.state.default_password,
-        });
+        // Set the URL to the required org_id
+        let search = window.location.search.replace('?', '');
+        let params = qs.parse(search);
+        params.org_id = org;
+
+        // Revert to this org on error.
+        let previous_org = window.globals.OrgId;
+
+        window.globals.OrgId = org;
+
+        // Force navigation to the welcome screen to make sure the GUI
+        // is reset.
+        window.history.pushState({}, "", api.href("/app/index.html", params));
+        this.props.history.replace("/welcome");
+
+        // Set the new settings for the next reload. This will be the
+        // default org id next time the user loads up the main page.
+        this.saveSettings({org: org,
+                           org_changed: true,
+                           previous_org: previous_org});
+        this.props.setClient({client_id: null});
         this.props.onClose();
     }
 
@@ -191,24 +233,25 @@ class UserSettings extends React.PureComponent {
                 { this.context.traits.orgs &&
                   <Form.Group as={Row}>
                     <Form.Label column sm="3">
-                      <OverlayTrigger
-                        delay={{show: 250, hide: 400}}
-                        overlay={(props)=><Tooltip {...props}>
-                                  {T("Switch to a different org")}
-                                </Tooltip>}>
+                      <ToolTip tooltip={T("Switch to a different org")}>
                         <div>{T("Organization")}</div>
-                      </OverlayTrigger>
+                      </ToolTip>
                     </Form.Label>
                     <Col sm="8">
-                      <Form.Control as="select"
-                                    value={this.state.org}
-                                    placeholder={T("Select an org")}
-                                    onChange={e=>this.changeOrg(e.currentTarget.value)}
-                  >
-                        {_.map(this.context.traits.orgs || [], function(x) {
-                            return <option key={x.id} value={x.id}>{x.name}</option>;
-                        })}
-                      </Form.Control>
+                      <Select
+                        value={this.state.org}
+                        placeholder={T("Select an org")}
+                        classNamePrefix="velo"
+                        onChange={e=>this.changeOrg(e.value)}
+                        spellCheck="false"
+                        options={_.map(_.sortBy(
+                            this.context.traits.orgs, x=>x.name) || [],
+                                       k=>{
+                                           return {value: k.id,
+                                                   label: k.name,
+                                                   isFixed: true};
+                                       })}
+                      />
                     </Col>
                   </Form.Group>
                 }
@@ -235,32 +278,69 @@ class UserSettings extends React.PureComponent {
                                   }}>
                       <option value="veloci-light">{T("Velociraptor (light)")}</option>
                       <option value="veloci-dark">{T("Velociraptor (dark)")}</option>
+                      <option value="vscode-dark">{T("VS Code (dark)")}</option>
                       <option value="no-theme">{T("Velociraptor Classic (light)")}</option>
                       <option value="pink-light">{T("Strawberry Milkshake (light)")}</option>
-                      <option value="ncurses">{T("Ncurses (light)")}</option>
+                      <option value="ncurses-light">{T("Ncurses (light)")}</option>
+                      <option value="ncurses-dark">{T("Ncurses (dark)")}</option>
+                      {/* <option value="github-light">{T("Github (light)")}</option> */}
                       <option value="github-dimmed-dark">{T("Github dimmed (dark)")}</option>
                       <option value="coolgray-dark">{T("Cool Gray (dark)")}</option>
                       <option value="midnight">{T("Midnight Inferno (very dark)")}</option>
+                      <option value="veloci-docs">{T("Standard Docs")}</option>
                     </Form.Control>
                   </Col>
                 </Form.Group>
-                <VeloForm
-                  param={{name: "Downloads Password",
-                          friendly_name: T("Downloads Password"),
-                          description: T("Default password to use for downloads"),
-                          type: "string"}}
-                  value={this.state.default_password}
-                  setValue={value=>this.setState({default_password: value})}
-                />
+
                 <Form.Group as={Row}>
                   <Form.Label column sm="3">
-                    <OverlayTrigger
-                      delay={{show: 250, hide: 400}}
-                      overlay={(props)=><Tooltip {...props}>
-                                          {T("Select a language")}
-                                        </Tooltip>}>
+                    <ToolTip tooltip={T("Default password to use for downloads")}>
+                      <div>{T("Downloads Password")}</div>
+                    </ToolTip>
+                  </Form.Label>
+                  <Col sm="8">
+                    <InputGroup className="mb-3">
+                      <Form.Control
+                        type="text"
+                        value={this.state.default_password}
+                        placeholder={T("Default password to use for downloads")}
+                        onChange={e => {this.setState({"edited": true});
+                                          this.setState({
+                                              default_password: e.currentTarget.value
+                                          });
+                                         }}/>
+                      <Button as="button" variant="default"
+                              disabled = {!this.state.edited}
+                              onClick={e => {
+                                  this.props.setSetting({
+                                      default_password: this.state.default_password
+                                  });
+                                  this.setState({
+                                      edited: false,
+                                  });
+                              }}>
+                        <FontAwesomeIcon icon="save" />
+                      </Button>
+                      <Button variant="default"
+                              disabled={!this.state.default_password}
+                              onClick={()=>{
+                                  this.props.setSetting({
+                                      default_password: "",
+                                  });
+                                  this.setState({
+                                      default_password: "",
+                                      edited: false});
+                              }}>
+                        <FontAwesomeIcon icon="broom"/>
+                      </Button>
+                    </InputGroup></Col>
+                </Form.Group>
+
+                <Form.Group as={Row}>
+                  <Form.Label column sm="3">
+                    <ToolTip tooltip={T("Select a language")}>
                       <div>{T("Language")}</div>
-                    </OverlayTrigger>
+                    </ToolTip>
                   </Form.Label>
                   <Col sm="8">
                     <Form.Control as="select"
@@ -272,7 +352,7 @@ class UserSettings extends React.PureComponent {
                                       // Change the language instantly
                                       // (We might still need to wait
                                       // for a react render event).
-                                      this.props.setSetting({
+                                      this.saveSettings({
                                           lang: e.currentTarget.value,
                                       });
                                   }}>
@@ -282,25 +362,20 @@ class UserSettings extends React.PureComponent {
                       <option value="por">{T("Portuguese")}</option>
                       <option value="fr">{T("French")}</option>
                       <option value="jp">{T("Japanese")}</option>
+                      <option value="vi">{T("Vietnamese")}</option>
                     </Form.Control>
                   </Col>
                 </Form.Group>
 
                 <Form.Group as={Row}>
                   <Form.Label column sm="3">
-                    <OverlayTrigger
-                      delay={{show: 250, hide: 400}}
-                      overlay={(props)=><Tooltip {...props}>
-                                          {T("Select a timezone")}
-                                        </Tooltip>}>
+                    <ToolTip tooltip={T("Select a timezone")}>
                       <div>{T("Display timezone")}</div>
-                    </OverlayTrigger>
+                    </ToolTip>
                   </Form.Label>
                   <Col sm="8">
                     <InputGroup className="mb-3">
-                      <InputGroup.Prepend>
-                        <InputGroup.Text
-                          as="button"
+                        <Button
                           className="btn btn-default"
                           onClick={()=>{
                               this.setState({timezone: "UTC"});
@@ -309,8 +384,7 @@ class UserSettings extends React.PureComponent {
                               });
                           }}>
                           UTC
-                        </InputGroup.Text>
-                      </InputGroup.Prepend>
+                        </Button>
                       <Select
                         className="timezone-selector"
                         classNamePrefix="velo"
@@ -348,12 +422,12 @@ class UserSettings extends React.PureComponent {
     };
 }
 
-const UserSettingsWithRouter = withRouter(UserSettings);
+const UserSettingsDialogWithRouter = withRouter(UserSettingsDialog);
 
 export default class UserLabel extends React.Component {
     static contextType = UserConfig;
     static propTypes = {
-
+        setClient: PropTypes.func.isRequired,
     };
 
     state = {
@@ -361,53 +435,90 @@ export default class UserLabel extends React.Component {
     }
 
     componentDidMount() {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
     }
 
     componentWillUnmount() {
         this.source.cancel("unmounted");
     }
 
-    setSettings = (options) => {
-        // Set the ACE theme according to the theme so they match.
-        let ace_options = JSON.parse(this.context.traits.ui_settings || "{}");
-        if (options.theme === "no-theme") {
-            ace_options.theme = "ace/theme/xcode";
-            ace_options.fontFamily = "monospace";
-        } else if (options.theme === "veloci-dark") {
-            ace_options.theme = "ace/theme/vibrant_ink";
-            ace_options.fontFamily = "Iosevka Term";
-        } else if(options.theme === "veloci-light") {
-            ace_options.theme = "ace/theme/xcode";
-            ace_options.fontFamily = "Iosevka Term";
-        } else if(options.theme === "pink-light") {
-            ace_options.theme = "ace/theme/xcode";
-            ace_options.fontFamily = "Iosevka Term";
-        } else if(options.theme === "ncurses") {
-            ace_options.theme = "ace/theme/sqlserver";
-            ace_options.fontFamily = "fixedsys";
-        } else if(options.theme === "github-dimmed-dark") {
-          ace_options.theme = "ace/theme/dracula";
-          ace_options.fontFamily = "Iosevka Term";
-        } else if(options.theme === "github-dimmed-light") {
-          ace_options.theme = "ace/theme/sqlserver";
-          ace_options.fontFamily = "Iosevka Term";
-        } else if(options.theme === "coolgray-dark") {
-          ace_options.theme = "ace/theme/nord_dark";
-          ace_options.fontFamily = "Iosevka Term";
-        } else if(options.theme === "midnight") {
-          ace_options.theme = "ace/theme/vibrant_ink";
-          ace_options.fontFamily = "Iosevka Term";
-        }
-        options.options = JSON.stringify(ace_options);
+    setSettings = (params) => {
+        if (params.theme) {
+            // Set the ACE theme according to the theme so they match.
+            let ace_options = JSONparse(this.context.traits.ui_settings, {});
+            if (params.theme === "no-theme") {
+                ace_options.theme = "ace/theme/xcode";
+                ace_options.fontFamily = "Iosevka Term";
+            } else if (params.theme === "veloci-dark") {
+                ace_options.theme = "ace/theme/vibrant_ink";
+                ace_options.fontFamily = "Iosevka Term";
+            } else if(params.theme === "veloci-light" || params.theme === "veloci-docs") {
+                ace_options.theme = "ace/theme/xcode";
+                ace_options.fontFamily = "Iosevka Term";
+            } else if(params.theme === "pink-light") {
+                ace_options.theme = "ace/theme/xcode";
+                ace_options.fontFamily = "Iosevka Term";
+            } else if(params.theme === "ncurses") {
+                ace_options.theme = "ace/theme/sqlserver";
+                ace_options.fontFamily = "fixedsys";
+            } else if(params.theme === "ncurses-dark") {
+                ace_options.theme = "ace/theme/tomorrow_night_eighties";
+                ace_options.fontFamily = "fixedsys";
+            } else if(params.theme === "github-default-light") {
+                ace_options.theme = "ace/theme/dracula";
+                ace_options.fontFamily = "Iosevka Term";
+            } else if(params.theme === "github-dimmed-dark") {
+                ace_options.theme = "ace/theme/dracula";
+                ace_options.fontFamily = "Iosevka Term";
+            } else if(params.theme === "coolgray-dark") {
+                ace_options.theme = "ace/theme/nord_dark";
+                ace_options.fontFamily = "Iosevka Term";
+            } else if(params.theme === "midnight") {
+                ace_options.theme = "ace/theme/terminal";
+                ace_options.fontFamily = "Iosevka Term";
+            } else if(params.theme === "vscode-dark") {
+                ace_options.theme = "ace/theme/tomorrow_night";
+                ace_options.fontFamily = "Iosevka Term";
+            }
 
-        api.post("v1/SetGUIOptions", options, this.source.token).then((response) => {
-            this.context.updateTraits();
-        });
+            params.options = JSON.stringify(ace_options);
+        }
+
+        if(_.isEmpty(params)) {
+            return;
+        }
+
+        api.post("v1/SetGUIOptions", params,
+                 this.source.token).then((response) => {
+                     if (response.status === 200) {
+                         // Check for redirect from the server - this
+                         // is normally set by the authenticator to
+                         // redirect to a better server.
+                         if (response.data && response.data.redirect_url &&
+                             response.data.redirect_url !== "") {
+                             window.location.assign(response.data.redirect_url);
+                         }
+                     }
+
+                     this.context.updateTraits();
+                 }).catch(response=>{
+                     // If we tried to set the org but we dont have
+                     // permission in it, we switch rightr back to the
+                     // previous org.
+                     if (response.response &&
+                         response.response.status === 403 &&
+                         params.org) {
+                         window.globals.OrgId = params.previous_org;
+                         window.history.pushState(
+                             {}, "", api.href("/app/index.html", {}));
+
+                     }
+                 });
     }
 
     orgName() {
-        let id = this.context.traits && this.context.traits.org;
+        let id = window.globals.OrgId || (
+            this.context.traits && this.context.traits.org);
         if (!id || id==="root") {
             return <></>;
         }
@@ -424,9 +535,11 @@ export default class UserLabel extends React.Component {
         return (
             <>
               { this.state.showUserSettings &&
-                <UserSettingsWithRouter
+                <UserSettingsDialogWithRouter
+                  setClient={this.props.setClient}
                   setSetting={this.setSettings}
-                  onClose={()=>this.setState({showUserSettings: false})} /> }
+                  onClose={()=>this.setState({showUserSettings: false})} />
+              }
               <ButtonGroup className="user-label">
                 <Button href={api.href("/app/logoff.html", {
                     username: this.context.traits.username,
@@ -440,10 +553,15 @@ export default class UserLabel extends React.Component {
                   { this.context.traits.picture &&
                     <img className="toolbar-buttons img-thumbnail"
                          alt="avatar"
-                         src={ this.context.traits.picture}
+                         src={this.context.traits.picture}
                     />
                   }
                   { this.orgName() }
+                </Button>
+                <Button variant="default"
+                  onClick={()=>this.setState({showUserSettings: true})}
+                >
+                  <FontAwesomeIcon icon="wrench" />
                 </Button>
               </ButtonGroup>
             </>

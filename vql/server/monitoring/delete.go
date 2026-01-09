@@ -7,6 +7,7 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -32,8 +33,9 @@ func (self DeleteEventsPlugin) Call(
 
 	go func() {
 		defer close(output_chan)
+		defer vql_subsystem.RegisterMonitor(ctx, "delete_events", args)()
 
-		err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+		err := vql_subsystem.CheckAccess(scope, acls.DELETE_RESULTS)
 		if err != nil {
 			scope.Log("delete_events: %v", err)
 			return
@@ -54,6 +56,12 @@ func (self DeleteEventsPlugin) Call(
 			arg.EndTime = time.Now()
 		}
 
+		err = services.RequireFrontend()
+		if err != nil {
+			scope.Log("delete_events: %v", err)
+			return
+		}
+
 		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
 			scope.Log("delete_events: Command can only run on the server")
@@ -66,8 +74,17 @@ func (self DeleteEventsPlugin) Call(
 			return
 		}
 
+		principal := vql_subsystem.GetPrincipal(scope)
+		if principal == "" {
+			scope.Log("delete_events: Username not specified")
+			return
+		}
+
 		responses, err := launcher.DeleteEvents(ctx, config_obj,
-			arg.Artifact, arg.ClientId, arg.StartTime, arg.EndTime, arg.ReallyDoIt)
+			principal, arg.Artifact, arg.ClientId,
+			arg.StartTime, arg.EndTime, services.DeleteFlowOptions{
+				ReallyDoIt: arg.ReallyDoIt,
+			})
 		if err != nil {
 			scope.Log("delete_events: %v", err)
 			return
@@ -87,9 +104,10 @@ func (self DeleteEventsPlugin) Call(
 
 func (self DeleteEventsPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "delete_events",
-		Doc:     "Delete all the files that make up a flow.",
-		ArgType: type_map.AddType(scope, &DeleteEventsPluginArgs{}),
+		Name:     "delete_events",
+		Doc:      "Delete all the files that make up a flow.",
+		ArgType:  type_map.AddType(scope, &DeleteEventsPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.DELETE_RESULTS).Build(),
 	}
 }
 

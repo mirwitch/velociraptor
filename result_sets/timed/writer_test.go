@@ -2,24 +2,23 @@ package timed_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
-	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/result_sets/timed"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/tempfile"
 	"www.velocidex.com/golang/velociraptor/vtesting"
+	"www.velocidex.com/golang/velociraptor/vtesting/goldie"
 )
 
 // We write files in the following ranges:
@@ -62,7 +61,7 @@ type TimedResultSetTestSuite struct {
 func (self *TimedResultSetTestSuite) SetupTest() {
 	self.ConfigObj = self.LoadConfig()
 
-	self.LoadArtifacts([]string{`
+	self.LoadArtifactsIntoConfig([]string{`
 name: Windows.Events.ProcessCreation
 type: CLIENT_EVENT
 `})
@@ -77,36 +76,34 @@ func (self *TimedResultSetTestSuite) TestTimedResultSetWriting() {
 	completion_result := []string{}
 
 	now := time.Unix(1587800000, 0)
-	clock := &utils.MockClock{MockNow: now}
+	clock := utils.NewMockClock(now)
+	closer := utils.MockTime(clock)
+	defer closer()
 
 	// Start off by writing some events on a queue.
 	path_manager, err := artifacts.NewArtifactPathManager(
-		self.ConfigObj,
+		self.Ctx, self.ConfigObj,
 		self.client_id,
 		self.flow_id,
 		"Windows.Events.ProcessCreation")
 	assert.NoError(self.T(), err)
-	path_manager.Clock = clock
 
-	file_store_factory := file_store.GetFileStore(self.ConfigObj)
 	writer, err := timed.NewTimedResultSetWriter(
-		file_store_factory, path_manager, nil, func() {
+		self.ConfigObj, path_manager, nil, func() {
 			mu.Lock()
 			completion_result = append(completion_result, "Done")
 			mu.Unlock()
 		})
 	assert.NoError(self.T(), err)
 
-	writer.(*timed.TimedResultSetWriterImpl).Clock = clock
-
 	// Push an event every hour for 48 hours.
 	for i := int64(0); i < 50; i++ {
 		// Advance the clock by 1 hour.
 		now := 1587800000 + 10000*i
-		clock.MockNow = time.Unix(now, 0).UTC()
+		clock.Set(time.Unix(now, 0).UTC())
 
 		writer.Write(ordereddict.NewDict().
-			Set("Time", clock.MockNow).
+			Set("Time", clock.Now()).
 			Set("Now", now))
 
 		// Force the writer to flush to disk - next write will open
@@ -127,7 +124,7 @@ func (self *TimedResultSetTestSuite) TestTimedResultSetWriting() {
 	result := ordereddict.NewDict()
 
 	rs_reader, err := result_sets.NewTimedResultSetReader(
-		self.Sm.Ctx, file_store_factory, path_manager)
+		self.Sm.Ctx, self.ConfigObj, path_manager)
 	assert.NoError(self.T(), err)
 
 	result.Set("Available Files", rs_reader.GetAvailableFiles(self.Sm.Ctx))
@@ -154,39 +151,37 @@ func (self *TimedResultSetTestSuite) TestTimedResultSetWritingJsonl() {
 	completion_result := []string{}
 
 	now := time.Unix(1587800000, 0)
-	clock := &utils.MockClock{MockNow: now}
+	clock := utils.NewMockClock(now)
+	closer := utils.MockTime(clock)
+	defer closer()
 
 	// Start off by writing some events on a queue.
 	path_manager, err := artifacts.NewArtifactPathManager(
-		self.ConfigObj,
+		self.Ctx, self.ConfigObj,
 		self.client_id,
 		self.flow_id,
 		"Windows.Events.ProcessCreation")
 	assert.NoError(self.T(), err)
-	path_manager.Clock = clock
 
-	file_store_factory := file_store.GetFileStore(self.ConfigObj)
 	writer, err := timed.NewTimedResultSetWriter(
-		file_store_factory, path_manager, nil, func() {
+		self.ConfigObj, path_manager, nil, func() {
 			mu.Lock()
 			completion_result = append(completion_result, "Done")
 			mu.Unlock()
 		})
 	assert.NoError(self.T(), err)
 
-	writer.(*timed.TimedResultSetWriterImpl).Clock = clock
-
 	// Push an event every hour for 48 hours.
 	for i := int64(0); i < 50; i++ {
 		// Advance the clock by 1 hour.
 		now := 1587800000 + 10000*i
-		clock.MockNow = time.Unix(now, 0).UTC()
+		clock.Set(time.Unix(now, 0).UTC())
 
 		// For performance critical sections it is sometimes easier to
 		// build the jsonl by hand.
 		writer.WriteJSONL([]byte(
 			fmt.Sprintf("{\"Time\":%q,\"Now\":%d}\n",
-				clock.MockNow.UTC().Format(time.RFC3339), now)), 1)
+				clock.Now().UTC().Format(time.RFC3339), now)), 1)
 
 		// Force the writer to flush to disk - next write will open
 		// the file and append data to the end.
@@ -206,7 +201,7 @@ func (self *TimedResultSetTestSuite) TestTimedResultSetWritingJsonl() {
 	result := ordereddict.NewDict()
 
 	rs_reader, err := result_sets.NewTimedResultSetReader(
-		self.Sm.Ctx, file_store_factory, path_manager)
+		self.Sm.Ctx, self.ConfigObj, path_manager)
 	assert.NoError(self.T(), err)
 
 	result.Set("Available Files", rs_reader.GetAvailableFiles(self.Sm.Ctx))
@@ -233,36 +228,34 @@ func (self *TimedResultSetTestSuite) TestTimedResultSetWritingNoFlushing() {
 	completion_result := []string{}
 
 	now := time.Unix(1587800000, 0)
-	clock := &utils.MockClock{MockNow: now}
+	clock := utils.NewMockClock(now)
+	closer := utils.MockTime(clock)
+	defer closer()
 
 	// Start off by writing some events on a queue.
 	path_manager, err := artifacts.NewArtifactPathManager(
-		self.ConfigObj,
+		self.Ctx, self.ConfigObj,
 		self.client_id,
 		self.flow_id,
 		"Windows.Events.ProcessCreation")
 	assert.NoError(self.T(), err)
-	path_manager.Clock = clock
 
-	file_store_factory := file_store.GetFileStore(self.ConfigObj)
 	writer, err := timed.NewTimedResultSetWriter(
-		file_store_factory, path_manager, nil, func() {
+		self.ConfigObj, path_manager, nil, func() {
 			mu.Lock()
 			completion_result = append(completion_result, "Done")
 			mu.Unlock()
 		})
 	assert.NoError(self.T(), err)
 
-	writer.(*timed.TimedResultSetWriterImpl).Clock = clock
-
 	// Push an event every hour for 48 hours.
 	for i := int64(0); i < 50; i++ {
 		// Advance the clock by 1 hour.
 		now := 1587800000 + 10000*i
-		clock.MockNow = time.Unix(now, 0).UTC()
+		clock.Set(time.Unix(now, 0).UTC())
 
 		writer.Write(ordereddict.NewDict().
-			Set("Time", clock.MockNow).
+			Set("Time", clock.Now()).
 			Set("Now", now))
 	}
 
@@ -288,7 +281,7 @@ type TimedResultSetTestSuiteFileBased struct {
 
 func (self *TimedResultSetTestSuiteFileBased) SetupTest() {
 	var err error
-	self.dir, err = ioutil.TempDir("", "file_store_test")
+	self.dir, err = tempfile.TempDir("file_store_test")
 	assert.NoError(self.T(), err)
 
 	self.ConfigObj = self.LoadConfig()

@@ -1,9 +1,5 @@
 package api
 
-import (
-	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-)
-
 /*
 
 # How paths are handled in Velociraptor.
@@ -90,6 +86,9 @@ const (
 	PATH_TYPE_FILESTORE_DOWNLOAD_ZIP
 	PATH_TYPE_FILESTORE_DOWNLOAD_REPORT
 
+	// Used to write chunk files
+	PATH_TYPE_FILESTORE_CHUNK_INDEX
+
 	// TMP files
 	PATH_TYPE_FILESTORE_TMP
 	PATH_TYPE_FILESTORE_CSV
@@ -108,6 +107,62 @@ const (
 	PATH_TYPE_FILESTORE_ANY
 )
 
+func (self PathType) String() string {
+	switch self {
+	case PATH_TYPE_DATASTORE_JSON:
+		return "PATH_TYPE_DATASTORE_JSON"
+
+	case PATH_TYPE_DATASTORE_PROTO:
+		return "PATH_TYPE_DATASTORE_PROTO"
+
+	case PATH_TYPE_DATASTORE_DIRECTORY:
+		return "PATH_TYPE_DATASTORE_DIRECTORY"
+
+	case PATH_TYPE_DATASTORE_UNKNOWN:
+		return "PATH_TYPE_DATASTORE_UNKNOWN"
+
+	case PATH_TYPE_FILESTORE_JSON:
+		return "PATH_TYPE_FILESTORE_JSON"
+
+	case PATH_TYPE_FILESTORE_JSON_INDEX:
+		return "PATH_TYPE_FILESTORE_JSON_INDEX"
+
+	case PATH_TYPE_FILESTORE_JSON_TIME_INDEX:
+		return "PATH_TYPE_FILESTORE_JSON_TIME_INDEX"
+
+	case PATH_TYPE_FILESTORE_SPARSE_IDX:
+		return "PATH_TYPE_FILESTORE_SPARSE_IDX"
+
+	case PATH_TYPE_FILESTORE_DOWNLOAD_ZIP:
+		return "PATH_TYPE_FILESTORE_DOWNLOAD_ZIP"
+
+	case PATH_TYPE_FILESTORE_CHUNK_INDEX:
+		return "PATH_TYPE_FILESTORE_CHUNK_INDEX"
+
+	case PATH_TYPE_FILESTORE_DOWNLOAD_REPORT:
+		return "PATH_TYPE_FILESTORE_DOWNLOAD_REPORT"
+
+	case PATH_TYPE_FILESTORE_TMP:
+		return "PATH_TYPE_FILESTORE_TMP"
+	case PATH_TYPE_FILESTORE_CSV:
+		return "PATH_TYPE_FILESTORE_CSV"
+
+	case PATH_TYPE_FILESTORE_YAML:
+		return "PATH_TYPE_FILESTORE_YAML"
+
+	case PATH_TYPE_FILESTORE_DB:
+		return "PATH_TYPE_FILESTORE_DB"
+
+	case PATH_TYPE_FILESTORE_DB_JSON:
+		return "PATH_TYPE_FILESTORE_DB_JSON"
+
+	case PATH_TYPE_FILESTORE_ANY:
+		return "PATH_TYPE_FILESTORE_ANY"
+	default:
+		return "Unknown PATH_TYPE"
+	}
+}
+
 type _PathSpec interface {
 	// A path suitable to be exchanged with the client.
 	AsClientPath() string
@@ -117,12 +172,13 @@ type _PathSpec interface {
 	Type() PathType
 
 	String() string
+
+	// Does any of the components need escaping?
+	IsSafe() bool
 }
 
 type DSPathSpec interface {
 	_PathSpec
-	AsDatastoreDirectory(config_obj *config_proto.Config) string
-	AsDatastoreFilename(config_obj *config_proto.Config) string
 
 	Dir() DSPathSpec
 
@@ -147,8 +203,6 @@ type DSPathSpec interface {
 
 type FSPathSpec interface {
 	_PathSpec
-	AsFilestoreFilename(config_obj *config_proto.Config) string
-	AsFilestoreDirectory(config_obj *config_proto.Config) string
 
 	Dir() FSPathSpec
 

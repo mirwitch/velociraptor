@@ -9,13 +9,12 @@ description: |
   ETW events for registry modifications.
 
   This artifact parses these events and ties them back to the
-  accessing process. It is recommended to run this artifact with the
+  accessing process. We recommend running this artifact with the
   process tracker.
 
-  NOTE: Experience shows this ETW provider is not very reliable and
-  seems to miss a lot of registry events.
-
-  This artifact is experimental.
+  NOTE: Experience shows this ETW provider is not very reliable and seems to
+  miss a lot of registry events. This artifact should therefore be considered
+  experimental.
 
 type: CLIENT_EVENT
 
@@ -47,7 +46,9 @@ sources:
     LET registry_access = SELECT System, EventData,
        get(item=EventLookup, field=str(str=System.ID)) AS EventType,
        get(item=Cache, field=EventData.KeyObject) || EventData.KeyName AS KeyName
-    FROM watch_etw(guid="{70EB4F03-C1DE-4F73-A051-33D13D5413BD}", any=0x7720)
+    FROM watch_etw(
+      description="Microsoft-Windows-Kernel-Registry",
+      guid="{70EB4F03-C1DE-4F73-A051-33D13D5413BD}", any=0x7720)
     WHERE System.ProcessID != getpid() -- exclude ourselves
         AND EventType  -- we only care about these events
         AND if(condition=System.ID in (1, 2, 4),
@@ -62,6 +63,7 @@ sources:
     WHERE KeyName =~ KeyNameRegex
 
     SELECT Timestamp, EventType,
+       System AS _System, EventData AS _EventData,
        Process.Name AS ProcessName, Process.Username AS Owner,
        Process.CommandLine AS CommandLine,
        KeyName, EventData.ValueName AS ValueName

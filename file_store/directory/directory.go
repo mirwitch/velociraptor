@@ -35,66 +35,41 @@ import (
 	"github.com/go-errors/errors"
 	"www.velocidex.com/golang/velociraptor/accessors/file_store_file_info"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/third_party/cache"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
-const (
-	// On windows all file paths must be prefixed by this to
-	// support long paths.
-	WINDOWS_LFN_PREFIX = "\\\\?\\"
-)
-
-type DirectoryFileWriter struct {
-	Fd         *os.File
-	completion func()
-}
-
-func (self *DirectoryFileWriter) Size() (int64, error) {
-	return self.Fd.Seek(0, os.SEEK_END)
-}
-
-func (self *DirectoryFileWriter) Write(data []byte) (int, error) {
-
-	defer api.InstrumentWithDelay("write", "DirectoryFileWriter", nil)()
-
-	_, err := self.Fd.Seek(0, os.SEEK_END)
-	if err != nil {
-		return 0, err
-	}
-
-	return self.Fd.Write(data)
-}
-
-func (self *DirectoryFileWriter) Truncate() error {
-	return self.Fd.Truncate(0)
-}
-
-func (self *DirectoryFileWriter) Flush() error { return nil }
-
-func (self *DirectoryFileWriter) Close() error {
-	err := self.Fd.Close()
-
-	// DirectoryFileWriter is synchronous... complete on Close()
-	if self.completion != nil &&
-		!utils.CompareFuncs(self.completion, utils.SyncCompleter) {
-		self.completion()
-	}
-	return err
-}
-
 type DirectoryFileStore struct {
 	config_obj *config_proto.Config
+	db         datastore.DataStore
 }
 
 func NewDirectoryFileStore(config_obj *config_proto.Config) *DirectoryFileStore {
-	return &DirectoryFileStore{config_obj}
+	db, err := datastore.GetDB(config_obj)
+	if err != nil {
+		return nil
+	}
+	return &DirectoryFileStore{
+		config_obj: config_obj,
+		db:         db,
+	}
 }
 
 func (self *DirectoryFileStore) Move(src, dest api.FSPathSpec) error {
-	src_path := src.AsFilestoreFilename(self.config_obj)
-	dest_path := dest.AsFilestoreFilename(self.config_obj)
+	src_path := datastore.AsFilestoreFilename(self.db, self.config_obj, src)
+	dest_path := datastore.AsFilestoreFilename(self.db, self.config_obj, dest)
+
+	// Ensure the directories exist.
+	err := datastore.MkdirAll(self.db, self.config_obj, dest.Dir())
+	if err != nil {
+		logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+		logger.Error("Can not create dir %v: %v", dest.Dir(), err)
+		return err
+	}
 
 	return os.Rename(src_path, dest_path)
 }
@@ -108,11 +83,14 @@ func (self *DirectoryFileStore) ListDirectory(dirname api.FSPathSpec) (
 
 	defer api.InstrumentWithDelay("list", "DirectoryFileStore", dirname)()
 
-	file_path := dirname.AsFilestoreDirectory(self.config_obj)
+	file_path := datastore.AsFilestoreDirectory(
+		self.db, self.config_obj, dirname)
 	files, err := utils.ReadDir(file_path)
 	if err != nil {
 		return nil, err
 	}
+
+	untyped := path_specs.IsComponentUntyped(dirname.Components())
 
 	var result []api.FileInfo
 	for _, fileinfo := range files {
@@ -125,31 +103,86 @@ func (self *DirectoryFileStore) ListDirectory(dirname api.FSPathSpec) (
 			continue
 		}
 
-		name_type, name := api.GetFileStorePathTypeFromExtension(name)
-		result = append(result, file_store_file_info.NewFileStoreFileInfo(
-			self.config_obj,
-			dirname.AddUnsafeChild(
-				utils.UnsanitizeComponent(name)).
-				SetType(name_type),
-			fileinfo))
+		// Name may be compressed
+		name = datastore.UncompressComponent(
+			self.db, self.config_obj, name)
+
+		var name_type api.PathType
+		if fileinfo.IsDir() {
+			name_type = api.PATH_TYPE_DATASTORE_DIRECTORY
+
+		} else if untyped {
+			name_type = api.PATH_TYPE_FILESTORE_ANY
+
+		} else {
+			name_type, name = api.GetFileStorePathTypeFromExtension(name)
+		}
+
+		result = append(result,
+			file_store_file_info.NewFileStoreFileInfo(self.config_obj,
+				dirname.AddUnsafeChild(name).SetType(name_type),
+				fileinfo))
 	}
 
 	return result, nil
 }
 
+func isPathCompressible(path api.FSPathSpec) bool {
+	switch path.Type() {
+	case api.PATH_TYPE_FILESTORE_CHUNK_INDEX,
+		api.PATH_TYPE_FILESTORE_JSON_INDEX,
+		api.PATH_TYPE_FILESTORE_SPARSE_IDX:
+		return false
+	default:
+		return true
+	}
+}
+
 func (self *DirectoryFileStore) ReadFile(
 	filename api.FSPathSpec) (api.FileReader, error) {
-	file_path := filename.AsFilestoreFilename(self.config_obj)
+	file_path := datastore.AsFilestoreFilename(
+		self.db, self.config_obj, filename)
 
 	defer api.InstrumentWithDelay("open_read", "DirectoryFileStore", filename)()
+
+	err := checkPath(file_path)
+	if err != nil {
+		return nil, err
+	}
 
 	file, err := os.Open(file_path)
 	if err != nil {
 		return nil, errors.Wrap(err, 0)
 	}
-	return &api.FileAdapter{
+	reader := &api.FileAdapter{
 		File:      file,
 		PathSpec_: filename,
+	}
+
+	if !isPathCompressible(filename) {
+		return reader, nil
+	}
+
+	chunk_file_path := datastore.AsFilestoreFilename(
+		self.db, self.config_obj, filename.
+			SetType(api.PATH_TYPE_FILESTORE_CHUNK_INDEX))
+
+	err = checkPath(chunk_file_path)
+	if err != nil {
+		return nil, err
+	}
+
+	chunk_fd, err := os.Open(chunk_file_path)
+	if err != nil {
+		return reader, nil
+	}
+
+	return &CompressedDirectoryReader{
+		chunkIndex: api.NewChunkIndex(&api.FileAdapter{
+			File: chunk_fd,
+		}),
+		reader:     reader,
+		chunkCache: cache.NewLRUCache(10),
 	}, nil
 }
 
@@ -158,20 +191,20 @@ func (self *DirectoryFileStore) StatFile(
 
 	defer api.Instrument("stat", "DirectoryFileStore", filename)()
 
-	file_path := filename.AsFilestoreFilename(self.config_obj)
+	file_path := datastore.AsFilestoreFilename(
+		self.db, self.config_obj, filename)
 	file, err := os.Stat(file_path)
 	if err != nil {
 		return nil, err
 	}
 
-	return &file_store_file_info.FileStoreFileInfo{
-		FileInfo: file,
-	}, nil
+	return file_store_file_info.NewFileStoreFileInfo(
+		self.config_obj, filename, file), nil
 }
 
 func (self *DirectoryFileStore) WriteFile(
 	filename api.FSPathSpec) (api.FileWriter, error) {
-	return self.WriteFileWithCompletion(filename, nil)
+	return self.WriteFileWithCompletion(filename, utils.SyncCompleter)
 }
 
 func (self *DirectoryFileStore) WriteFileWithCompletion(
@@ -179,15 +212,26 @@ func (self *DirectoryFileStore) WriteFileWithCompletion(
 
 	defer api.InstrumentWithDelay("open_write", "DirectoryFileStore", filename)()
 
-	file_path := filename.AsFilestoreFilename(self.config_obj)
-	err := os.MkdirAll(filepath.Dir(file_path), 0700)
+	// Writes are only possible when the datastore is healthy.
+	err := self.db.Healthy()
+	if err != nil {
+		return nil, err
+	}
+
+	err = datastore.MkdirAll(self.db, self.config_obj, filename.Dir())
 	if err != nil {
 		logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 		logger.Error("Can not create dir: %v", err)
 		return nil, err
 	}
 
-	file, err := os.OpenFile(file_path, os.O_RDWR|os.O_CREATE, 0700)
+	file_path := datastore.AsFilestoreFilename(self.db, self.config_obj, filename)
+	err = checkPath(file_path)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.OpenFile(file_path, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 		logger.Error("Unable to open file %v: %v", file_path, err)
@@ -195,8 +239,35 @@ func (self *DirectoryFileStore) WriteFileWithCompletion(
 		return nil, errors.Wrap(err, 0)
 	}
 
+	var chunk_fd *os.File
+
+	if isPathCompressible(filename) {
+		chunk_file_path := datastore.AsFilestoreFilename(
+			self.db, self.config_obj, filename.
+				SetType(api.PATH_TYPE_FILESTORE_CHUNK_INDEX))
+
+		err = checkPath(chunk_file_path)
+		if err != nil {
+			return nil, err
+		}
+
+		// If the index exists, we open it for append mode. If the
+		// index does not exist, then we wait to create it on the
+		// first call to WriteCompressed()
+		chunk_fd, err = os.OpenFile(chunk_file_path, os.O_RDWR, 0600)
+		if errors.Is(err, os.ErrNotExist) {
+			// Delay chunk writer until first call to WriteCompressed()
+			chunk_fd = nil
+		}
+	}
+
 	return &DirectoryFileWriter{
 		Fd:         file,
+		ChunkFd:    chunk_fd,
+		path:       filename,
+		db:         self.db,
+		config_obj: self.config_obj,
+
 		completion: completion,
 	}, nil
 }
@@ -205,7 +276,8 @@ func (self *DirectoryFileStore) Delete(filename api.FSPathSpec) error {
 
 	defer api.InstrumentWithDelay("delete", "DirectoryFileStore", filename)()
 
-	file_path := filename.AsFilestoreFilename(self.config_obj)
+	file_path := datastore.AsFilestoreFilename(
+		self.db, self.config_obj, filename)
 	err := os.Remove(file_path)
 	if err != nil {
 		return err
@@ -219,7 +291,7 @@ func (self *DirectoryFileStore) Delete(filename api.FSPathSpec) error {
 		err = os.Remove(dir_name)
 		if err == nil {
 			logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
-			logger.Debug("Prunning empty directory %v", dir_name)
+			logger.Debug("Pruning empty directory %v", dir_name)
 		}
 
 		// Check if this is the last file in the directory.

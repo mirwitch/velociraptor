@@ -8,6 +8,8 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
+	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/startup"
@@ -17,8 +19,9 @@ import (
 )
 
 var (
-	unzip_cmd        = app.Command("unzip", "Unzip a container file")
-	unzip_cmd_filter = unzip_cmd.Flag("where", "A WHERE condition for the query").String()
+	unzip_cmd                 = app.Command("unzip", "Unzip a container file")
+	unzip_cmd_report_password = unzip_cmd.Flag("report_password", "Log the X509 session password").Bool()
+	unzip_cmd_filter          = unzip_cmd.Flag("where", "A WHERE condition for the query").String()
 
 	unzip_path = unzip_cmd.Flag("dump_dir", "Directory to dump output files.").
 			Default(".").String()
@@ -36,8 +39,10 @@ var (
 )
 
 func doUnzip() error {
+	logging.DisableLogging()
 
-	server_config_obj, err := makeDefaultConfigLoader().WithNullLoader().LoadAndValidate()
+	server_config_obj, err := makeDefaultConfigLoader().
+		WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
@@ -48,6 +53,7 @@ func doUnzip() error {
 	config_obj := &config_proto.Config{}
 	config_obj.Frontend = server_config_obj.Frontend
 
+	config_obj.Services = services.GenericToolServices()
 	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
 
@@ -65,23 +71,30 @@ func doUnzip() error {
 		return err
 	}
 
+	logger := &LogWriter{config_obj: sm.Config}
 	builder := services.ScopeBuilder{
 		Config:     sm.Config,
 		ACLManager: acl_managers.NewRoleACLManager(sm.Config, "administrator"),
-		Logger:     log.New(&LogWriter{sm.Config}, "", 0),
+		Logger:     log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set("ZipPath", filename).
 			Set("DumpDir", *unzip_path).
-			Set("MemberGlob", *unzip_cmd_member),
+			Set("MemberGlob", *unzip_cmd_member).
+			Set(constants.REPORT_ZIP_PASSWORD, *unzip_cmd_report_password),
 	}
 
 	if *unzip_cmd_list {
-		return runUnzipList(builder)
+		err = runUnzipList(builder)
 	} else if *unzip_cmd_print {
-		return runUnzipPrint(builder)
+		err = runUnzipPrint(builder)
 	} else {
-		return runUnzipFiles(builder)
+		err = runUnzipFiles(builder)
 	}
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func runUnzipList(builder services.ScopeBuilder) error {
@@ -97,7 +110,7 @@ func runUnzipList(builder services.ScopeBuilder) error {
 		query += " AND " + *unzip_cmd_filter
 	}
 
-	return runQueryWithEnv(query, builder)
+	return runQueryWithEnv(query, builder, *unzip_format)
 }
 
 func runUnzipFiles(builder services.ScopeBuilder) error {
@@ -118,7 +131,7 @@ func runUnzipFiles(builder services.ScopeBuilder) error {
 		query += " AND " + *unzip_cmd_filter
 	}
 
-	return runQueryWithEnv(query, builder)
+	return runQueryWithEnv(query, builder, *unzip_format)
 }
 
 func runUnzipPrint(builder services.ScopeBuilder) error {
@@ -129,46 +142,17 @@ func runUnzipPrint(builder services.ScopeBuilder) error {
           FROM glob(globs=MemberGlob,
                     root=pathspec(DelegatePath=ZipPath),
                     accessor='collector')
-          WHERE NOT IsDir AND FullPath =~ '.json$'
+          WHERE NOT IsDir AND OSPath =~ '.json$'
        }, query={
-          SELECT *
+           SELECT *
           FROM parse_jsonl(filename=OSPath, accessor='collector')
        })
     `
-	return runQueryWithEnv(query, builder)
-}
-
-func getAllStats(
-	query string, builder services.ScopeBuilder) (
-	[]*ordereddict.Dict, error) {
-	manager, err := services.GetRepositoryManager(builder.Config)
-	if err != nil {
-		return nil, err
-	}
-
-	scope := manager.BuildScope(builder)
-	defer scope.Close()
-
-	vql, err := vfilter.Parse(query)
-	if err != nil {
-		return nil, fmt.Errorf("Unable to parse VQL Query: %w", err)
-	}
-
-	ctx, cancel := InstallSignalHandler(nil, scope)
-	defer cancel()
-
-	result := []*ordereddict.Dict{}
-	for row := range vql.Eval(ctx, scope) {
-		d, ok := row.(*ordereddict.Dict)
-		if ok {
-			result = append(result, d)
-		}
-	}
-	return result, nil
+	return runQueryWithEnv(query, builder, *unzip_format)
 }
 
 func runQueryWithEnv(
-	query string, builder services.ScopeBuilder) error {
+	query string, builder services.ScopeBuilder, format string) error {
 	manager, err := services.GetRepositoryManager(builder.Config)
 	if err != nil {
 		return err
@@ -186,9 +170,9 @@ func runQueryWithEnv(
 	defer cancel()
 
 	for _, vql := range vqls {
-		scope.Log("Running query %v", query)
+		scope.Log("Running query %v", vfilter.FormatToString(scope, vql))
 
-		switch *unzip_format {
+		switch format {
 		case "text":
 			table := reporting.EvalQueryToTable(ctx, scope, vql, os.Stdout)
 			table.Render()

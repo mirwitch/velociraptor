@@ -2,7 +2,6 @@ package paths
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
@@ -21,15 +20,38 @@ func NotebookDir() api.DSPathSpec {
 	return NOTEBOOK_ROOT
 }
 
-// Where to store attachments? In the notebook path.
+func (self *NotebookPathManager) NotebookId() string {
+	return self.notebook_id
+}
+
+// Attachments are not the same as uploads - they are usually uploaded
+// by pasting in the cell eg an image. We want the attachment to
+// remain whenever the cell is updated to a new version.
+// Example workflow:
+//   - User uploads an attachment into a cell
+//   - Cell is updated with a link to the attachment
+//   - User continues to edit the cell in newer versions but the link
+//     remains valid because the attachment is stored in the notebook
+//     and not the cell.
 func (self *NotebookPathManager) Attachment(name string) api.FSPathSpec {
-	return self.root.AddUnsafeChild(self.notebook_id, "files", name).
+	return self.root.AddUnsafeChild(self.notebook_id, "attach", name).
 		AsFilestorePath().SetType(api.PATH_TYPE_FILESTORE_ANY)
 }
 
 func (self *NotebookPathManager) AttachmentDirectory() api.FSPathSpec {
-	return self.root.AddChild(self.notebook_id, "files").
+	return self.root.AddChild(self.notebook_id, "attach").
 		AsFilestorePath().SetType(api.PATH_TYPE_FILESTORE_ANY)
+}
+
+func (self *NotebookPathManager) NotebookDirectory() api.FSPathSpec {
+	return self.root.AddChild(self.notebook_id).
+		AsFilestorePath().SetType(api.PATH_TYPE_FILESTORE_ANY)
+}
+
+func (self *NotebookPathManager) NotebookIndexForUser(
+	username string) api.FSPathSpec {
+	return self.root.AddChild("indexes", username).
+		AsFilestorePath().SetType(api.PATH_TYPE_FILESTORE_JSON)
 }
 
 // Notebook paths are based on the time so we need to write the stats
@@ -44,7 +66,21 @@ func (self *NotebookPathManager) Path() api.DSPathSpec {
 	return self.root.AddChild(self.notebook_id).SetTag("Notebook")
 }
 
-func (self *NotebookPathManager) Cell(cell_id string) *NotebookCellPathManager {
+// Stored the cached copy of the psuedo artifact we calculated when
+// the artifact was first created. This is used even if the original
+// artifact is deleted or modified.
+func (self *NotebookPathManager) Artifact() api.DSPathSpec {
+	return self.root.AddChild(self.notebook_id, "artifact").
+		SetTag("Artifact")
+}
+
+// Support versioned cells by appending the version to the cell id.
+func (self *NotebookPathManager) Cell(
+	cell_id, version string) *NotebookCellPathManager {
+	if version != "" {
+		cell_id += "-" + version
+	}
+
 	return &NotebookCellPathManager{
 		notebook_id: self.notebook_id,
 		cell_id:     cell_id,
@@ -61,10 +97,13 @@ func (self *NotebookPathManager) DSDirectory() api.DSPathSpec {
 	return self.root.AddChild(self.notebook_id)
 }
 
-func (self *NotebookPathManager) HtmlExport() api.FSPathSpec {
-	return DOWNLOADS_ROOT.AddChild("notebooks", self.notebook_id,
-		fmt.Sprintf("%s-%s", self.notebook_id,
-			self.Clock.Now().UTC().Format("20060102150405Z"))).
+func (self *NotebookPathManager) HtmlExport(prefered_name string) api.FSPathSpec {
+	if prefered_name == "" {
+		prefered_name = fmt.Sprintf("%s-%s", self.notebook_id,
+			self.Clock.Now().UTC().Format("20060102150405Z"))
+	}
+	return DOWNLOADS_ROOT.AddChild(
+		"notebooks", self.notebook_id, prefered_name).
 		SetType(api.PATH_TYPE_FILESTORE_DOWNLOAD_REPORT)
 }
 
@@ -89,37 +128,33 @@ func (self *NotebookPathManager) SuperTimeline(
 	}
 }
 
-// A notebook id for clients flows
-var client_notebook_regex = regexp.MustCompile(`^N\.(F\.[^-]+?)-(C\..+|server)$`)
-var event_notebook_regex = regexp.MustCompile(`^N\.E\.([^-]+?)-(C\..+|server)$`)
-
 func rootPathFromNotebookID(notebook_id string) api.DSPathSpec {
-	if strings.HasPrefix(notebook_id, "Dashboard") {
+	if utils.DashboardNotebookId(notebook_id) {
 		return NOTEBOOK_ROOT.AddUnsafeChild("Dashboards").
 			SetType(api.PATH_TYPE_DATASTORE_JSON)
 	}
 
-	if strings.HasPrefix(notebook_id, "N.H.") {
+	hunt_id, ok := utils.HuntNotebookId(notebook_id)
+	if ok {
 		// For hunt notebooks store them in the hunt itself.
-		return HUNTS_ROOT.AddChild(
-			strings.TrimPrefix(notebook_id, "N."), "notebook").
+		return HUNTS_ROOT.AddChild(hunt_id, "notebook").
 			SetType(api.PATH_TYPE_DATASTORE_JSON)
 	}
 
-	matches := client_notebook_regex.FindStringSubmatch(notebook_id)
-	if len(matches) == 3 {
+	flow_id, client_id, ok := utils.ClientNotebookId(notebook_id)
+	if ok {
 		// For collections notebooks store them in the hunt itself.
-		return CLIENTS_ROOT.AddChild(matches[2],
-			"collections", matches[1], "notebook").
+		return CLIENTS_ROOT.AddChild(client_id,
+			"collections", flow_id, "notebook").
 			SetType(api.PATH_TYPE_DATASTORE_JSON)
 	}
 
-	matches = event_notebook_regex.FindStringSubmatch(notebook_id)
-	if len(matches) == 3 {
+	artifact, client_id, ok := utils.EventNotebookId(notebook_id)
+	if ok {
 		// For event notebooks, store them in the client's monitoring
 		// area.
-		return CLIENTS_ROOT.AddUnsafeChild(matches[2],
-			"monitoring_notebooks", matches[1]).
+		return CLIENTS_ROOT.AddUnsafeChild(client_id,
+			"monitoring_notebooks", artifact).
 			SetType(api.PATH_TYPE_DATASTORE_JSON)
 	}
 
@@ -145,9 +180,17 @@ func (self *NotebookCellPathManager) Directory() api.FSPathSpec {
 	return self.root.AddChild(self.notebook_id, self.cell_id).AsFilestorePath()
 }
 
+func (self *NotebookCellPathManager) DSDirectory() api.DSPathSpec {
+	return self.root.AddChild(self.notebook_id, self.cell_id)
+}
+
 func (self *NotebookCellPathManager) Path() api.DSPathSpec {
 	return self.root.AddUnsafeChild(self.notebook_id, self.cell_id).
 		SetTag("NotebookCell")
+}
+
+func (self *NotebookCellPathManager) NotebookId() string {
+	return self.notebook_id
 }
 
 func (self *NotebookCellPathManager) Notebook() *NotebookPathManager {
@@ -188,7 +231,7 @@ func (self *NotebookCellPathManager) QueryStorage(id int64) *NotebookCellQuery {
 	}
 }
 
-// Uploads are stored in each cell separately.
+// Uploads are stored at the network level.
 func (self *NotebookCellPathManager) UploadsDir() api.FSPathSpec {
 	return self.root.AsFilestorePath().
 		AddUnsafeChild(self.notebook_id, self.cell_id, "uploads").
@@ -196,9 +239,10 @@ func (self *NotebookCellPathManager) UploadsDir() api.FSPathSpec {
 }
 
 func (self *NotebookCellPathManager) GetUploadsFile(filename string) api.FSPathSpec {
+	// Uploads exist inside each cell so when cells are reaped we
+	// remove the uploads.
 	return self.root.AsFilestorePath().
-		AddUnsafeChild(self.notebook_id,
-			self.cell_id, "uploads", filename).
+		AddUnsafeChild(self.notebook_id, self.cell_id, "uploads", filename).
 		SetType(api.PATH_TYPE_FILESTORE_ANY)
 }
 
@@ -231,11 +275,12 @@ func ZipPathFromFSPathSpec(path api.FSPathSpec) string {
 	components := path.Components()
 	safe_components := make([]string, 0, len(components))
 	for _, c := range components {
+		c = utils.SanitizeStringForZip(c)
 		if c == "" || c == "." || c == ".." {
 			continue
 		}
-		safe_components = append(safe_components, utils.SanitizeString(c))
+		safe_components = append(safe_components, c)
 	}
-	return "/" + strings.Join(safe_components, "/") +
-		api.GetExtensionForFilestore(path)
+	// Zip paths must not have a leading /
+	return strings.Join(safe_components, "/") + api.GetExtensionForFilestore(path)
 }

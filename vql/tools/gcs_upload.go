@@ -1,22 +1,32 @@
-//+build extras
+//go:build extras
+// +build extras
 
 package tools
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"net/http"
 
 	"cloud.google.com/go/storage"
 	"github.com/Velocidex/ordereddict"
-	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
+	"google.golang.org/api/transport"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/artifacts"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/uploads"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/networking"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
@@ -27,7 +37,7 @@ type GCSUploadArgs struct {
 	Accessor    string            `vfilter:"optional,field=accessor,doc=The accessor to use"`
 	Bucket      string            `vfilter:"required,field=bucket,doc=The bucket to upload to"`
 	Project     string            `vfilter:"required,field=project,doc=The project to upload to"`
-	Credentials string            `vfilter:"required,field=credentials,doc=The credentials to use"`
+	Credentials string            `vfilter:"optional,field=credentials,doc=The credentials to use"`
 }
 
 type GCSUploadFunction struct{}
@@ -36,6 +46,8 @@ func (self *GCSUploadFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
+	defer vql_subsystem.RegisterMonitor(ctx, "upload_gcs", args)()
+
 	arg := &GCSUploadArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -43,21 +55,21 @@ func (self *GCSUploadFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
-	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-	if err != nil {
-		scope.Log("upload_gcs: %s", err)
+	client_config, ok := artifacts.GetConfig(scope)
+	if !ok {
+		scope.Log("upload_gcs: unable to fetch config")
 		return vfilter.Null{}
 	}
 
 	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
-		scope.Log("upload_gcs: %v", err)
+		scope.Log("ERROR:upload_gcs: %v", err)
 		return vfilter.Null{}
 	}
 
 	file, err := accessor.OpenWithOSPath(arg.File)
 	if err != nil {
-		scope.Log("upload_gcs: Unable to open %s: %s",
+		scope.Log("ERROR:upload_gcs: Unable to open %s: %s",
 			arg.File, err.Error())
 		return &vfilter.Null{}
 	}
@@ -69,15 +81,16 @@ func (self *GCSUploadFunction) Call(ctx context.Context,
 
 	stat, err := accessor.LstatWithOSPath(arg.File)
 	if err != nil {
-		scope.Log("upload_gcs: Unable to stat %s: %v",
+		scope.Log("ERROR:upload_gcs: Unable to stat %s: %v",
 			arg.File, err)
 	} else if !stat.IsDir() {
 		upload_response, err := upload_gcs(
-			ctx, scope, file, arg.Project,
+			ctx, client_config,
+			scope, file, arg.Project,
 			arg.Bucket,
 			arg.Name, arg.Credentials)
 		if err != nil {
-			scope.Log("upload_gcs: %v", err)
+			scope.Log("ERROR:upload_gcs: %v", err)
 			return vfilter.Null{}
 		}
 		return upload_response
@@ -86,7 +99,10 @@ func (self *GCSUploadFunction) Call(ctx context.Context,
 	return vfilter.Null{}
 }
 
-func upload_gcs(ctx context.Context, scope vfilter.Scope,
+func upload_gcs(
+	ctx context.Context,
+	config_obj *config_proto.ClientConfig,
+	scope vfilter.Scope,
 	reader io.Reader,
 	projectID, bucket, name string,
 	credentials string) (
@@ -96,8 +112,39 @@ func upload_gcs(ctx context.Context, scope vfilter.Scope,
 	var bucket_handle *storage.BucketHandle
 	bucket_handle_cache := vql_subsystem.CacheGet(scope, bucket)
 	if bucket_handle_cache == nil {
-		client, err := storage.NewClient(ctx, option.WithCredentialsJSON(
-			[]byte(credentials)))
+		http_transport, err := networking.GetHttpTransport(config_obj, "")
+		if err != nil {
+			return nil, err
+		}
+
+		http_transport = networking.MaybeSpyOnTransport(
+			&config_proto.Config{Client: config_obj}, http_transport)
+
+		var creds *google.Credentials
+		if len(credentials) > 0 {
+			creds, err = transport.Creds(ctx,
+				option.WithAuthCredentialsJSON(option.ServiceAccount, []byte(credentials)),
+				option.WithScopes(storage.ScopeReadWrite))
+		} else {
+			creds, err = google.FindDefaultCredentials(ctx)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		t_http_client := &http.Client{
+			Transport: &oauth2.Transport{
+				Base:   http_transport,
+				Source: creds.TokenSource,
+			},
+		}
+
+		// Theoretically option.WithCredentialsJSON can be provided to
+		// storage.NewClient but this is currently broken upstream. We
+		// add the credentials to the transport directly instead.
+		// https://github.com/googleapis/google-api-go-client/issues/3414
+		client, err := storage.NewClient(ctx,
+			option.WithHTTPClient(t_http_client))
 		if err != nil {
 			return nil, err
 		}
@@ -119,19 +166,23 @@ func upload_gcs(ctx context.Context, scope vfilter.Scope,
 	defer func() {
 		err := writer.Close()
 		if err != nil {
-			scope.Log("upload_gcs: ERROR writing to object: %v", err)
+			scope.Log("ERROR:upload_gcs: <red>ERROR writing to object: %v", err)
 		} else {
 			attr := writer.Attrs()
 			serialized, _ := json.Marshal(attr)
 			scope.Log("upload_gcs: SUCCESS writing to object: %v",
 				string(serialized))
 
-			report := "Hash mismatch!!!"
 			if string(attr.MD5) == string(md5_sum.Sum(nil)) {
-				report = "Hash checks out."
+				scope.Log(
+					"DEBUG: upload_gcs: <red>GCS Calculated MD5: %016x Hash checks out.",
+					attr.MD5)
+
+			} else {
+				scope.Log(
+					"ERROR: upload_gcs: <red>GCS Calculated MD5: %016x Hash mismatch!!!",
+					attr.MD5)
 			}
-			scope.Log("upload_gcs: GCS Calculated MD5: %016x %v",
-				attr.MD5, report)
 		}
 	}()
 
@@ -158,9 +209,10 @@ func upload_gcs(ctx context.Context, scope vfilter.Scope,
 func (self GCSUploadFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "upload_gcs",
-		Doc:     "Upload files to GCS.",
-		ArgType: type_map.AddType(scope, &GCSUploadArgs{}),
+		Name:     "upload_gcs",
+		Doc:      "Upload files to GCS.",
+		ArgType:  type_map.AddType(scope, &GCSUploadArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

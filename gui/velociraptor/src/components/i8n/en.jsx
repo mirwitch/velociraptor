@@ -1,8 +1,10 @@
+import React from 'react';
 import Alert from 'react-bootstrap/Alert';
 import humanizeDuration from "humanize-duration";
+import api from '../core/api-service.jsx';
 
 const English = {
-    SEARCH_CLIENTS: "Search clients",
+    "SEARCH_CLIENTS": "Search clients",
     "Quarantine description": <>
           <p>You are about to quarantine this host.</p>
           <p>
@@ -44,20 +46,26 @@ const English = {
     "VQL Drilldown": "VQL Drilldown",
     "Shell": "Shell",
     "Close": "Close",
+    "Search": "Search",
+    "Main Menu": "Main Menu",
+    "Toggle Main Menu": "Toggle Main Menu",
+    "Welcome": "Welcome",
     "Connected": "Connected",
     "time_ago": (value, unit) => {
         return value + ' ' + unit + ' ago';
     },
     "DeleteMessage": "You are about to permanently delete the following clients",
+    "KillMessage": "You are about to kill the following clients",
     "You are about to delete": name=>"You are about to delete "+name,
     "Edit Artifact": name=>{
         return "Edit Artifact " + name;
     },
     "Notebook for Collection": name=>"Notebook for Collection "+name,
+    "Import Artifacts": length=><>Import {length} Artifacts</>,
     "ArtifactDeletionDialog": (session_id, artifacts, total_bytes, total_rows)=>
     <>
-      You are about to permanently delete the artifact collection
-      <b>{session_id}</b>.
+      You are about to permanently delete the artifact
+      collection <b>{session_id}</b>.
       <br/>
       This collection had the artifacts <b className="wrapped-text">
                                           {artifacts}</b>
@@ -92,19 +100,19 @@ const English = {
       time it is needed. Tools will only be downloaded if their
       hash has changed.
     </>,
-    "ServedFromURL": (base_path, url)=>
+    "ServedFromURL": (url)=>
     <>
-      Clients will fetch the tool directly from
-      <a href={base_path + url}>{url}</a> if
+      Clients will fetch the tool directly
+      from <a href={api.href(url)}>{url}</a> if
       needed. Note that if the hash does not match the
       expected hash the clients will reject the file.
     </>,
     "ServedFromGithub": (github_project, github_asset_regex)=>
     <>
       Tool URL will be refreshed from
-      GitHub as the latest release from the project
-      <b>{github_project}</b> that matches
-      <b>{github_asset_regex}</b>
+      GitHub as the latest release from the
+      project <b>{github_project}</b> that
+      matches <b>{github_asset_regex}</b>
     </>,
     "PlaceHolder":
     <>
@@ -163,9 +171,9 @@ const English = {
       event artifacts targetting that group.
     </>,
     "Deutsch": "German",
-    "_ts": "Server Time",
+    "_ts": "ServerTime",
     "TablePagination": (from, to, size)=>
-    <>Showing { from } to { to } of { size }</>,
+    <>{ from.toString() }-{ to.toString() }/{ size.toString() }</>,
     "Verified Email" : "Verified Email",
     "Account Locked" : "Account Locked",
     "Role_administrator" : "Server Administrator",
@@ -174,7 +182,7 @@ const English = {
     "Role_analyst" : "Analyst",
     "Role_investigator" : "Investigator",
     "Role_artifact_writer" : "Artifact Writer",
-    "Role_api" : "Read-Only API Client",
+    "Role_api" : "API Client",
     "ToolRole_administrator" :
     <>
     Like any system, Velociraptor needs an administrator which is all powerful. This account can run arbitrary VQL on the server, reconfigure the server, etc.  The ability to add/create/edit/remove users is dependent on the organizations to which this account belongs.
@@ -201,15 +209,16 @@ const English = {
     </>,
     "ToolRole_api" :
     <>
-    This role provides the ability to read previously collected results but does not allow the user to actually make any changes.
+    This role is required to provide the ability for the user to connect over the API port.
     </>,
 
-    "Perm_ALL_QUERY" : "All Query",
     "Perm_ANY_QUERY" : "Any Query",
     "Perm_PUBISH" : "Publish",
     "Perm_READ_RESULTS" : "Read results",
     "Perm_LABEL_CLIENT" : "Label Clients",
     "Perm_COLLECT_CLIENT" : "Collect Client",
+    "Perm_COLLECT_BASIC": "Collect Basic Client",
+    "Perm_START_HUNT" : "Start Hunt",
     "Perm_COLLECT_SERVER" : "Collect Server",
     "Perm_ARTIFACT_WRITER" : "Artifact Writer",
     "Perm_SERVER_ARTIFACT_WRITER" : "Server Artifact Writer",
@@ -220,17 +229,20 @@ const English = {
     "Perm_IMPERSONATION" : "Impersonation",
     "Perm_FILESYSTEM_READ" : "Filesystem Read",
     "Perm_FILESYSTEM_WRITE" : "Filesystem Write",
+    "Perm_NETWORK": "Network Access",
     "Perm_MACHINE_STATE" : "Machine State",
     "Perm_PREPARE_RESULTS" : "Prepare Results",
+    "Perm_DELETE_RESULTS" : "Delete Results",
     "Perm_DATASTORE_ACCESS" : "Datastore Access",
 
 
-    "ToolPerm_ALL_QUERY" : "Issue all queries without restriction",
-    "ToolPerm_ANY_QUERY" : "Issue any query at all (AllQuery implies AnyQuery)",
+    "ToolPerm_ANY_QUERY" : "Issue any query at all ",
     "ToolPerm_PUBISH" : "Publish events to server side queues (typically not needed)",
     "ToolPerm_READ_RESULTS" : "Read results from already run hunts, flows, or notebooks",
     "ToolPerm_LABEL_CLIENT" : "Can manipulate client labels and metadata",
     "ToolPerm_COLLECT_CLIENT" : "Schedule or cancel new collections on clients",
+    "ToolPerm_COLLECT_BASIC" : "Schedule basic collections on clients",
+    "ToolPerm_START_HUNT" : "Start a new hunt",
     "ToolPerm_COLLECT_SERVER" : "Schedule new artifact collections on Velociraptor servers",
     "ToolPerm_ARTIFACT_WRITER" : "Add or edit custom artifacts that run on the server",
     "ToolPerm_SERVER_ARTIFACT_WRITER" : "Add or edit custom artifacts that run on the server",
@@ -241,12 +253,11 @@ const English = {
     "ToolPerm_IMPERSONATION" : "Allows the user to specify a different username for the query() plugin",
     "ToolPerm_FILESYSTEM_READ" : "Allowed to read arbitrary files from the filesystem",
     "ToolPerm_FILESYSTEM_WRITE" : "Allowed to create files on the filesystem",
+    "ToolPerm_NETWORK": "Allowed to run plugins that make network connections",
     "ToolPerm_MACHINE_STATE" : "Allowed to collect state information from machines (e.g. pslist())",
     "ToolPerm_PREPARE_RESULTS" : "Allowed to create zip files",
+    "ToolPerm_DELETE_RESULTS" : "Allowed to delete clients, flows and other data",
     "ToolPerm_DATASTORE_ACCESS" : " Allowed raw datastore access",
-
-
-
 
     "ToolUsernamePasswordless" :
     <>
@@ -280,6 +291,12 @@ const English = {
         <>
           You are about to remove user {user} from Org {org} <br/>
         </>),
+    "RUNNING": "Scheduled",
+    "WAITING": "Waiting to run",
+    "IN_PROGRESS": "In Progress",
+    "UNRESPONSIVE": "Unresponsive",
+    "FINISHED": "Completed",
+    "ERROR": "Error",
 };
 
 export default English;

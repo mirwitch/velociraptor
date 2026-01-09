@@ -1,24 +1,26 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -28,10 +30,12 @@ import (
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
+	kingpin "github.com/alecthomas/kingpin/v2"
 	"www.velocidex.com/golang/velociraptor/accessors"
 	file_store_accessor "www.velocidex.com/golang/velociraptor/accessors/file_store"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/file_store/uploader"
 	logging "www.velocidex.com/golang/velociraptor/logging"
@@ -39,6 +43,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/startup"
 	"www.velocidex.com/golang/velociraptor/uploads"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	vfilter "www.velocidex.com/golang/vfilter"
@@ -72,6 +77,13 @@ var (
 	fs_command_cat_path = fs_command_cat.Arg(
 		"path", "The path to cat").Required().String()
 
+	fs_command_zcat = fs_command.Command(
+		"zcat", "Dump a compressed filestore file")
+	fs_command_zcat_chunk_path = fs_command_zcat.Arg(
+		"chunk_path", "The path to the .chunk index file").Required().File()
+	fs_command_zcat_file_path = fs_command_zcat.Arg(
+		"file_path", "The path to the compressed file to dump").Required().File()
+
 	fs_command_rm      = fs_command.Command("rm", "Remove file (only filestore supported)")
 	fs_command_rm_path = fs_command_rm.Arg(
 		"path", "The path or glob to remove").Required().String()
@@ -85,7 +97,8 @@ func eval_query(
 	if config_obj.ApiConfig != nil && config_obj.ApiConfig.Name != "" {
 		logging.GetLogger(config_obj, &logging.ToolComponent).
 			Info("API Client configuration loaded - will make gRPC connection.")
-		return doRemoteQuery(config_obj, format, []string{query}, env)
+		return doRemoteQuery(config_obj, format, config_obj.OrgId,
+			[]string{query}, env)
 	}
 
 	return eval_local_query(ctx, config_obj, *fs_command_format, query, scope)
@@ -121,6 +134,8 @@ func eval_local_query(
 }
 
 func doLS(path, accessor string) error {
+	logging.DisableLogging()
+
 	config_obj, err := APIConfigLoader.WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
@@ -129,6 +144,7 @@ func doLS(path, accessor string) error {
 	ctx, cancel := install_sig_handler()
 	defer cancel()
 
+	config_obj.Services = services.GenericToolServices()
 	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
 
@@ -147,10 +163,11 @@ func doLS(path, accessor string) error {
 		path += "*"
 	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	builder := services.ScopeBuilder{
 		Config:     config_obj,
 		ACLManager: acl_managers.NullACLManager{},
-		Logger:     log.New(&LogWriter{config_obj}, "", 0),
+		Logger:     log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set(vql_subsystem.ACL_MANAGER_VAR,
 				acl_managers.NewRoleACLManager(config_obj, "administrator")).
@@ -168,7 +185,8 @@ func doLS(path, accessor string) error {
 	query := "SELECT Name, Size, Mode.String AS Mode, Mtime, Data " +
 		"FROM glob(globs=path, accessor=accessor) "
 	if *fs_command_verbose {
-		query = strings.Replace(query, "Name", "FullPath", 1)
+		query = "SELECT OSPath, Size, Mode.String AS Mode, Mtime, Data " +
+			"FROM glob(globs=path, accessor=accessor) "
 	}
 
 	// Special handling for ntfs.
@@ -176,11 +194,18 @@ func doLS(path, accessor string) error {
 		query += " WHERE Sys.name_type != 'DOS' "
 	}
 
-	return eval_query(sm.Ctx, config_obj,
+	err = eval_query(sm.Ctx, config_obj,
 		*fs_command_format, query, scope, builder.Env)
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func doRM(path, accessor string) error {
+	logging.DisableLogging()
+
 	config_obj, err := APIConfigLoader.WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
@@ -211,10 +236,11 @@ func doRM(path, accessor string) error {
 		return fmt.Errorf("Only fs:// URLs support removal")
 	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	builder := services.ScopeBuilder{
 		Config:     config_obj,
 		ACLManager: acl_managers.NewRoleACLManager(config_obj, "administrator"),
-		Logger:     log.New(&LogWriter{config_obj}, "", 0),
+		Logger:     log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set("accessor", accessor).
 			Set("path", path),
@@ -226,15 +252,22 @@ func doRM(path, accessor string) error {
 	scope := manager.BuildScope(builder)
 	defer scope.Close()
 
-	query := "SELECT FullPath, Size, Mode.String AS Mode, Mtime, " +
-		"file_store_delete(path=FullPath) AS Deletion " +
+	query := "SELECT OSPath, Size, Mode.String AS Mode, Mtime, " +
+		"file_store_delete(path=OSPath) AS Deletion " +
 		"FROM glob(globs=path, accessor=accessor) "
 
-	return eval_query(sm.Ctx,
+	err = eval_query(sm.Ctx,
 		config_obj, *fs_command_format, query, scope, builder.Env)
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func doCp(path, accessor string, dump_dir string) error {
+	logging.DisableLogging()
+
 	config_obj, err := APIConfigLoader.
 		WithNullLoader().LoadAndValidate()
 	if err != nil {
@@ -275,9 +308,10 @@ func doCp(path, accessor string, dump_dir string) error {
 		output_path = matches[2]
 	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	builder := services.ScopeBuilder{
 		Config: config_obj,
-		Logger: log.New(&LogWriter{config_obj}, "", 0),
+		Logger: log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set("accessor", accessor).
 			Set("path", path),
@@ -311,21 +345,28 @@ func doCp(path, accessor string, dump_dir string) error {
 	scope.Log("Copy from %v (%v) to %v (%v)",
 		path, accessor, output_path, output_accessor)
 
-	return eval_query(sm.Ctx, config_obj, *fs_command_format, `
+	err = eval_query(sm.Ctx, config_obj, *fs_command_format, `
 SELECT * from foreach(
   row={
     SELECT Name, Size, Mode.String AS Mode,
-       Mtime, Data, FullPath
+       Mtime, Data, OSPath
     FROM glob(globs=path, accessor=accessor)
   }, query={
      SELECT Name, Size, Mode, Mtime, Data,
-     upload(file=FullPath, accessor=accessor, name=Name) AS Upload
+     upload(file=OSPath, accessor=accessor, name=Name) AS Upload
      FROM scope()
   })`, scope, builder.Env)
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func doCat(path, accessor_name string) error {
-	_, err := APIConfigLoader.
+	logging.DisableLogging()
+
+	config_obj, err := APIConfigLoader.
 		WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
@@ -337,7 +378,31 @@ func doCat(path, accessor_name string) error {
 		path = matches[2]
 	}
 
-	scope := vql_subsystem.MakeScope()
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	config_obj.Services = services.GenericToolServices()
+	sm, err := startup.StartToolServices(ctx, config_obj)
+	defer sm.Close()
+
+	if err != nil {
+		return err
+	}
+
+	logger := &LogWriter{config_obj: config_obj}
+	builder := services.ScopeBuilder{
+		Config:     config_obj,
+		ACLManager: acl_managers.NullACLManager{},
+		Logger:     log.New(logger, "", 0),
+	}
+
+	manager, err := services.GetRepositoryManager(config_obj)
+	if err != nil {
+		return err
+	}
+	scope := manager.BuildScope(builder)
+	defer scope.Close()
+
 	accessor, err := accessors.GetAccessor(accessor_name, scope)
 	if err != nil {
 		return err
@@ -352,15 +417,60 @@ func doCat(path, accessor_name string) error {
 	return err
 }
 
+func doZCat(chunk_fd, file_fd *os.File) error {
+	defer chunk_fd.Close()
+	defer file_fd.Close()
+
+	if !strings.HasSuffix(chunk_fd.Name(), ".chunk") {
+		return fmt.Errorf("Chunk file %v does not have the .chunk extension", chunk_fd.Name())
+	}
+
+	chunk_buf := make([]byte, api.SizeofCompressedChunk)
+	for {
+		_, err := chunk_fd.Read(chunk_buf)
+		if err != nil {
+			break
+		}
+
+		chunk := &api.CompressedChunk{}
+		err = binary.Read(bytes.NewReader(chunk_buf), binary.LittleEndian, chunk)
+		if err != nil {
+			return err
+		}
+
+		compressed := make([]byte, chunk.CompressedLength)
+		_, err = file_fd.Seek(chunk.ChunkOffset, os.SEEK_SET)
+		if err != nil {
+			return err
+		}
+
+		n, err := file_fd.Read(compressed)
+		if err != nil || int64(n) != chunk.CompressedLength {
+			break
+		}
+
+		uncompressed, err := utils.Uncompress(context.Background(), compressed)
+		if err != nil {
+			break
+		}
+
+		_, err = io.Copy(os.Stdout, bytes.NewReader(uncompressed))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // Only register the filesystem accessor if we have a proper valid server config.
 func initFilestoreAccessor(config_obj *config_proto.Config) error {
 	if config_obj.Datastore != nil {
 		fs_factory := file_store_accessor.NewFileStoreFileSystemAccessor(config_obj)
-		accessors.Register("fs", fs_factory,
-			`Provide access to the server's filestore and datastore.
+		accessors.Register(fs_factory)
 
-Many VQL plugins produce references to files stored on the server. This accessor can be used to open those files and read them. Typically references to filestore or datastore files have the "fs:" or "ds:" prefix.
-`)
+		sparse_fs_factory := file_store_accessor.NewSparseFileStoreFileSystemAccessor(config_obj)
+		accessors.Register(sparse_fs_factory)
 	}
 	return nil
 }
@@ -369,16 +479,25 @@ func init() {
 	command_handlers = append(command_handlers, func(command string) bool {
 		switch command {
 		case fs_command_ls.FullCommand():
-			doLS(*fs_command_ls_path, *fs_command_accessor)
+			err := doLS(*fs_command_ls_path, *fs_command_accessor)
+			kingpin.FatalIfError(err, "%s", fs_command_ls.FullCommand())
 
 		case fs_command_rm.FullCommand():
-			doRM(*fs_command_rm_path, *fs_command_accessor)
+			err := doRM(*fs_command_rm_path, *fs_command_accessor)
+			kingpin.FatalIfError(err, "%s", fs_command_rm.FullCommand())
 
 		case fs_command_cp.FullCommand():
-			doCp(*fs_command_cp_path, *fs_command_accessor, *fs_command_cp_outdir)
+			err := doCp(*fs_command_cp_path,
+				*fs_command_accessor, *fs_command_cp_outdir)
+			kingpin.FatalIfError(err, "%s", fs_command_cp.FullCommand())
 
 		case fs_command_cat.FullCommand():
-			doCat(*fs_command_cat_path, *fs_command_accessor)
+			err := doCat(*fs_command_cat_path, *fs_command_accessor)
+			kingpin.FatalIfError(err, "%s", fs_command_cat.FullCommand())
+
+		case fs_command_zcat.FullCommand():
+			err := doZCat(*fs_command_zcat_chunk_path, *fs_command_zcat_file_path)
+			kingpin.FatalIfError(err, "%s", fs_command_zcat.FullCommand())
 
 		default:
 			return false

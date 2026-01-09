@@ -1,8 +1,8 @@
 name: Windows.System.UntrustedBinaries
 description: |
-  Windows runs a number of services and binaries as part of the
+  Windows runs several services and binaries as part of the
   operating system. Sometimes malware pretends to run as those well
-  known names in order to hide itself in plain sight. For example, a
+  known names to hide itself in plain sight. For example, a
   malware service might call itself svchost.exe so it shows up in the
   process listing as a benign service.
 
@@ -18,6 +18,11 @@ parameters:
     description: A regex to select running processes which we consider should be trusted.
     default: "lsass|svchost|conhost|taskmgr|winlogon|wmiprv|dwm|csrss|velociraptor"
     type: regex
+  - name: DISABLE_DANGEROUS_API_CALLS
+    type: bool
+    description: |
+      Enable this to disable potentially flakey APIs which may cause
+      crashes.
 
 sources:
   - precondition: |

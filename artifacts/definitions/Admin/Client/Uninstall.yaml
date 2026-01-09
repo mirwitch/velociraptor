@@ -39,7 +39,8 @@ sources:
           argv=commandline_split(command=UninstallString) + "/quiet")
 
       SELECT KeyName, DisplayName, UninstallString,
-          if(condition=ReallyDoIt, then=uninstall(Name=UninstallString).Stdout) AS UninstallLog
+          if(condition=ReallyDoIt,
+             then=uninstall(UninstallString=UninstallString).Stdout) AS UninstallLog
       FROM packages
 
   - name: Debian
@@ -59,7 +60,7 @@ sources:
 
   - name: RPMBased
     precondition: |
-      -- Only run if dpkg is installed.
+      -- Only run if rpm is installed.
       SELECT OS, {
          SELECT ReturnCode FROM execve(argv=["rpm", "--help"])
       } AS ReturnCode

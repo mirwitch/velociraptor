@@ -1,27 +1,29 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package api
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
@@ -29,13 +31,13 @@ import (
 	errors "github.com/go-errors/errors"
 
 	"github.com/sirupsen/logrus"
-	context "golang.org/x/net/context"
-	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/executor/throttler"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/vfilter"
@@ -72,13 +74,17 @@ func streamQuery(
 	}()
 
 	response_channel := make(chan *actions_proto.VQLResponse)
-	scope_logger := MakeLogger(ctx, response_channel)
+	sub_ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	scope_logger := MakeLogger(sub_ctx, response_channel)
 
 	// Add extra artifacts to the query from the global repository.
 	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return err
 	}
+
 	repository, err := manager.GetGlobalRepository(config_obj)
 	if err != nil {
 		return err
@@ -99,22 +105,30 @@ func streamQuery(
 	// Now execute the query.
 	scope := manager.BuildScope(builder)
 
-	subctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// Keep the connection open until the logs are sent.
+	wg := sync.WaitGroup{}
+	defer wg.Wait()
 
 	// Implement timeout
 	if arg.Timeout > 0 {
 		start := time.Now()
-		timed_ctx, timed_cancel := context.WithTimeout(subctx,
-			time.Second*time.Duration(arg.Timeout))
+		timed_ctx, timed_cancel := utils.WithTimeoutCause(sub_ctx,
+			time.Second*time.Duration(arg.Timeout),
+			errors.New("Query API timeout reached"))
 
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
+
 			select {
-			case <-ctx.Done():
+			// Cancelling the parent will not return a log.
+			case <-sub_ctx.Done():
 				timed_cancel()
+
+				// Log the timeout
 			case <-timed_ctx.Done():
 				scope.Log("collect: <red>Timeout Error:</> Collection timed out after %v",
-					time.Now().Sub(start))
+					utils.GetTime().Now().Sub(start))
 				// Cancel the main context.
 				cancel()
 				timed_cancel()
@@ -123,12 +137,21 @@ func streamQuery(
 	}
 
 	// Throttle the query if required.
-	scope.SetThrottler(
-		actions.NewThrottler(subctx, scope, 0, float64(arg.CpuLimit), 0))
+	t, closer := throttler.NewThrottler(sub_ctx, scope, config_obj,
+		0, float64(arg.CpuLimit), 0)
+	scope.SetThrottler(t)
+	err = scope.AddDestructor(closer)
+	if err != nil {
+		closer()
+		return err
+	}
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		defer close(response_channel)
 		defer scope.Close()
+		defer cancel()
 
 		scope.Log("Starting query execution.")
 
@@ -148,7 +171,7 @@ func streamQuery(
 					vfilter.FormatToString(scope, vql))
 
 				result_chan := vfilter.GetResponseChannel(
-					vql, subctx, scope,
+					vql, sub_ctx, scope,
 					vql_subsystem.MarshalJson(scope),
 					int(arg.MaxRow), int(arg.MaxWait))
 
@@ -198,6 +221,16 @@ type logWriter struct {
 }
 
 func (self *logWriter) Write(b []byte) (int, error) {
+	// Sometimes the channel becomes closed for some reason and this
+	// tends to panic.
+	defer utils.CheckForPanic("logWriter.Write")
+
+	select {
+	case <-self.ctx.Done():
+		return 0, io.EOF
+	default:
+	}
+
 	select {
 	case <-self.ctx.Done():
 		return 0, io.EOF

@@ -11,8 +11,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vtesting/assert"
 )
 
 var writeTests = []struct {
@@ -64,9 +67,10 @@ func TestWrite(t *testing.T) {
 
 // This tests round tripping through WriteAny() and ReadAny().
 var writeAnyTests = []struct {
-	Input   [][]interface{}
-	Output  string
-	UseCRLF bool
+	Input          [][]interface{}
+	Output         string
+	UseCRLF        bool
+	TestEncodeOnly bool
 }{
 	// Simple strings are written without quoting.
 	{Input: [][]interface{}{{"a", "b", "c"}}, Output: "a,b,c\n"},
@@ -80,10 +84,9 @@ var writeAnyTests = []struct {
 
 	// Known bug: Strings with \r\n get converted to \n because
 	// csv module converts \r\n to \n even within a quoted item.
-	/*
-		{Input: [][]interface{}{{"a\nb", 2, "c\r\nd"}},
-			Output: "\"a\nb\",2,\"c\r\nd\"\n"},
-	*/
+
+	//	{Input: [][]interface{}{{"a\nb", 2, "c\r\nd"}},
+	//		Output: "\"a\nb\",2,\"c\r\nd\"\n"},
 
 	// Raw Bytes are converted to base64
 	{Input: [][]interface{}{{[]byte("hello")}}, Output: "base64:aGVsbG8=\n"},
@@ -98,11 +101,14 @@ var writeAnyTests = []struct {
 		Output: "1,\" 2\",4.5,abc\n"},
 
 	// Ints, maps and strings.
-	{Input: [][]interface{}{{1, map[string]interface{}{
-		"foo": "bar",
-	}, "hello"}},
+	{Input: [][]interface{}{{1, ordereddict.NewDict().Set("foo", "bar"), "hello"}},
 		Output: "1,\"{\n \"\"foo\"\": \"\"bar\"\"\n}\",hello\n",
 	},
+
+	// OSPath is encoded correctly.
+	{Input: [][]interface{}{{accessors.MustNewGenericOSPath("/bin/ls")}},
+		TestEncodeOnly: true,
+		Output:         "/bin/ls\n"},
 }
 
 func TestWriteAny(t *testing.T) {
@@ -124,9 +130,15 @@ func TestWriteAny(t *testing.T) {
 			t.Errorf("#%d: out=%q want %q", n, out, tt.Output)
 		}
 
+		if tt.TestEncodeOnly {
+			continue
+		}
+
 		rows := [][]interface{}{}
 
-		r := NewReader(strings.NewReader(out))
+		r, err := NewReader(strings.NewReader(out))
+		assert.NoError(t, err)
+
 		for {
 			row, err := r.ReadAny()
 			if err != nil {

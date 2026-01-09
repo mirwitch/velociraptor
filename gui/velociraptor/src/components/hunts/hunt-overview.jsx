@@ -6,20 +6,19 @@ import _ from 'lodash';
 import VeloTimestamp from "../utils/time.jsx";
 import VeloValueRenderer from "../utils/value.jsx";
 import ArtifactLink from '../artifacts/artifacts-link.jsx';
-import CardDeck from 'react-bootstrap/CardDeck';
+import Row from 'react-bootstrap/Row';
+import Col from 'react-bootstrap/Col';
 import Card from 'react-bootstrap/Card';
 import Dropdown from 'react-bootstrap/Dropdown';
 import UserConfig from '../core/user.jsx';
 import ButtonGroup from 'react-bootstrap/ButtonGroup';
 import Button from 'react-bootstrap/Button';
-import OverlayTrigger from 'react-bootstrap/OverlayTrigger';
-import Tooltip from 'react-bootstrap/Tooltip';
 import T from '../i8n/i8n.jsx';
+import ToolTip from '../widgets/tooltip.jsx';
 
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { formatColumns } from "../core/table.jsx";
 import api from '../core/api-service.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 import { requestToParameters } from "../flows/utils.jsx";
 import AvailableDownloads from "../notebooks/downloads.jsx";
 
@@ -38,7 +37,7 @@ export default class HuntOverview extends React.Component {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
 
         // Default state of the lock is set by the user's preferences.
         let lock_password = this.context.traits &&
@@ -133,7 +132,8 @@ export default class HuntOverview extends React.Component {
         files = files || [];
 
         return (
-            <CardDeck>
+            <Row>
+              <Col sm="6">
               <Card>
                 <Card.Header>{T("Overview")}</Card.Header>
                 <Card.Body>
@@ -219,7 +219,9 @@ export default class HuntOverview extends React.Component {
                     })}
                   </dl>
                 </Card.Body>
-              </Card>
+            </Card>
+              </Col>
+              <Col sm="6">
               <Card>
                   <Card.Header>{T("Results")}</Card.Header>
                 <Card.Body>
@@ -245,14 +247,7 @@ export default class HuntOverview extends React.Component {
                              <FontAwesomeIcon icon="lock-open"/> }
                           </Button>
                           :
-                          <OverlayTrigger
-                            delay={{show: 250, hide: 400}}
-                            overlay={
-                                <Tooltip
-                                  id='download-tooltip'>
-                                  {T("Set a password in user preferences to lock the download file.")}
-                                </Tooltip>
-                            }>
+                          <ToolTip tooltip={T("Set a password in user preferences to lock the download file.")}>
                             <span className="d-inline-block">
                               <Button
                                 style={{ pointerEvents: "none"}}
@@ -261,7 +256,7 @@ export default class HuntOverview extends React.Component {
                                 <FontAwesomeIcon icon="lock-open"/>
                               </Button>
                             </span>
-                          </OverlayTrigger>
+                          </ToolTip>
                         }
                         <Dropdown>
                           <Dropdown.Toggle
@@ -299,8 +294,9 @@ export default class HuntOverview extends React.Component {
                     </dd>
                   </dl>
                 </Card.Body>
-              </Card>
-            </CardDeck>
+            </Card>
+            </Col>
+            </Row>
         );
     }
 };

@@ -18,6 +18,10 @@ export default class URLViewer extends Component {
         url: PropTypes.string,
         desc: PropTypes.string,
         safe: PropTypes.bool,
+
+        // If specified this is an intenral link - so we add org id
+        // etc.
+        internal: PropTypes.bool,
     }
 
     state = {
@@ -25,7 +29,7 @@ export default class URLViewer extends Component {
     }
 
     render() {
-        let url = this.props.url;
+        let url = this.props.url || "";
         let desc = url;
         const md_regex = url.match(/\[([^\]]+)\]\(([^)]+)\)/);
         if (md_regex) {
@@ -38,15 +42,17 @@ export default class URLViewer extends Component {
         }
 
         if (!this.props.safe) {
-        return <Button
-                   as="a"
-                   className="url-link"
-                   size="sm"
-                   variant="outline-info"
-                   href={api.href(url)} target="_blank">
-                   <FontAwesomeIcon icon="external-link-alt"/>
-                   <span className="button-label">{desc}</span>
-               </Button>;
+            return <Button
+                     as="a"
+                     className="url-link"
+                     size="sm"
+                     variant="outline-info"
+                     href={api.href(url, {}, {
+                         internal: this.props.internal,
+                     })} target="_blank">
+                     <FontAwesomeIcon icon="external-link-alt"/>
+                     <span className="button-label">{desc}</span>
+                   </Button>;
         };
 
         return <>

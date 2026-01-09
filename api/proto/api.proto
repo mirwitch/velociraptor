@@ -21,6 +21,9 @@ import "csv.proto";
 import "download.proto";
 import "completions.proto";
 import "vfs_api.proto";
+import "scheduler.proto";
+import "secrets.proto";
+import "timeline_api.proto";
 
 package proto;
 
@@ -58,6 +61,8 @@ message VFSFileBuffer {
     uint32 length = 4;
     bytes data = 5;
     repeated string components = 6;
+    string org_id = 7;
+    optional bool padding = 8;
 }
 
 
@@ -97,6 +102,10 @@ message PushEventRequest {
     int64 rows = 5;
 
     string org_id = 6;
+
+    // If false we do not write but just broadcast to all
+    // listeners. But if true we also write to the local filestore.
+    bool write = 7;
 }
 
 
@@ -118,6 +127,13 @@ service API {
         };
     }
 
+    rpc GetHuntTable(GetTableRequest) returns (GetTableResponse) {
+        option (google.api.http) = {
+            get: "/api/v1/GetHuntTable",
+        };
+    }
+
+    // Deprecated - hunts are now listed with GetHuntTable()
     rpc ListHunts(ListHuntsRequest) returns (ListHuntsResponse) {
         option (google.api.http) = {
             get: "/api/v1/ListHunts",
@@ -130,7 +146,13 @@ service API {
         };
     }
 
-    rpc ModifyHunt(Hunt) returns (google.protobuf.Empty) {
+    rpc GetHuntTags(google.protobuf.Empty) returns (HuntTags) {
+        option (google.api.http) = {
+            get: "/api/v1/GetHuntTags",
+        };
+    }
+
+    rpc ModifyHunt(HuntMutation) returns (google.protobuf.Empty) {
         option (google.api.http) = {
             post: "/api/v1/ModifyHunt",
             body: "*"
@@ -182,22 +204,16 @@ service API {
         };
     }
 
-    rpc SetClientMetadata(ClientMetadata) returns (google.protobuf.Empty) {
+    rpc SetClientMetadata(SetClientMetadataRequest) returns (google.protobuf.Empty) {
         option (google.api.http) = {
             post: "/api/v1/SetClientMetadata",
             body: "*"
         };
     }
 
-    rpc GetClientFlows(ApiFlowRequest) returns (ApiFlowResponse) {
+    rpc GetClientFlows(GetTableRequest) returns (GetTableResponse) {
         option (google.api.http) = {
-            get: "/api/v1/GetClientFlows/{client_id}",
-            additional_bindings: {
-                custom: {
-                    kind: "HEAD",
-                    path: "/api/v1/GetClientFlows/{client_id}",
-                },
-            }
+            get: "/api/v1/GetClientFlows",
         };
     }
 
@@ -208,7 +224,7 @@ service API {
         };
     }
 
-    rpc SetGUIOptions(SetGUIOptionsRequest) returns (google.protobuf.Empty) {
+    rpc SetGUIOptions(SetGUIOptionsRequest) returns (SetGUIOptionsResponse) {
         option (google.api.http) = {
            post: "/api/v1/SetGUIOptions",
            body: "*"
@@ -301,9 +317,24 @@ service API {
         };
     }
 
+    rpc VFSDownloadFile(VFSStatDownloadRequest) returns (StartFlowResponse) {
+        option (google.api.http) = {
+            post: "/api/v1/VFSDownloadFile",
+            body: "*",
+        };
+    }
+
     rpc GetTable(GetTableRequest) returns (GetTableResponse) {
         option (google.api.http) = {
             get: "/api/v1/GetTable",
+        };
+    }
+
+    // Facilitate the HexEditor search API
+    rpc SearchFile(SearchFileRequest) returns (SearchFileResponse) {
+        option (google.api.http) = {
+            post: "/api/v1/SearchFile",
+            body: "*",
         };
     }
 
@@ -318,6 +349,13 @@ service API {
     rpc CancelFlow(ApiFlowRequest) returns (StartFlowResponse) {
         option (google.api.http) = {
             post: "/api/v1/CancelFlow",
+            body: "*"
+        };
+    }
+
+    rpc ResumeFlow(ApiFlowRequest) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            post: "/api/v1/ResumeFlow",
             body: "*"
         };
     }
@@ -362,14 +400,14 @@ service API {
         };
     }
 
-    rpc SetArtifactFile(SetArtifactRequest) returns (APIResponse) {
+    rpc SetArtifactFile(SetArtifactRequest) returns (SetArtifactResponse) {
         option (google.api.http) = {
             post: "/api/v1/SetArtifactFile",
             body: "*",
         };
     }
 
-    rpc LoadArtifactPack(VFSFileBuffer) returns (LoadArtifactPackResponse) {
+    rpc LoadArtifactPack(LoadArtifactPackRequest) returns (LoadArtifactPackResponse) {
         option (google.api.http) = {
             post: "/api/v1/LoadArtifactPack",
             body: "*",
@@ -469,6 +507,13 @@ service API {
         };
     }
 
+   rpc DeleteNotebook(NotebookMetadata) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            post: "/api/v1/DeleteNotebook",
+            body: "*",
+        };
+    }
+
     rpc NewNotebookCell(NotebookCellRequest) returns (NotebookMetadata) {
         option (google.api.http) = {
             post: "/api/v1/NewNotebookCell",
@@ -485,6 +530,13 @@ service API {
    rpc UpdateNotebookCell(NotebookCellRequest) returns (NotebookCell) {
         option (google.api.http) = {
             post: "/api/v1/UpdateNotebookCell",
+            body: "*",
+        };
+    }
+
+   rpc RevertNotebookCell(NotebookCellRequest) returns (NotebookCell) {
+        option (google.api.http) = {
+            post: "/api/v1/RevertNotebookCell",
             body: "*",
         };
     }
@@ -510,6 +562,49 @@ service API {
         };
     }
 
+    // Remove a notebook attachment.
+    rpc RemoveNotebookAttachment(NotebookFileUploadRequest) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            post: "/api/v1/RemoveNotebookAttachment",
+            body: "*",
+        };
+    }
+
+    rpc AnnotateTimeline(AnnotationRequest) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            post: "/api/v1/AnnotateTimeline",
+            body: "*",
+        };
+    }
+
+    // Secret management
+    rpc GetSecretDefinitions(google.protobuf.Empty) returns (SecretDefinitionList) {
+        option (google.api.http) = {
+            get: "/api/v1/GetSecretDefinitions",
+        };
+    }
+
+    rpc AddSecret(Secret) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            post: "/api/v1/AddSecret",
+            body: "*",
+        };
+    }
+
+    rpc ModifySecret(ModifySecretRequest) returns (google.protobuf.Empty) {
+        option (google.api.http) = {
+            post: "/api/v1/ModifySecret",
+            body: "*",
+        };
+    }
+
+    // Returns a redacted version of the secret.
+   rpc GetSecret(Secret) returns (Secret) {
+        option (google.api.http) = {
+            get: "/api/v1/GetSecret",
+        };
+    }
+
     // The below are API client methods - not available over HTTP
 
     // This can be used by API clients to fetch file content.
@@ -529,6 +624,9 @@ service API {
 
     // Push monitoring event to the server.
     rpc WriteEvent(VQLResponse) returns (google.protobuf.Empty) {}
+
+    // Scheduler endpoint for minion scheduling
+    rpc Scheduler(stream ScheduleRequest) returns (stream ScheduleResponse) {}
 
     // Remote data store access.
     rpc GetSubject(DataRequest) returns (DataResponse) {}

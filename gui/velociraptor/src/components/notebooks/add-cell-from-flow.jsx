@@ -1,17 +1,17 @@
+import _ from 'lodash';
 import React from 'react';
 import PropTypes from 'prop-types';
 
+import { SimpleFlowsList } from '../flows/flows-list.jsx';
+
 import api from '../core/api-service.jsx';
 import Modal from 'react-bootstrap/Modal';
-import BootstrapTable from 'react-bootstrap-table-next';
-import filterFactory from 'react-bootstrap-table2-filter';
+import Table from 'react-bootstrap/Table';
 import Button from 'react-bootstrap/Button';
 import VeloClientSearch from '../clients/search.jsx';
 import T from '../i8n/i8n.jsx';
 
-import { getClientColumns } from '../clients/clients-list.jsx';
-import { getFlowColumns } from '../flows/flows-list.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 
 
 export default class AddCellFromFlowDialog extends React.Component {
@@ -21,7 +21,7 @@ export default class AddCellFromFlowDialog extends React.Component {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.setSearch("all");
     }
 
@@ -42,29 +42,26 @@ export default class AddCellFromFlowDialog extends React.Component {
 
     addCellFromFlow = (flow) => {
         let client_id = flow.client_id;
-        var flow_id = flow.session_id;
-        var query = "SELECT * \nFROM source(\n";
-        var sources = flow["artifacts_with_results"] || flow["request"]["artifacts"];
+        let flow_id = flow.session_id;
+        let query = "SELECT * \nFROM source(\n";
+        let sources = flow.artifacts_with_results;
+        if (!sources) {
+            sources = flow.request && flow.request.artifacts;
+        }
+
+        if (sources.length<1) {
+            return;
+        }
+
         query += "    artifact='" + sources[0] + "',\n";
         for (var i=1; i<sources.length; i++) {
             query += "    -- artifact='" + sources[i] + "',\n";
         }
-        query += "    client_id='" + client_id + "', flow_id='" +
-            flow_id + "')\nLIMIT 50\n";
+        query += "    client_id='" + client_id + "',\n    flow_id='" +
+            flow_id + "', hunt_id='')\nLIMIT 50\n";
 
         this.props.addCell(query, "VQL");
         this.props.closeDialog();
-    }
-
-    fetchFlows = (selectedClient) => {
-        let client_id = selectedClient.client_id;
-        api.get("v1/GetClientFlows/" + client_id, {
-            count: 100,
-            offset: 0,
-        }, this.source.token).then(response=>{
-            let flows = response.data.items || [];
-            this.setState({flows: flows, selectedClient: selectedClient});
-        });
     }
 
     state = {
@@ -72,69 +69,50 @@ export default class AddCellFromFlowDialog extends React.Component {
         clients: [],
         flows: [],
         selectedClient: null,
+        selectedFlow: {},
+        query: "all",
     }
 
     renderClients() {
-        const selectRow = {
-            mode: "checkbox",
-            clickToSelect: true,
-            hideSelectColumn: true,
-            classes: "row-selected",
-            onSelect: this.fetchFlows,
-        };
+        return <>
+                 <VeloClientSearch setSearch={this.setSearch}/>
 
-        let columns = getClientColumns();
-        columns[1] = {dataField: "client_id", text: "Client ID"};
+                 <Table className="paged-table">
+                   <thead>
+                     <tr className="paged-table-header">
+                       <th>{T("Client ID")}</th>
+                       <th>{T("Hostname")}</th>
+                       <th>{T("FQDN")}</th>
+                       <th>{T("OS Version")}</th>
+                     </tr>
+                   </thead>
+                   <tbody className="fixed-table-body">
+                     {_.map(this.state.clients, (c, i)=>{
+                         return (
+                             <tr key={i}
+                                 onClick={()=>this.setState({
+                                     selectedClient: c,
+                                 })}>
+                               <td>{c && c.client_id}</td>
+                               <td>{c && c.os_info && c.os_info.hostname}</td>
+                               <td>{c && c.os_info && c.os_info.fqdn}</td>
+                               <td>{c && c.os_info && c.os_info.release}</td>
+                             </tr>);
+                     })}
+                   </tbody>
+                 </Table>
 
-        return (
-            <>
-              <VeloClientSearch setSearch={this.setSearch}/>
-              <div className="no-margins selectable">
-                <BootstrapTable
-                  hover
-                  condensed
-                  keyField="client_id"
-                  bootstrap4
-                  headerClasses="alert alert-secondary"
-                  bodyClasses="fixed-table-body"
-                  data={this.state.clients}
-                  columns={columns}
-                  filter={ filterFactory() }
-                  selectRow={ selectRow }
-                />
-              </div>
-            </>
-        );
+               </>;
     }
 
     renderFlows() {
-        const selectRow = {
-            mode: "checkbox",
-            clickToSelect: true,
-            hideSelectColumn: true,
-            classes: "row-selected",
-            onSelect: this.addCellFromFlow,
-        };
-
-        let columns = getFlowColumns(this.state.selectedClient.client_id);
-        return (
-            <>
-              <div className="no-margins selectable">
-                <BootstrapTable
-                  hover
-                  condensed
-                  keyField="session_id"
-                  bootstrap4
-                  headerClasses="alert alert-secondary"
-                  bodyClasses="fixed-table-body"
-                  data={this.state.flows}
-                  columns={columns}
-                  filter={ filterFactory() }
-                  selectRow={ selectRow }
-                />
-              </div>
-            </>
-        );
+        return <>
+                 <SimpleFlowsList
+                   selected_flow={this.state.selectedFlow}
+                   setSelectedFlow={flow=>this.addCellFromFlow(flow)}
+                   collapseToggle={()=>""}
+                   client_id={this.state.selectedClient.client_id}/>
+               </>;
     }
 
     render() {

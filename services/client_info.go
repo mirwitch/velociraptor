@@ -41,15 +41,15 @@ func GetClientInfoManager(config_obj *config_proto.Config) (ClientInfoManager, e
 
 type ClientInfo struct {
 	// The original info from disk
-	actions_proto.ClientInfo
+	*actions_proto.ClientInfo
 }
 
-func (self ClientInfo) Copy() ClientInfo {
-	copy := proto.Clone(&self.ClientInfo).(*actions_proto.ClientInfo)
-	return ClientInfo{*copy}
+func (self *ClientInfo) Copy() *ClientInfo {
+	copy := proto.Clone(self.ClientInfo).(*actions_proto.ClientInfo)
+	return &ClientInfo{ClientInfo: copy}
 }
 
-func (self ClientInfo) OS() ClientOS {
+func (self *ClientInfo) OS() ClientOS {
 	switch self.System {
 	case "windows":
 		return Windows
@@ -62,9 +62,19 @@ func (self ClientInfo) OS() ClientOS {
 }
 
 type ClientInfoManager interface {
-	// Used to set a new client record.
+	ListClients(ctx context.Context) <-chan string
+
+	// Used to set a new client record. To modify an existing record -
+	// or set a new one use Modify()
 	Set(ctx context.Context,
 		client_info *ClientInfo) error
+
+	// Modify a record or set a new one - if the record is not found,
+	// modifier will receive a nil client_info. The ClientInfoManager
+	// can not be accessed within the modifier function as it is
+	// locked for the duration of the change.
+	Modify(ctx context.Context, client_id string,
+		modifier func(client_info *ClientInfo) (new_record *ClientInfo, err error)) error
 
 	Get(ctx context.Context,
 		client_id string) (*ClientInfo, error)
@@ -101,14 +111,17 @@ type ClientInfoManager interface {
 		client_id string,
 		req *crypto_proto.VeloMessage) error
 
-	// Remove client id from the cache - this is needed when the
-	// record chages and we need to force a read from storage.
-	Flush(ctx context.Context, client_id string)
-
+	// Be able to manipulate the client and server metadata.
 	GetMetadata(ctx context.Context,
 		client_id string) (*ordereddict.Dict, error)
+
 	SetMetadata(ctx context.Context,
-		client_id string, metadata *ordereddict.Dict) error
+		client_id string, metadata *ordereddict.Dict, principal string) error
+
+	ValidateClientId(client_id string) error
+
+	DeleteClient(ctx context.Context, client_id, principal string,
+		progress chan DeleteFlowResponse, really_do_it bool) error
 }
 
 func GetHostname(

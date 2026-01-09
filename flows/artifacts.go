@@ -3,21 +3,21 @@
 // eventually be removed.
 
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package flows
 
@@ -61,7 +61,6 @@ var (
 		Help: "Total bytes of Uploaded Files.",
 	})
 
-	notModified      = errors.New("Not modified")
 	invalidSessionId = errors.New("Invalid SessionId")
 	invalidClientId  = errors.New("Invalid ClientId")
 )
@@ -96,7 +95,8 @@ type CollectionContext struct {
 	send_update bool
 }
 
-func NewCollectionContext(config_obj *config_proto.Config) *CollectionContext {
+func NewCollectionContext(
+	ctx context.Context, config_obj *config_proto.Config) *CollectionContext {
 	self := &CollectionContext{
 		ArtifactCollectorContext: flows_proto.ArtifactCollectorContext{},
 		monitoring_batch:         make(map[string]*jsonBatch),
@@ -110,7 +110,7 @@ func NewCollectionContext(config_obj *config_proto.Config) *CollectionContext {
 		defer self.mu.Unlock()
 
 		// Mark the collection as updated.
-		updateContext(config_obj, self.ClientId, self.SessionId)
+		_ = updateContext(config_obj, self.ClientId, self.SessionId)
 
 		if !self.send_update {
 			return
@@ -129,7 +129,7 @@ func NewCollectionContext(config_obj *config_proto.Config) *CollectionContext {
 
 		journal, err := services.GetJournal(config_obj)
 		if err == nil {
-			journal.PushRowsToArtifactAsync(
+			journal.PushRowsToArtifactAsync(ctx,
 				config_obj, row, "System.Flow.Completion")
 		}
 	})
@@ -226,7 +226,7 @@ func closeContext(
 	}
 
 	if len(collection_context.Logs) > 0 {
-		err := flushContextLogs(
+		err := flushContextLogs(ctx,
 			config_obj, collection_context, collection_context.completer)
 		if err != nil {
 			collection_context.State = flows_proto.ArtifactCollectorContext_ERROR
@@ -246,7 +246,7 @@ func closeContext(
 	}
 
 	if len(collection_context.monitoring_batch) > 0 {
-		err = flushMonitoringLogs(config_obj, collection_context)
+		err = flushMonitoringLogs(ctx, config_obj, collection_context)
 		if err != nil {
 			collection_context.State = flows_proto.ArtifactCollectorContext_ERROR
 			collection_context.Status = err.Error()
@@ -309,11 +309,11 @@ func flushContextUploadedFiles(
 
 // Load the collector context from storage.
 func LoadCollectionContext(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	client_id, flow_id string) (*CollectionContext, error) {
 
 	if flow_id == constants.MONITORING_WELL_KNOWN_FLOW {
-		result := NewCollectionContext(config_obj)
+		result := NewCollectionContext(ctx, config_obj)
 		result.SessionId = flow_id
 		result.ClientId = client_id
 
@@ -321,7 +321,7 @@ func LoadCollectionContext(
 	}
 
 	flow_path_manager := paths.NewFlowPathManager(client_id, flow_id)
-	collection_context := NewCollectionContext(config_obj)
+	collection_context := NewCollectionContext(ctx, config_obj)
 	db, err := datastore.GetDB(config_obj)
 	if err != nil {
 		return nil, err
@@ -344,12 +344,17 @@ func LoadCollectionContext(
 
 // Process an incoming message from the client.
 func ArtifactCollectorProcessOneMessage(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	collection_context *CollectionContext,
 	message *crypto_proto.VeloMessage) error {
 
 	if message.Status != nil {
 		return CheckForStatus(config_obj, collection_context, message)
+	}
+
+	// Ignore new style messages
+	if message.UploadTransaction != nil {
+		return nil
 	}
 
 	// Check that this is not a retransmission - if it is we drop
@@ -366,7 +371,7 @@ func ArtifactCollectorProcessOneMessage(
 	// Handle the response depending on the RequestId
 	switch message.RequestId {
 	case constants.TransferWellKnownFlowId:
-		return appendUploadDataToFile(
+		return appendUploadDataToFile(ctx,
 			config_obj, collection_context, message)
 
 	case constants.ProcessVQLResponses:
@@ -387,7 +392,7 @@ func ArtifactCollectorProcessOneMessage(
 		rows_written := uint64(0)
 		if response.Query.Name != "" {
 			path_manager, err := artifact_paths.NewArtifactPathManager(
-				config_obj,
+				ctx, config_obj,
 				collection_context.Request.ClientId,
 				collection_context.SessionId,
 				response.Query.Name)
@@ -484,7 +489,7 @@ func CheckForStatus(
 }
 
 func appendUploadDataToFile(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	collection_context *CollectionContext,
 	message *crypto_proto.VeloMessage) error {
 
@@ -501,7 +506,8 @@ func appendUploadDataToFile(
 	// Figure out where to store the file.
 	file_path_manager := flow_path_manager.GetUploadsFile(
 		file_buffer.Pathspec.Accessor,
-		file_buffer.Pathspec.Path)
+		file_buffer.Pathspec.Path,
+		file_buffer.Pathspec.Components)
 
 	fd, err := file_store_factory.WriteFile(file_path_manager.Path())
 	if err != nil {
@@ -606,7 +612,7 @@ func appendUploadDataToFile(
 			return err
 		}
 
-		return journal.PushRowsToArtifact(config_obj,
+		return journal.PushRowsToArtifact(ctx, config_obj,
 			[]*ordereddict.Dict{row},
 			"System.Upload.Completion",
 			message.Source, collection_context.SessionId,
@@ -722,7 +728,7 @@ func (self *FlowRunner) ProcessSingleMessage(
 			return invalidClientId
 		}
 
-		collection_context, err = LoadCollectionContext(
+		collection_context, err = LoadCollectionContext(ctx,
 			self.config_obj, job.Source, job.SessionId)
 		if err != nil {
 			// Ignore logs and status messages from the
@@ -732,7 +738,7 @@ func (self *FlowRunner) ProcessSingleMessage(
 				return nil
 			}
 
-			logger.Error(fmt.Sprintf("Unable to load flow %s: %v", job.SessionId, err))
+			logger.Error("Unable to load flow %s: %v", job.SessionId, err)
 
 			client_manager, err := services.GetClientInfoManager(self.config_obj)
 			if err != nil {
@@ -769,7 +775,8 @@ func (self *FlowRunner) ProcessSingleMessage(
 	}
 
 	if job.SessionId == constants.MONITORING_WELL_KNOWN_FLOW {
-		err := MonitoringProcessMessage(self.config_obj, collection_context, job)
+		err := MonitoringProcessMessage(
+			ctx, self.config_obj, collection_context, job)
 		if err != nil {
 			Log(self.config_obj, collection_context,
 				fmt.Sprintf("MonitoringProcessMessage: %v", err))
@@ -777,7 +784,7 @@ func (self *FlowRunner) ProcessSingleMessage(
 		return err
 	}
 
-	err := ArtifactCollectorProcessOneMessage(
+	err := ArtifactCollectorProcessOneMessage(ctx,
 		self.config_obj, collection_context, job)
 	if err != nil {
 		Log(self.config_obj, collection_context,

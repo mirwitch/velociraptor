@@ -2,12 +2,14 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/json"
+	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -72,7 +74,9 @@ func applyMergesAndPatches(
 
 		patched, err := patch.Apply(serialized)
 		if err != nil {
-			return fmt.Errorf("Unable to apply JSON patch: %w", err)
+			logger := logging.GetLogger(config_obj, &logging.ToolComponent)
+			logger.Info("Patch failed to apply: %v", err)
+			continue
 		}
 
 		err = json.Unmarshal(patched, &config_obj)
@@ -88,7 +92,7 @@ func applyMergesAndPatches(
 func getMergePatches(merge_file *os.File, merges []string) ([][]byte, error) {
 	result := make([][]byte, 0)
 	if merge_file != nil {
-		data, err := ioutil.ReadAll(merge_file)
+		data, err := utils.ReadAllWithLimit(merge_file, constants.MAX_MEMORY)
 		if err != nil {
 			return nil, err
 		}
@@ -104,8 +108,8 @@ func getMergePatches(merge_file *os.File, merges []string) ([][]byte, error) {
 
 func getJsonPatches(patch_file *os.File, patches []string) ([]jsonpatch.Patch, error) {
 	result := make([]jsonpatch.Patch, 0)
-	if *config_generate_command_patch_file != nil {
-		data, err := ioutil.ReadAll(patch_file)
+	if patch_file != nil {
+		data, err := utils.ReadAllWithLimit(patch_file, constants.MAX_MEMORY)
 		if err != nil {
 			return nil, fmt.Errorf("Reading patch file: %w", err)
 		}

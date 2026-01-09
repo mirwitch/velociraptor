@@ -6,15 +6,16 @@ import (
 	"github.com/Velocidex/ordereddict"
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type PatchFunctionArgs struct {
-	Item  vfilter.Any `vfilter:"required,field=item,doc=The item to path"`
-	Patch vfilter.Any `vfilter:"optional,field=patch,doc=A JSON Patch to apply"`
-	Merge vfilter.Any `vfilter:"optional,field=merge,doc=A merge-patch to apply"`
+	Item  vfilter.Any `vfilter:"required,field=item,doc=The item to patch"`
+	Patch vfilter.Any `vfilter:"optional,field=patch,doc=A JSON patch to apply"`
+	Merge vfilter.Any `vfilter:"optional,field=merge,doc=A merge patch to apply"`
 }
 
 type PatchFunction struct{}
@@ -22,7 +23,7 @@ type PatchFunction struct{}
 func (self PatchFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "patch",
-		Doc:     "Patch a JSON object with a json patch.",
+		Doc:     "Patch a JSON object with a JSON patch.",
 		ArgType: type_map.AddType(scope, PatchFunctionArgs{}),
 	}
 }
@@ -45,6 +46,9 @@ func (self *PatchFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 	arg := &PatchFunctionArgs{}
+
+	defer vql_subsystem.RegisterMonitor(ctx, "patch", args)()
+
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
 		scope.Log("patch: %s", err.Error())
@@ -100,8 +104,7 @@ func (self *PatchFunction) Call(
 		return vfilter.Null{}
 	}
 
-	item := ordereddict.NewDict()
-	err = json.Unmarshal(patched, &item)
+	item, err := utils.ParseJsonToObject(patched)
 	if err != nil {
 		scope.Log("patch: %v", err)
 		return vfilter.Null{}

@@ -4,7 +4,7 @@ import T from '../i8n/i8n.jsx';
 import _ from 'lodash';
 
 import api from '../core/api-service.jsx';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 import CreatableSelect from 'react-select/creatable';
 
 
@@ -15,7 +15,7 @@ export default class LabelForm extends React.Component {
     };
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         this.loadLabels();
     }
 
@@ -61,7 +61,7 @@ export default class LabelForm extends React.Component {
                 classNamePrefix="velo"
                 options={this.state.options}
                 onChange={this.handleChange}
-                placeholder={T("Select a label")}
+                placeholder={T("Select a label or type to create new label.")}
               />
             </>
         );

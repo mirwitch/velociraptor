@@ -3,7 +3,7 @@ import PropTypes from 'prop-types';
 
 import _ from 'lodash';
 import Modal from 'react-bootstrap/Modal';
-import axios from 'axios';
+import {CancelToken} from 'axios';
 import StepWizard from 'react-step-wizard';
 import T from '../i8n/i8n.jsx';
 
@@ -11,12 +11,14 @@ import Form from 'react-bootstrap/Form';
 import Col from 'react-bootstrap/Col';
 import Row from 'react-bootstrap/Row';
 import { HotKeys, ObserveKeys } from "react-hotkeys";
-import DateTimePicker from 'react-datetime-picker';
+import DateTimePicker from '../widgets/datetime.jsx';
 import EstimateHunt from './estimate.jsx';
 import LabelForm from '../utils/labels.jsx';
 import api from '../core/api-service.jsx';
 import NewCollectionConfigParameters from '../flows/new-collections-parameters.jsx';
 import { OrgSelectorForm } from './orgs.jsx';
+
+import CreatableSelect from 'react-select/creatable';
 
 import {
     NewCollectionSelectArtifacts,
@@ -26,7 +28,12 @@ import {
     PaginationBuilder
 } from '../flows/new-collection.jsx';
 
+import { FormatRFC3339, ToStandardTime } from '../utils/time.jsx';
+
 import UserConfig from '../core/user.jsx';
+
+const hour = 60 * 60 * 1000;
+
 
 // The hunt wizard is built upon the new collection wizard with some extra steps.
 class HuntPaginator extends PaginationBuilder {
@@ -49,10 +56,43 @@ class NewHuntConfigureHunt extends React.Component {
         this.props.setHuntParameters(this.props.parameters);
     }
 
+    componentDidMount = () => {
+        this.source = CancelToken.source();
+        this.getTags();
+    }
+
+    componentWillUnmount() {
+        this.source.cancel("unmounted");
+    }
+
+    state = {
+        tags: [],
+    }
+
+    getTags = ()=>{
+        api.get("v1/GetHuntTags", {}, this.source.token).then(response=>{
+                if (response && response.data &&
+                    response.data.tags && response.data.tags.length) {
+                    this.setState({tags: response.data.tags});
+                };
+        });
+    }
+
     render() {
         let is_admin = this.context.traits &&
             this.context.traits.Permissions &&
             this.context.traits.Permissions.server_admin;
+
+        let is_start_hunt = this.context.traits &&
+            this.context.traits.Permissions &&
+            this.context.traits.Permissions.start_hunt;
+
+        let options = _.map(this.state.tags, x=>{
+            return {value: x, label: x, isFixed: true, color: "#00B8D9"};
+        });
+
+        let tag_defaults = _.map(this.props.parameters.tags,
+                             x=>{return {value: x, label: x};});
 
         return (
             <>
@@ -62,7 +102,25 @@ class NewHuntConfigureHunt extends React.Component {
               <Modal.Body>
                 <Form>
                   <Form.Group as={Row}>
-                    <Form.Label column sm="3">Description</Form.Label>
+                    <Form.Label column sm="3">{T("Tags")}</Form.Label>
+                    <Col sm="8">
+                      <CreatableSelect
+                        isMulti
+                        isClearable
+                        className="labels"
+                        classNamePrefix="velo"
+                        options={options}
+                        onChange={(e)=>{
+                            this.setParam("tags", _.map(e, x=>x.value));
+                        }}
+                        placeholder={T("Hunt Tags (Type to create new Tag)")}
+                        spellCheck="false"
+                        defaultValue={tag_defaults}
+                      />
+                    </Col>
+                  </Form.Group>
+                  <Form.Group as={Row}>
+                    <Form.Label column sm="3">{T("Description")}</Form.Label>
                     <Col sm="8">
                       <Form.Control as="textarea" rows={3}
                                     id="hunt-description-text"
@@ -77,7 +135,15 @@ class NewHuntConfigureHunt extends React.Component {
                     <Form.Label column sm="3">{T("Expiry")}</Form.Label>
                     <Col sm="8">
                       <DateTimePicker value={this.props.parameters.expires}
-                                      onChange={(value) => this.setParam("expires", value)}
+                                      onChange={(value)=>{
+                                          let ts = ToStandardTime(value);
+                                          let now = new Date();
+                                          if (ts < now) {
+                                              api.error(T("Expiry time is in the past"));
+                                              return;
+                                          }
+                                          this.setParam("expires", value);
+                                      }}
                       />
                     </Col>
                   </Form.Group>
@@ -109,6 +175,7 @@ class NewHuntConfigureHunt extends React.Component {
                           <option label="Windows" value="WINDOWS">Windows</option>
                           <option label="Linux" value="LINUX">LINUX</option>
                           <option label="MacOS" value="OSX">OSX</option>
+                          <option label="MacOSArm" value="OSX">OSX Arm</option>
                         </Form.Control>
                       </Col>
                     </Form.Group>
@@ -152,22 +219,23 @@ class NewHuntConfigureHunt extends React.Component {
                     </Form.Group>
                   }
 
-                  <OrgSelectorForm
-                    value={this.props.parameters.org_ids}
-                    onChange={(value) => this.setParam("org_ids", value)} />
-
                   { is_admin &&
-                    <Form.Group as={Row}>
-                      <Form.Label column sm="3">{T("Hunt State")}</Form.Label>
-                      <Col sm="8">
-                        <Form.Check
-                          value={this.props.parameters.force_start}
-                          label={T("Start Hunt Immediately")}
-                          onChange={e=>this.setParam(
-                              "force_start", !this.props.parameters.force_start)}
-                        />
-                      </Col>
-                    </Form.Group>
+                      <OrgSelectorForm
+                        value={this.props.parameters.org_ids}
+                        onChange={(value) => this.setParam("org_ids", value)} />
+                  }
+                  { is_start_hunt &&
+                      <Form.Group as={Row}>
+                        <Form.Label column sm="3">{T("Hunt State")}</Form.Label>
+                        <Col sm="8">
+                          <Form.Check
+                            value={this.props.parameters.force_start}
+                            label={T("Start Hunt Immediately")}
+                            onChange={e=>this.setParam(
+                                "force_start", !this.props.parameters.force_start)}
+                          />
+                        </Col>
+                      </Form.Group>
                   }
                   <EstimateHunt
                     params={this.props.parameters}/>
@@ -187,6 +255,7 @@ class NewHuntConfigureHunt extends React.Component {
 
 
 export default class NewHuntWizard extends React.Component {
+    static contextType = UserConfig;
 
     static propTypes = {
         baseHunt: PropTypes.object,
@@ -204,6 +273,7 @@ export default class NewHuntWizard extends React.Component {
         resources: {},
 
         hunt_parameters: {
+            tags: [],
             include_condition: "",
             include_labels: [],
             include_os: "ALL", // Default selector
@@ -213,7 +283,7 @@ export default class NewHuntWizard extends React.Component {
     }
 
     componentDidMount = () => {
-        this.source = axios.CancelToken.source();
+        this.source = CancelToken.source();
         let state = this.setStateFromBase(this.props.baseHunt || {});
         this.setState(state);
 
@@ -249,7 +319,15 @@ export default class NewHuntWizard extends React.Component {
     setStateFromBase = (hunt) => {
         let request = hunt && hunt.start_request;
         let expiry = new Date();
-        expiry.setTime(expiry.getTime() + 7 * 24 * 60 * 60 * 1000);
+        let timezone = this.context.traits.timezone || "UTC";
+        let hunt_expiry_hours = this.context.traits && this.context.traits.customizations &&
+            this.context.traits.customizations.hunt_expiry_hours;
+        if (!hunt_expiry_hours) {
+            hunt_expiry_hours = 7 * 24;
+        };
+
+        // Calcuate the default expiry to 1 week from now.
+        expiry.setTime(expiry.getTime() + hunt_expiry_hours * hour);
 
         if (request) {
             let state = {
@@ -284,8 +362,15 @@ export default class NewHuntWizard extends React.Component {
                 state.hunt_parameters.excluded_labels = excluded;
             }
             state.hunt_parameters.description = hunt.hunt_description;
-            state.hunt_parameters.expires = expiry;
+            state.hunt_parameters.tags = hunt.tags || [];
+            state.hunt_parameters.expires = FormatRFC3339(expiry, timezone);
             state.hunt_parameters.org_ids = hunt.org_ids || [];
+
+            if (_.isEmpty(request.artifacts)) {
+                this.setState({artifacts:[]});
+                return state;
+            }
+
 
             // Resolve the artifacts from the request into a list of descriptors.
             api.post("v1/GetArtifacts", {
@@ -330,7 +415,7 @@ export default class NewHuntWizard extends React.Component {
         };
 
         let state = this.state;
-        state.hunt_parameters.expires = expiry;
+        state.hunt_parameters.expires = FormatRFC3339(expiry, timezone);
         return state;
     }
 
@@ -386,7 +471,12 @@ export default class NewHuntWizard extends React.Component {
 
         let hunt_parameters = this.state.hunt_parameters;
         if (hunt_parameters.expires) {
-            result.expires = hunt_parameters.expires.getTime() * 1000;
+            // hunt_parameters.expires is an RFC3339 string but we
+            // expect microseconds here.
+            let ts = ToStandardTime(hunt_parameters.expires);
+            if (_.isDate(ts)) {
+                result.expires = ts.getTime() * 1000;
+            }
         }
 
         if (hunt_parameters.include_condition === "labels") {
@@ -403,6 +493,10 @@ export default class NewHuntWizard extends React.Component {
 
         if (hunt_parameters.description) {
             result.hunt_description = hunt_parameters.description;
+        }
+
+        if (hunt_parameters.tags) {
+            result.tags = hunt_parameters.tags;
         }
 
         if (hunt_parameters.org_ids) {

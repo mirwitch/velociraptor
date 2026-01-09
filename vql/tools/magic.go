@@ -1,3 +1,4 @@
+//go:build cgo
 // +build cgo
 
 package tools
@@ -10,6 +11,8 @@ import (
 	"github.com/Velocidex/go-magic/magic_files"
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -33,6 +36,8 @@ func (self MagicFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
+	defer vql_subsystem.RegisterMonitor(ctx, "magic", args)()
+
 	arg := &MagicFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -40,7 +45,7 @@ func (self MagicFunction) Call(
 		return vfilter.Null{}
 	}
 
-	magic_type := magic.MAGIC_NONE
+	var magic_type int
 	switch arg.Type {
 	case "mime":
 		magic_type = magic.MAGIC_MIME
@@ -65,7 +70,11 @@ func (self MagicFunction) Call(
 
 	case nil:
 		handle = magic.NewMagicHandle(magic_type)
-		magic_files.LoadDefaultMagic(handle)
+		err := magic_files.LoadDefaultMagic(handle)
+		if err != nil {
+			scope.Log("magic:  %v", err)
+			return vfilter.Null{}
+		}
 
 		// Do we need to load additional magic tests?
 		if arg.Magic != "" {
@@ -77,8 +86,13 @@ func (self MagicFunction) Call(
 		}
 
 		// Attach the handle to the root destructor.
-		vql_subsystem.GetRootScope(scope).
-			AddDestructor(func() { handle.Close() })
+		err = vql_subsystem.GetRootScope(scope).AddDestructor(func() {
+			handle.Close()
+		})
+		if err != nil {
+			scope.Log("magic:  %v", err)
+		}
+
 		vql_subsystem.CacheSet(scope, key, handle)
 
 	case *magic.Magic:
@@ -91,13 +105,12 @@ func (self MagicFunction) Call(
 
 	// Just let libmagic handle the path
 	if arg.Accessor == "" {
-		return handle.File(arg.Path.String())
-	}
-
-	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
-	if err != nil {
-		scope.Log("magic: %v", err)
-		return vfilter.Null{}
+		magic, err := handle.File(arg.Path.String())
+		if err != nil {
+			scope.Log("magic: %v", err)
+			return vfilter.Null{}
+		}
+		return magic
 	}
 
 	// Read a header from the file and pass to the libmagic
@@ -123,10 +136,11 @@ func (self MagicFunction) Call(
 
 func (self MagicFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "magic",
-		Doc:     "Identify a file using magic rules.",
-		ArgType: type_map.AddType(scope, &MagicFunctionArgs{}),
-		Version: 1,
+		Name:     "magic",
+		Doc:      "Identify a file using magic rules.",
+		ArgType:  type_map.AddType(scope, &MagicFunctionArgs{}),
+		Version:  1,
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

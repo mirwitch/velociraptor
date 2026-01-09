@@ -5,12 +5,12 @@
 package flows
 
 import (
+	"context"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Velocidex/ordereddict"
 	artifacts "www.velocidex.com/golang/velociraptor/artifacts"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	constants "www.velocidex.com/golang/velociraptor/constants"
@@ -72,7 +72,8 @@ func writeLogMessages(
 	}
 	defer rs_writer.Close()
 
-	rs_writer.SetStartRow(int64(msg.Id))
+	// Always write the log messages even if they are retransmitted.
+	_ = rs_writer.SetStartRow(int64(msg.Id))
 
 	// The JSON payload from the client.
 	payload := artifacts.DeobfuscateString(config_obj, msg.Jsonl)
@@ -98,8 +99,7 @@ func writeLogMessages(
 			getLogErrorRegex(config_obj).FindStringIndex(payload) != nil {
 			for _, line := range strings.Split(payload, "\n") {
 				if getLogErrorRegex(config_obj).FindStringIndex(line) != nil {
-					msg := ordereddict.NewDict()
-					err := json.Unmarshal([]byte(line), msg)
+					msg, err := utils.ParseJsonToObject([]byte(line))
 					if err == nil {
 						error_message, _ = msg.GetString("message")
 					}
@@ -121,13 +121,13 @@ func writeLogMessages(
 // Flush the logs to disk. During execution the flow collects the logs
 // in memory and then flushes it all when done.
 func flushContextLogs(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	collection_context *CollectionContext,
 	completion *utils.Completer) error {
 
 	// Handle monitoring flow specially.
 	if collection_context.SessionId == constants.MONITORING_WELL_KNOWN_FLOW {
-		return flushContextLogsMonitoring(config_obj, collection_context)
+		return flushContextLogsMonitoring(ctx, config_obj, collection_context)
 	}
 
 	flow_path_manager := paths.NewFlowPathManager(

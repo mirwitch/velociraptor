@@ -4,29 +4,58 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 
 	"github.com/Velocidex/ordereddict"
 
 	"www.velocidex.com/golang/velociraptor/accessors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/vfilter/types"
 )
 
 // Process a "mount" type remapping directive.
 // Example:
 //
+//  remapping:
 //  - type: mount
 //    from:
 //      accessor: file
-//      prefix: /shared/deaddisk/c/
+//      prefix: /mnt/data
 //    on:
 //      accessor: file
 //      prefix: C:\
 //
-// This reads like "mount directory from file:/mnt/data on file:/
+// This reads like "mount directory from file:/mnt/data on file:/C:
 // Means when VQL opens a path using accessor "file" in all paths
-// below "/", the "file" accessor will be used on "/mnt/data" instead.
+// below "C:/", the "file" accessor will be used on "/mnt/data"
+// instead.
+//
+// You can also preconfigure the scope that will be used with the
+// mounted accessor. This is needed for some accessors which look to
+// the scope to configure them - for example the `ssh` accessor can be
+// used with the following remapping file:
+//
+//remappings:
+//- type: permissions
+//  permissions:
+//  - FILESYSTEM_READ
+//
+//- "type": mount
+//  scope: |
+//    LET SSH_CONFIG <= dict(hostname='localhost:22',
+//      username='user',
+//      private_key=read_file(filename='/home/user/.ssh/id_rsa'))
+//
+//  "from":
+//    accessor: ssh
+//    prefix: /
+//  "on":
+//    accessor: auto
+//    prefix: /
+
 func InstallMountPoints(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	pristine_scope vfilter.Scope,
 	manager accessors.DeviceManager,
@@ -63,9 +92,16 @@ func InstallMountPoints(
 			from_accessor = "file"
 		}
 
+		// Evaluate VQL on pristine scope to prepare for accessor
+		// configuration.
+		evaluated_scope, err := evaluateScopeQuery(ctx,
+			pristine_scope, remapping.Scope)
+		if err != nil {
+			return err
+		}
+
 		from_fs, err := accessors.GetDefaultDeviceManager(
-			config_obj).GetAccessor(
-			from_accessor, pristine_scope)
+			config_obj).GetAccessor(from_accessor, evaluated_scope)
 		if err != nil {
 			return err
 		}
@@ -89,8 +125,11 @@ func InstallMountPoints(
 	}
 
 	// Register the new accessor.
-	manager.Register(on_accessor, mount_fs,
-		fmt.Sprintf("Remapping %v", remappings))
+	manager.Register(accessors.DescribeAccessor(
+		mount_fs, accessors.AccessorDescriptor{
+			Name:        on_accessor,
+			Description: fmt.Sprintf("Remapping %v", remappings),
+		}))
 
 	return nil
 }
@@ -111,6 +150,9 @@ func getTypedOSPath(path_type string, path string) (*accessors.OSPath, error) {
 
 	case "ntfs":
 		return accessors.NewWindowsNTFSPath(path)
+
+	case "zip":
+		return accessors.NewZipFilePath(path)
 
 	default:
 		return accessors.NewGenericOSPath(path)
@@ -152,7 +194,11 @@ func ApplyRemappingOnScope(
 			}
 
 			// Install on top of the manager
-			manager.Register(remapping.On.Accessor, to_fs, "Shadowed")
+			manager.Register(accessors.DescribeAccessor(
+				to_fs, accessors.AccessorDescriptor{
+					Name:        remapping.On.Accessor,
+					Description: "Shadowed",
+				}))
 
 		case "mount":
 			if remapping.From == nil || remapping.On == nil {
@@ -169,7 +215,7 @@ func ApplyRemappingOnScope(
 
 		case "impersonation":
 			remapped_scope.AppendPlugins(NewMockerPlugin(
-				"info", []*ordereddict.Dict{
+				"info", []types.Any{
 					ordereddict.NewDict().
 						Set("Hostname", remapping.Hostname).
 						Set("Fqdn", remapping.Hostname).
@@ -185,6 +231,7 @@ func ApplyRemappingOnScope(
 						Set("VirtualizationRole", "").
 						Set("HostID", "").
 						Set("Exe", "").
+						Set("Architecture", runtime.GOARCH).
 						Set("IsAdmin", true),
 				}))
 			disablePlugins(remapped_scope, remapping)
@@ -195,7 +242,7 @@ func ApplyRemappingOnScope(
 	}
 
 	for to_accessor, remappings := range mounts {
-		err := InstallMountPoints(config_obj, pristine_scope,
+		err := InstallMountPoints(ctx, config_obj, pristine_scope,
 			manager, remappings, to_accessor)
 		if err != nil {
 			return err
@@ -205,4 +252,30 @@ func ApplyRemappingOnScope(
 	installExpandMock(pristine_scope, remappings)
 
 	return nil
+}
+
+func evaluateScopeQuery(
+	ctx context.Context, scope vfilter.Scope, query string) (vfilter.Scope, error) {
+	if query == "" {
+		return scope, nil
+	}
+
+	sub_scope := scope.Copy()
+
+	vqls, err := vfilter.MultiParse(query)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"While evaluating remapping scope: %w", err)
+	}
+
+	for _, vql := range vqls {
+		if vql.Let == "" {
+			return nil, fmt.Errorf(
+				"While evaluating remapping scope: Only LET statements allowed in this context")
+		}
+		for _ = range vql.Eval(ctx, sub_scope) {
+		}
+	}
+
+	return sub_scope, nil
 }

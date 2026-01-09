@@ -15,11 +15,13 @@ import (
 	"sync"
 
 	"github.com/Velocidex/ordereddict"
+	"github.com/alitto/pond/v2"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
@@ -28,6 +30,8 @@ import (
 
 var (
 	notInitializedError = errors.New("Not initialized")
+
+	PushRowsToArtifactAsyncIsSynchrnous = false
 )
 
 type JournalService struct {
@@ -39,18 +43,18 @@ type JournalService struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
 
-	Clock utils.Clock
+	pool pond.Pool
 }
 
 func (self *JournalService) GetWatchers() []string {
 	return self.qm.GetWatchers()
 }
 
-func (self *JournalService) publishWatchers() {
-	self.PushRowsToArtifact(self.config_obj,
+func (self *JournalService) publishWatchers(ctx context.Context) {
+	_ = self.PushRowsToInternalEventArtifact(ctx, self.config_obj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("Events", self.GetWatchers())},
-		"Server.Internal.MasterRegistrations", "server", "")
+		"Server.Internal.MasterRegistrations")
 }
 
 func (self *JournalService) Watch(
@@ -62,20 +66,27 @@ func (self *JournalService) Watch(
 		return nil, func() {}
 	}
 
+	disable_file_buffering := false
+	if self.config_obj.Frontend != nil &&
+		self.config_obj.Frontend.Resources != nil {
+		disable_file_buffering = self.config_obj.Frontend.Resources.DisableFileBuffering
+	}
+
 	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 	logger.Info("%s: Watching for events from %v", watcher_name, queue_name)
 	res, cancel := self.qm.Watch(ctx, queue_name, &api.QueueOptions{
-		OwnerName: watcher_name,
+		OwnerName:            watcher_name,
+		DisableFileBuffering: disable_file_buffering,
 	})
 
 	// Advertise new watchers
-	self.publishWatchers()
+	self.publishWatchers(ctx)
 
 	return res, func() {
 		cancel()
 
 		// Advertise that a watcher was removed.
-		self.publishWatchers()
+		self.publishWatchers(ctx)
 	}
 }
 
@@ -86,7 +97,8 @@ func (self *JournalService) Watch(
 func (self *JournalService) AppendToResultSet(
 	config_obj *config_proto.Config,
 	path api.FSPathSpec,
-	rows []*ordereddict.Dict) error {
+	rows []*ordereddict.Dict,
+	options services.JournalOptions) error {
 
 	// Key a lock to manage access to this file.
 	self.mu.Lock()
@@ -104,9 +116,14 @@ func (self *JournalService) AppendToResultSet(
 
 	file_store_factory := file_store.GetFileStore(config_obj)
 
+	sync := utils.BackgroundWriter
+	if options.Sync {
+		sync = utils.SyncCompleter
+	}
+
 	// Append the data to the end of the file.
 	rs_writer, err := result_sets.NewResultSetWriter(file_store_factory,
-		path, json.DefaultEncOpts(), utils.BackgroundWriter, result_sets.AppendMode)
+		path, json.DefaultEncOpts(), sync, result_sets.AppendMode)
 	if err != nil {
 		return err
 	}
@@ -154,27 +171,38 @@ func (self *JournalService) AppendJsonlToResultSet(
 }
 
 func (self *JournalService) PushRowsToArtifactAsync(
-	config_obj *config_proto.Config, row *ordereddict.Dict,
+	ctx context.Context, config_obj *config_proto.Config, row *ordereddict.Dict,
 	artifact string) {
 
-	go func() {
-		err := self.PushRowsToArtifact(config_obj, []*ordereddict.Dict{row},
+	f := func() {
+		err := self.PushRowsToArtifact(ctx, config_obj, []*ordereddict.Dict{row},
 			artifact, "server", "")
 		if err != nil {
 			logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 			logger.Error("<red>PushRowsToArtifactAsync</> %v", err)
 		}
-	}()
+	}
+
+	// If the pool is full, run this synchronously. This is necessary
+	// to prevent deadlocks because some of the tasks may also call
+	// the journal service to write asynchronously which they can not
+	// do when taking up a pool slot.
+	if self.pool.WaitingTasks() > 0 || PushRowsToArtifactAsyncIsSynchrnous {
+		f()
+		return
+	}
+
+	self.pool.Submit(f)
 }
 
 func (self *JournalService) Broadcast(
-	config_obj *config_proto.Config, rows []*ordereddict.Dict,
-	artifact, client_id, flows_id string) error {
+	ctx context.Context, config_obj *config_proto.Config,
+	rows []*ordereddict.Dict, artifact, client_id, flows_id string) error {
 	if self == nil || self.qm == nil {
 		return notInitializedError
 	}
 
-	path_manager, err := artifacts.NewArtifactPathManager(
+	path_manager, err := artifacts.NewArtifactPathManager(ctx,
 		config_obj, client_id, flows_id, artifact)
 	if err != nil {
 		return err
@@ -185,15 +213,14 @@ func (self *JournalService) Broadcast(
 }
 
 func (self *JournalService) PushJsonlToArtifact(
-	config_obj *config_proto.Config, jsonl []byte, row_count int,
-	artifact, client_id, flows_id string) error {
+	ctx context.Context, config_obj *config_proto.Config,
+	jsonl []byte, row_count int, artifact, client_id, flows_id string) error {
 
-	path_manager, err := artifacts.NewArtifactPathManager(
+	path_manager, err := artifacts.NewArtifactPathManager(ctx,
 		config_obj, client_id, flows_id, artifact)
 	if err != nil {
 		return err
 	}
-	path_manager.Clock = self.Clock
 
 	// Just a regular artifact, append to the existing result set.
 	if !path_manager.IsEvent() {
@@ -213,15 +240,14 @@ func (self *JournalService) PushJsonlToArtifact(
 }
 
 func (self *JournalService) PushRowsToArtifact(
-	config_obj *config_proto.Config, rows []*ordereddict.Dict,
-	artifact, client_id, flows_id string) error {
+	ctx context.Context, config_obj *config_proto.Config,
+	rows []*ordereddict.Dict, artifact, client_id, flows_id string) error {
 
-	path_manager, err := artifacts.NewArtifactPathManager(
+	path_manager, err := artifacts.NewArtifactPathManager(ctx,
 		config_obj, client_id, flows_id, artifact)
 	if err != nil {
 		return err
 	}
-	path_manager.Clock = self.Clock
 
 	// Just a regular artifact, append to the existing result set.
 	if !path_manager.IsEvent() {
@@ -229,7 +255,8 @@ func (self *JournalService) PushRowsToArtifact(
 		if err != nil {
 			return err
 		}
-		return self.AppendToResultSet(config_obj, path, rows)
+		return self.AppendToResultSet(config_obj, path, rows,
+			services.JournalOptions{})
 	}
 
 	// The Queue manager will manage writing event artifacts to a
@@ -240,9 +267,16 @@ func (self *JournalService) PushRowsToArtifact(
 	return errors.New("Filestore not initialized")
 }
 
-func (self *JournalService) SetClock(clock utils.Clock) {
-	self.Clock = clock
-	self.qm.SetClock(clock)
+func (self *JournalService) PushRowsToInternalEventArtifact(
+	ctx context.Context, config_obj *config_proto.Config,
+	rows []*ordereddict.Dict, artifact string) error {
+
+	path_manager := artifacts.NewArtifactPathManagerWithMode(
+		config_obj, "server", "F.Monitoring", artifact, paths.INTERNAL)
+	if self != nil && self.qm != nil {
+		return self.qm.PushEventRows(path_manager, rows)
+	}
+	return nil
 }
 
 func (self *JournalService) Start(config_obj *config_proto.Config) error {
@@ -268,12 +302,11 @@ func NewJournalService(
 	service := &JournalService{
 		config_obj: config_obj,
 		locks:      make(map[string]*sync.Mutex),
-		Clock:      utils.RealClock{},
+		pool:       pond.NewPool(100),
 	}
 
 	qm, err := file_store.GetQueueManager(config_obj)
 	if err == nil && qm != nil {
-		qm.SetClock(service.Clock)
 		service.qm = qm
 	}
 

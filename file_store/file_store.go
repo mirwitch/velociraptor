@@ -1,23 +1,24 @@
 /*
-   Velociraptor - Dig Deeper
-   Copyright (C) 2019-2022 Rapid7 Inc.
+Velociraptor - Dig Deeper
+Copyright (C) 2019-2025 Rapid7 Inc.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package file_store
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -27,6 +28,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store/directory"
 	"www.velocidex.com/golang/velociraptor/file_store/memcache"
 	"www.velocidex.com/golang/velociraptor/file_store/memory"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -43,8 +45,10 @@ func GetFileStore(config_obj *config_proto.Config) api.FileStore {
 	defer fs_mu.Unlock()
 
 	// Maintain a different filestore for each org.
-	impl, pres := g_impl[config_obj.OrgId]
-	if pres {
+	org_id := utils.NormalizedOrgId(config_obj.OrgId)
+
+	impl, pres := g_impl[org_id]
+	if pres && impl != nil {
 		return impl
 	}
 
@@ -58,7 +62,7 @@ func GetFileStore(config_obj *config_proto.Config) api.FileStore {
 	}
 
 	res, _ := getImpl(implementation, config_obj)
-	g_impl[config_obj.OrgId] = res
+	g_impl[org_id] = res
 	return res
 }
 
@@ -69,7 +73,8 @@ func getImpl(implementation string,
 		return memory.NewMemoryFileStore(config_obj), nil
 
 	case "MemcacheFileDataStore", "RemoteFileDataStore":
-		return memcache.NewMemcacheFileStore(config_obj), nil
+		return memcache.NewMemcacheFileStore(
+			context.Background(), config_obj), nil
 
 	case "FileBaseDataStore", "ReadOnlyDataStore":
 		return directory.NewDirectoryFileStore(config_obj), nil
@@ -85,7 +90,16 @@ func OverrideFilestoreImplementation(
 	fs_mu.Lock()
 	defer fs_mu.Unlock()
 
-	g_impl[config_obj.OrgId] = impl
+	org_id := utils.NormalizedOrgId(config_obj.OrgId)
+	g_impl[org_id] = impl
+}
+
+// Used by tests to reset global state.
+func ClearGlobalFilestore() {
+	fs_mu.Lock()
+	defer fs_mu.Unlock()
+
+	g_impl = make(map[string]api.FileStore)
 }
 
 func SetGlobalFilestore(
@@ -94,18 +108,27 @@ func SetGlobalFilestore(
 	fs_mu.Lock()
 	defer fs_mu.Unlock()
 
+	org_id := utils.NormalizedOrgId(config_obj.OrgId)
+
+	if implementation == "clear" {
+		delete(g_impl, org_id)
+		return nil
+	}
+
+	// Nothing to update, the filestore is already set correctly.
+	current_impl, pres := g_impl[org_id]
+	if pres {
+		_, ok := current_impl.(*memcache.MemcacheFileStore)
+		if ok && implementation == "MemcacheFileDataStore" {
+			return nil
+		}
+	}
+
 	impl, err := getImpl(implementation, config_obj)
 	if err != nil {
 		return err
 	}
 
-	g_impl[config_obj.OrgId] = impl
+	g_impl[org_id] = impl
 	return nil
-}
-
-func Reset() {
-	fs_mu.Lock()
-	defer fs_mu.Unlock()
-
-	g_impl = make(map[string]api.FileStore)
 }

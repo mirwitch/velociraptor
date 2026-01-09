@@ -1,21 +1,80 @@
 import { VqlHighlightRules } from './mode-vql.jsx';
 
+// A list of artifact definition keywords - taken from artifact.proto
+const keywords = [
+    "name",
+    "aliases",
+    "description",
+    "author",
+    "reference",
+    "references",
+    "required_permissions",
+    "implied_permissions",
+    "impersonate",
+    "resources",
+    "tools",
+    // Excluded because there is special handling "precondition",
+    "parameters",
+    "type",
+    "sources",
+    "imports",
+    // Excluded because there is special handling "export",
+
+    // deprecated reports
+    "column_types",
+
+    // ArtifactSource
+    // Excluded because there is special handling "query",
+
+    // deprecated  queries
+    "notebook",
+
+    // ArtifactParameter
+    "default",
+    "choices",
+    "friendly_name",
+    "validating_regex",
+    "artifact_type",
+
+
+    // Tools
+    "url",
+    "github_project",
+    "github_asset_regex",
+    "serve_locally",
+    "expected_hash",
+    "version",
+
+    // Resources
+    "timeout",
+    "ops_per_second",
+    "cpu_limit",
+    "iops_limit",
+    "max_rows",
+    "max_upload_bytes",
+    "max_batch_wait",
+    "max_batch_rows",
+    "max_batch_rows_buffer",
+];
+
+
+const KeywordRegexp = new RegExp("\\s*-?\\s*(" + keywords.join("|") + "):");
+
 export class YamlHighlightRules extends window.ace.acequire("ace/mode/yaml_highlight_rules").YamlHighlightRules {
     constructor() {
         super();
 
         this.$rules["start"] = [{
             token : "keyword",
-            regex : /\s*-?\s*(name|type|description|choices|sources|parameters|author|reference|required_permissions|resources|tools|parameters|url|default|serve_locally|github_asset_regex|github_project|column_types|imports|export|notebook|template|timeout|ops_per_second|max_rows|max_upload_bytes|artifact_type):/,
+            regex : KeywordRegexp,
         }, {
             token: "keyword",
-            regex: /.*(precondition|query):\s*[|]?/,
+            regex: /.*(export|precondition|query):\s*[|]?/,
             onMatch: function(val, state, stack, line) {
                 line = line.replace(/ #.*/, "");
                 var indent = /^\s*((:\s*)?-(\s*[^|>])?)?/.exec(line)[0]
                     .replace(/\S\s*$/, "").length;
                 var indentationIndicator = parseInt(/\d+[\s+-]*$/.exec(line));
-
                 if (indentationIndicator) {
                     indent += indentationIndicator - 1;
                     this.next = "vql-start";
